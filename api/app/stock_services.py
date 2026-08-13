@@ -544,7 +544,17 @@ def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | Non
     if stat_dates:
         start_date = stat_dates[0]
         end_date = max(date.today(), stat_dates[-1])
-        calendar_dates = [start_date + timedelta(days=offset) for offset in range((end_date - start_date).days + 1)]
+        # Only working days (Po-Pa) are filled in - AkcieStatistika.bas never
+        # generates weekend rows ("Pridat vsechny pracovni dny (Po-Pa)"), no
+        # trading happens then anyway. A real transaction/dividend that did
+        # land on a weekend still gets its row, exactly like the VBA (it never
+        # filters out actual data, only the synthetic empty fill days).
+        calendar_dates = [
+            candidate
+            for offset in range((end_date - start_date).days + 1)
+            for candidate in [start_date + timedelta(days=offset)]
+            if candidate.weekday() < 5 or candidate in buy_dates or candidate in daily_dividends
+        ]
     else:
         calendar_dates = []
 

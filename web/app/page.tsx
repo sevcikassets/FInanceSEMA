@@ -4,6 +4,8 @@ import {
   Building2,
   Calculator,
   CalendarDays,
+  ChevronDown,
+  ChevronRight,
   Coins,
   Download,
   FileSpreadsheet,
@@ -343,13 +345,19 @@ function interestPlanEntries(asset: Row): [string, number][] {
     .sort((a, b) => a[0].localeCompare(b[0]));
 }
 
+// Fields that are genuinely a fraction (0.05 = 5 %). Everything else called
+// "*_rate" (eur_rate, usd_rate, rate_to_czk, the ticker-history "rate" column)
+// is an actual exchange rate/kurz (e.g. 24.685 CZK per EUR), not a percentage -
+// a plain substring match on "rate" used to misclassify those as percent.
+const PERCENT_KEYS = new Set(["profit_pct", "difference_pct", "profit_loss_pct", "week_52_state_pct", "change_pct", "interest_rate"]);
+
 function formatValue(key: string, value: Row[string]) {
   if (value === null || value === undefined || value === "") return "";
   if (typeof value === "boolean") return value ? "ano" : "ne";
   if (Array.isArray(value)) return value.map((item) => tabsById[String(item)]?.label || String(item)).join(", ");
   if (typeof value === "object") return JSON.stringify(value);
   if (typeof value === "number") {
-    if (key.includes("pct") || (key.includes("rate") && key !== "rate_to_czk")) {
+    if (PERCENT_KEYS.has(key)) {
       return new Intl.NumberFormat("cs-CZ", { style: "percent", maximumFractionDigits: 2 }).format(value);
     }
     return new Intl.NumberFormat("cs-CZ", { maximumFractionDigits: 2 }).format(value);
@@ -378,7 +386,32 @@ function monthLabel(dateText: string) {
   return new Intl.DateTimeFormat("cs-CZ", { month: "long", year: "numeric" }).format(date);
 }
 
-function buildStatisticRows(rows: Row[], showDetail: boolean) {
+const CZ_WEEKDAYS = ["Ne", "Po", "Út", "St", "Čt", "Pá", "So"]; // indexed by Date#getDay()
+
+// Same as the "ddd" day-of-week + "DD.MM.YYYY" date columns in AkcieStatistika.bas.
+function formatDateWithWeekday(dateText: string) {
+  if (!dateText) return "";
+  const parsed = new Date(`${dateText}T00:00:00`);
+  if (Number.isNaN(parsed.getTime())) return dateText;
+  const day = CZ_WEEKDAYS[parsed.getDay()];
+  const dd = String(parsed.getDate()).padStart(2, "0");
+  const mm = String(parsed.getMonth() + 1).padStart(2, "0");
+  return `${day} ${dd}.${mm}.${parsed.getFullYear()}`;
+}
+
+// Same as the VBA "+#,##0;-#,##0;0" number format + green/red font on
+// Nereal. zisk / Zisk denní.
+function formatSignedProfit(value: number) {
+  const rounded = Math.round(value);
+  const formatted = new Intl.NumberFormat("cs-CZ", { maximumFractionDigits: 0 }).format(Math.abs(rounded));
+  if (rounded > 0) return `+${formatted}`;
+  if (rounded < 0) return `-${formatted}`;
+  return "0";
+}
+
+const signedProfitColumns = new Set(["unrealized_profit_czk", "daily_profit_czk"]);
+
+function buildStatisticRows(rows: Row[], expandedMonths: Set<string>) {
   const groups = new Map<string, Row[]>();
   for (const row of rows) {
     const dateText = String(row.stat_date || "");
@@ -393,8 +426,10 @@ function buildStatisticRows(rows: Row[], showDetail: boolean) {
   for (const [monthKey, groupRows] of [...groups.entries()].sort((a, b) => b[0].localeCompare(a[0]))) {
     const sortedRows = [...groupRows].sort((a, b) => String(b.stat_date).localeCompare(String(a.stat_date)));
     const latest = sortedRows[0];
+    const expanded = expandedMonths.has(monthKey);
     const summary: Row = {
       row_kind: "summary",
+      month_key: monthKey,
       period_label: monthLabel(`${monthKey}-01`),
       alerts: sortedRows.map((row) => row.alerts).filter(Boolean).join(" | "),
     };
@@ -406,9 +441,9 @@ function buildStatisticRows(rows: Row[], showDetail: boolean) {
     }
     result.push(summary);
 
-    if (showDetail) {
+    if (expanded) {
       for (const row of sortedRows) {
-        result.push({ ...row, row_kind: "detail", period_label: row.stat_date });
+        result.push({ ...row, row_kind: "detail", period_label: formatDateWithWeekday(String(row.stat_date || "")) });
       }
     }
   }
@@ -460,7 +495,7 @@ export default function Page() {
   const [assetAgendas, setAssetAgendas] = useState<AssetAgenda[]>([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [showStatDetail, setShowStatDetail] = useState(true);
+  const [expandedStatMonths, setExpandedStatMonths] = useState<Set<string>>(() => new Set());
   const [showCostDetail, setShowCostDetail] = useState(true);
   const [costAssetFilter, setCostAssetFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -505,10 +540,22 @@ export default function Page() {
   );
   const tableRows =
     activeTab === "stats"
-      ? buildStatisticRows(rows, showStatDetail)
+      ? buildStatisticRows(rows, expandedStatMonths)
       : activeTab === "costs"
         ? buildCostRows(rows, costAssetFilter, showCostDetail)
         : rows;
+
+  function toggleStatMonth(monthKey: string) {
+    setExpandedStatMonths((current) => {
+      const next = new Set(current);
+      if (next.has(monthKey)) {
+        next.delete(monthKey);
+      } else {
+        next.add(monthKey);
+      }
+      return next;
+    });
+  }
 
   useEffect(() => {
     const saved = localStorage.getItem("finance-token");
@@ -1227,25 +1274,6 @@ export default function Page() {
           </section>
         )}
 
-        {activeTab === "stats" && (
-          <section className="work-panel compact-panel">
-            <div className="panel-header">
-              <div>
-                <h2>Měsíční mezisoučty</h2>
-                <p>{showStatDetail ? "Zobrazené jsou měsíce i denní detail." : "Zobrazené jsou pouze měsíční souhrny."}</p>
-                <p className="field-hint">
-                  Denní statistiky se přepočítají tlačítkem „Přepočítat" v panelu Akciový souhrn výše (podle data v poli
-                  „Napočítat od" tamtéž - {recalcFromDate ? `nyní: od ${recalcFromDate}` : "nyní: celá historie"}).
-                </p>
-              </div>
-              <div className="stock-actions">
-                <button className="action-button" onClick={() => setShowStatDetail((value) => !value)}>
-                  <span>{showStatDetail ? "Skrýt detail" : "Zobrazit detail"}</span>
-                </button>
-              </div>
-            </div>
-          </section>
-        )}
 
         {activeTab === "assets" && assetAgendas.length > 0 && (
           <section className="asset-agendas">
@@ -1343,15 +1371,34 @@ export default function Page() {
               </tr>
             </thead>
             <tbody>
-              {tableRows.map((row, index) => (
-                <tr className={String(row.row_kind || "")} key={String(row.id || row.ticker || row.stat_date || row.period_label || index)}>
-                  {(columns[activeTab] || []).map((col) => (
-                    <td className={isNumericCell(row[col]) ? "numeric-cell" : ""} key={col}>
-                      {formatValue(col, row[col])}
-                    </td>
-                  ))}
-                </tr>
-              ))}
+              {tableRows.map((row, index) => {
+                const isStatSummary = activeTab === "stats" && row.row_kind === "summary";
+                const monthKey = String(row.month_key || "");
+                return (
+                  <tr
+                    className={`${String(row.row_kind || "")}${isStatSummary ? " clickable-row" : ""}`}
+                    key={String(row.id || row.ticker || row.stat_date || row.period_label || index)}
+                    onClick={isStatSummary ? () => toggleStatMonth(monthKey) : undefined}
+                  >
+                    {(columns[activeTab] || []).map((col, colIndex) => (
+                      <td className={isNumericCell(row[col]) ? "numeric-cell" : ""} key={col}>
+                        {isStatSummary && colIndex === 0 ? (
+                          <span className="stat-month-toggle">
+                            {expandedStatMonths.has(monthKey) ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                            {formatValue(col, row[col])}
+                          </span>
+                        ) : signedProfitColumns.has(col) && typeof row[col] === "number" ? (
+                          <span className={numberValue(row[col]) >= 0 ? "positive" : "negative"}>
+                            {formatSignedProfit(numberValue(row[col]))}
+                          </span>
+                        ) : (
+                          formatValue(col, row[col])
+                        )}
+                      </td>
+                    ))}
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </section>

@@ -345,3 +345,44 @@ def test_recalculate_stocks_unrealized_profit_reflects_price_history(db_session,
     assert later_row.total_value_czk == Decimal("1500")
     assert later_row.invested_czk == Decimal("1000")  # unchanged - still only ever paid 1000
     assert later_row.unrealized_profit_czk == Decimal("500")  # 1500 - 1000, the real price gain
+
+
+@requires_db
+def test_recalculate_stocks_excludes_weekend_fill_days(db_session, monkeypatch):
+    """AkcieStatistika.bas only fills in working days (Po-Pa) between purchases -
+    no trading happens on weekends, so Excel never shows a Saturday/Sunday row.
+    A weekend day with no transaction must be skipped; a weekend day that DOES
+    have a real transaction must still show up (the VBA never filters out
+    actual data, only the synthetic empty fill days)."""
+    from app import stock_services
+    from app.models import DailyStatistic, StockTransaction
+
+    monkeypatch.setattr(stock_services, "fetch_yahoo_history", lambda ticker, date_from, date_to: {"currency": "CZK", "points": []})
+
+    monday = date(2024, 1, 8)
+    saturday_with_trade = date(2024, 1, 13)  # unusual but a real transaction landed here
+    sunday_empty = date(2024, 1, 14)  # no transaction - must not appear
+    next_monday = date(2024, 1, 15)
+
+    for day in (monday, saturday_with_trade, next_monday):
+        db_session.add(
+            StockTransaction(
+                traded_on=day,
+                movement_type="Nákup",
+                instrument_name="Test Corp",
+                ticker="TEST",
+                quantity=Decimal("1"),
+                unit_price_ccy=Decimal("100"),
+                gross_amount_ccy=Decimal("100"),
+                currency="CZK",
+                amount_czk=Decimal("100"),
+            )
+        )
+    db_session.commit()
+
+    stock_services.recalculate_stocks(db_session, dry_run=False)
+
+    assert db_session.get(DailyStatistic, monday) is not None  # weekday
+    assert db_session.get(DailyStatistic, saturday_with_trade) is not None  # real trade, kept despite weekend
+    assert db_session.get(DailyStatistic, sunday_empty) is None  # empty weekend fill day - excluded
+    assert db_session.get(DailyStatistic, next_monday) is not None  # weekday

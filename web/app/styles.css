@@ -895,6 +895,25 @@ tr.summary td {
   border-bottom-color: #b7d4ce;
 }
 
+tr.clickable-row {
+  cursor: pointer;
+}
+
+tr.clickable-row:hover td {
+  background: #ddece8;
+}
+
+.stat-month-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.stat-month-toggle svg {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
 tr.detail td:first-child {
   padding-left: 28px;
   color: var(--muted);
