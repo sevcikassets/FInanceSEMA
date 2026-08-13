@@ -960,7 +960,9 @@ export default function Page() {
       const result = await api(`/stocks/recalculate?${params.toString()}`, { method: "POST" });
       const zeroStatsHint =
         result.daily_statistics === 0 && result.date_from
-          ? " Zadané datum leží až po posledním dni, který má být napočítán (dnešek nebo poslední nákup) - proto se nepřepočetl žádný den. Pro plný přepočet pole vyprázdni."
+          ? result.computed_range_from && result.computed_range_to
+            ? ` Zadané datum ${result.date_from} leží mimo počítaný rozsah (${result.computed_range_from} až ${result.computed_range_to}) - proto se nepřepočetl žádný den. Pro plný přepočet pole vyprázdni.`
+            : " Zadané datum leží až po posledním dni, který má být napočítán (dnešek nebo poslední nákup) - proto se nepřepočetl žádný den. Pro plný přepočet pole vyprázdni."
           : "";
       const priceFailureHint =
         result.price_fetch_failures > 0

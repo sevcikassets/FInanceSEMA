@@ -476,6 +476,89 @@ def test_recalculate_stocks_reports_price_fetch_failures(db_session, monkeypatch
 
 
 @requires_db
+def test_recalculate_stocks_patches_latest_day_with_live_quote(db_session, monkeypatch):
+    """AkcieStatistika.bas's 'Krok 5b-2': when the daily-candle history has no
+    exact close for the latest trading day (Yahoo publishes it late, or the
+    recalc runs mid-session), Excel patches that one day in with a live quote
+    instead of silently reusing yesterday's close. A ticker already sold off
+    entirely must NOT trigger an extra live-quote lookup."""
+    from app import stock_services
+
+    today = date.today()
+    latest_weekday = today
+    while latest_weekday.weekday() >= 5:
+        latest_weekday -= timedelta(days=1)
+    buy_day = latest_weekday - timedelta(days=14)
+
+    from app.models import StockTransaction
+
+    db_session.add(
+        StockTransaction(
+            traded_on=buy_day,
+            movement_type="Nákup",
+            instrument_name="Held Corp",
+            ticker="HELD",
+            quantity=Decimal("1"),
+            unit_price_ccy=Decimal("100"),
+            gross_amount_ccy=Decimal("100"),
+            currency="CZK",
+            amount_czk=Decimal("100"),
+        )
+    )
+    db_session.add(
+        StockTransaction(
+            traded_on=buy_day,
+            movement_type="Nákup",
+            instrument_name="Sold Corp",
+            ticker="SOLD",
+            quantity=Decimal("1"),
+            unit_price_ccy=Decimal("50"),
+            gross_amount_ccy=Decimal("50"),
+            currency="CZK",
+            amount_czk=Decimal("50"),
+        )
+    )
+    db_session.add(
+        StockTransaction(
+            traded_on=buy_day,
+            movement_type="Prodej",
+            instrument_name="Sold Corp",
+            ticker="SOLD",
+            quantity=Decimal("-1"),
+            unit_price_ccy=Decimal("55"),
+            gross_amount_ccy=Decimal("55"),
+            currency="CZK",
+            amount_czk=Decimal("55"),
+        )
+    )
+    db_session.commit()
+
+    def fake_history(ticker, date_from, date_to):
+        # Neither ticker has a candle for the latest weekday - only up to the
+        # day before it (simulates a delayed/incomplete publish).
+        return {"currency": "CZK", "points": [(buy_day, Decimal("100" if ticker == "HELD" else "50"))]}
+
+    live_quote_calls: list[str] = []
+
+    def fake_price(ticker):
+        live_quote_calls.append(ticker)
+        return {"price": Decimal("111"), "currency": "CZK"}
+
+    monkeypatch.setattr(stock_services, "fetch_yahoo_history", fake_history)
+    monkeypatch.setattr(stock_services, "fetch_yahoo_price", fake_price)
+
+    stock_services.recalculate_stocks(db_session, dry_run=False)
+
+    assert live_quote_calls == ["HELD"]  # SOLD is fully closed out - no extra lookup needed
+
+    from app.models import DailyStatistic
+
+    latest_row = db_session.get(DailyStatistic, latest_weekday)
+    assert latest_row is not None
+    assert latest_row.value_czk == Decimal("111")  # HELD priced via the live-quote patch, not the stale candle
+
+
+@requires_db
 def test_ensure_cnb_rates_up_to_date_fills_missing_weekdays(db_session, monkeypatch):
     """Port of KurzyCNB.bas's FetchCNBIfNeeded(): fetch any missing EUR/USD
     rates between the last stored date and the publish cutoff, skipping

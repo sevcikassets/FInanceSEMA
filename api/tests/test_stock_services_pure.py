@@ -4,6 +4,7 @@ from datetime import date
 from decimal import Decimal
 
 from app.stock_services import (
+    _extract_quote,
     decimal_or_zero,
     movement_is_buy,
     movement_is_dividend,
@@ -84,3 +85,20 @@ def test_parse_patria_text_builds_buy_and_sell_trades():
 def test_parse_patria_text_ignores_incomplete_trailing_lines():
     text = "01.02.2024\t10\tNákup\tApple Inc\t1,5\t0\tXNAS\n"
     assert parse_patria_text(text) == []
+
+
+def test_extract_quote_reads_chart_endpoint_shape():
+    # /v8/finance/chart response shape
+    payload = {"chart": {"result": [{"meta": {"regularMarketPrice": 123.45, "currency": "USD"}}]}}
+    assert _extract_quote(payload) == (123.45, "USD")
+
+
+def test_extract_quote_reads_v7_quote_endpoint_shape():
+    # /v7/finance/quote response shape - AktualizujHodnotu.bas's GetStooqPrice
+    # falls back to this when the chart endpoint is throttled/unavailable.
+    payload = {"quoteResponse": {"result": [{"regularMarketPrice": 67.89, "currency": "EUR"}]}}
+    assert _extract_quote(payload) == (67.89, "EUR")
+
+
+def test_extract_quote_returns_none_when_both_shapes_empty():
+    assert _extract_quote({"chart": {"result": []}, "quoteResponse": {"result": []}}) == (None, None)

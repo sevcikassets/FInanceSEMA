@@ -4,6 +4,7 @@ import bisect
 import json
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -258,11 +259,18 @@ YAHOO_HEADERS = {
 }
 
 
-def _yahoo_get(url: str, timeout: int, attempts: int = 2) -> dict[str, Any] | None:
+def _yahoo_get(url: str, timeout: int = 8, attempts: int = 2) -> dict[str, Any] | None:
     """GET a Yahoo chart URL, with one short retry - Yahoo occasionally throttles
     back-to-back requests (recalculating a portfolio with many tickers fires
     dozens of these in a row), and a bare single attempt turns a transient
     throttle into a permanently-missing price for that ticker/day.
+
+    Timeout is deliberately short (default 8s, was 12-15s) and the retry
+    backoff brief (0.2s): a recalculation fetches history for every ticker in
+    the portfolio, one request per ticker - a slow-but-not-quite-failing
+    Yahoo response used to be able to stack up to minutes of latency across
+    ~80+ tickers and make the browser's fetch() itself time out ("Failed to
+    fetch"), even though the recalculation was still running server-side.
     """
     last_error: Exception | None = None
     for attempt in range(attempts):
@@ -273,25 +281,47 @@ def _yahoo_get(url: str, timeout: int, attempts: int = 2) -> dict[str, Any] | No
         except Exception as exc:  # noqa: BLE001 - network is inherently flaky here
             last_error = exc
             if attempt + 1 < attempts:
-                time.sleep(0.4)
+                time.sleep(0.2)
     if last_error is not None:
         raise last_error
     return None
 
 
+def _extract_quote(payload: dict[str, Any]) -> tuple[Any, str | None]:
+    """Pull (price, currency) out of either Yahoo response shape: the /v8/chart
+    endpoint (chart.result[0].meta) or the /v7/quote endpoint
+    (quoteResponse.result[0]) - GetStooqPrice in AktualizujHodnotu.bas tries
+    both, since one occasionally answers when the other is throttled."""
+    chart_results = (payload.get("chart") or {}).get("result") or []
+    if chart_results:
+        meta = chart_results[0].get("meta", {})
+        price = meta.get("regularMarketPrice") or meta.get("previousClose")
+        if price is not None:
+            return price, meta.get("currency")
+    quote_results = (payload.get("quoteResponse") or {}).get("result") or []
+    if quote_results:
+        entry = quote_results[0]
+        price = entry.get("regularMarketPrice") or entry.get("regularMarketPreviousClose")
+        if price is not None:
+            return price, entry.get("currency")
+    return None, None
+
+
 def fetch_yahoo_price(ticker: str) -> dict[str, Decimal | str | None]:
+    # Same four endpoint variants as AktualizujHodnotu.bas's GetStooqPrice (a
+    # misleading name - it is Yahoo, not Stooq): two chart-endpoint hosts plus
+    # two quote-endpoint hosts, tried in order until one answers with a price.
     symbol = quote(ticker)
     urls = [
         f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d",
         f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d",
+        f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={symbol}",
+        f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}",
     ]
     for url in urls:
         try:
-            payload = _yahoo_get(url, timeout=12)
-            result = payload["chart"]["result"][0]
-            meta = result.get("meta", {})
-            price = meta.get("regularMarketPrice") or meta.get("previousClose")
-            currency = meta.get("currency")
+            payload = _yahoo_get(url)
+            price, currency = _extract_quote(payload)
             if price is not None:
                 return {"price": decimal_or_zero(price), "currency": currency}
         except Exception:
@@ -601,14 +631,56 @@ def recalculate_stocks(
     # per-day "Chybí cena" alerts so a full outage is visible as one clear
     # number instead of being buried inside dozens of daily alert strings.
     tickers_without_price_history: list[str] = []
+    # Fetched concurrently, not one ticker at a time: a portfolio with ~80+
+    # distinct tickers used to fire that many sequential blocking HTTP calls,
+    # which - especially once retries were added for reliability - could take
+    # minutes and made the browser's own fetch() time out ("Failed to fetch")
+    # well before the recalculation itself finished. A small bounded pool
+    # keeps the same request pattern per ticker but runs them side by side.
+    YAHOO_CONCURRENCY = 8
     if calendar_dates:
-        for ticker in positions:
-            history = fetch_yahoo_history(ticker, start_date, date.today())
+        ticker_list = list(positions)
+        with ThreadPoolExecutor(max_workers=YAHOO_CONCURRENCY) as pool:
+            histories = pool.map(lambda t: fetch_yahoo_history(t, start_date, date.today()), ticker_list)
+        for ticker, history in zip(ticker_list, histories):
             points = sorted(history.get("points") or [])
             price_dates[ticker] = [point[0] for point in points]
             price_values[ticker] = [point[1] for point in points]
             if not points:
                 tickers_without_price_history.append(ticker)
+
+        # "Krok 5b-2" in AkcieStatistika.bas: the daily-candle history endpoint
+        # can lack an exact close for the latest trading day (published with a
+        # delay, or the macro/recalc runs mid-session) - Excel then patches that
+        # one day in with a live quote instead of silently falling back to an
+        # older price. Only bother for tickers still actually held, to avoid
+        # doubling the number of Yahoo requests for positions long since sold.
+        latest_stat_date = date.today()
+        while latest_stat_date.weekday() >= 5:
+            latest_stat_date -= timedelta(days=1)
+        still_held = [
+            ticker
+            for ticker, events in ticker_qty_events.items()
+            if sum(events.values()) > ZERO
+            and not (price_dates.get(ticker) and price_dates[ticker][-1] == latest_stat_date)
+        ]
+        if still_held:
+            with ThreadPoolExecutor(max_workers=YAHOO_CONCURRENCY) as pool:
+                live_quotes = pool.map(fetch_yahoo_price, still_held)
+            for ticker, quote_data in zip(still_held, live_quotes):
+                price = quote_data.get("price")
+                if not isinstance(price, Decimal) or price <= ZERO:
+                    continue
+                dates = price_dates.setdefault(ticker, [])
+                values = price_values.setdefault(ticker, [])
+                idx = bisect.bisect_left(dates, latest_stat_date)
+                if idx < len(dates) and dates[idx] == latest_stat_date:
+                    values[idx] = price
+                else:
+                    dates.insert(idx, latest_stat_date)
+                    values.insert(idx, price)
+                if ticker in tickers_without_price_history:
+                    tickers_without_price_history.remove(ticker)
 
     def price_at_or_before(ticker: str, target: date) -> Decimal | None:
         dates = price_dates.get(ticker)
@@ -738,6 +810,11 @@ def recalculate_stocks(
         "daily_statistics": len(computed_stats),
         "price_fetch_failures": len(tickers_without_price_history),
         "price_fetch_failed_tickers": sorted(tickers_without_price_history)[:25],
+        # The full range that was actually considered (independent of date_from,
+        # which only controls what gets (re)written) - lets the caller explain
+        # a 0-row result precisely instead of just guessing why nothing changed.
+        "computed_range_from": stat_dates[0] if stat_dates else None,
+        "computed_range_to": calendar_dates[-1] if calendar_dates else None,
     }
 
 
@@ -753,7 +830,7 @@ def fetch_yahoo_history(ticker: str, date_from: date, date_to: date) -> dict[str
     ]
     for url in urls:
         try:
-            payload = _yahoo_get(url, timeout=15)
+            payload = _yahoo_get(url)
             result = payload["chart"]["result"][0]
             timestamps = result.get("timestamp") or []
             closes = result["indicators"]["quote"][0].get("close") or []
