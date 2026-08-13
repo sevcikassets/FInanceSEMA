@@ -707,11 +707,12 @@ export default function Page() {
     setStockBusy(true);
     const fromDate = recalcFromDate.trim();
     setWorkingMessage(
-      dryRun
+      (dryRun
         ? "Počítám kontrolní náhled portfolia a denní statistiky"
         : fromDate
           ? `Přepočítávám portfolio a denní statistiku od ${fromDate}`
-          : "Přepočítávám portfolio a celou historii denní statistiky",
+          : "Přepočítávám portfolio a celou historii denní statistiky") +
+        " - stahují se historické ceny akcií z Yahoo Finance, u větších portfolií to může trvat i přes minutu",
     );
     try {
       const params = new URLSearchParams({ dry_run: dryRun ? "true" : "false" });

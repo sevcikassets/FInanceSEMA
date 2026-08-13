@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import json
 from collections import defaultdict
 from dataclasses import dataclass
@@ -421,6 +422,14 @@ def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | Non
     `date_from` is given, only statistic rows on or after that date are
     (re)written - earlier rows already stored in `daily_statistics` are left
     untouched. Omit `date_from` for a full recompute of the whole history.
+
+    The "Hod. EUR/USD/CZK" / "Celk. Hod. CZK" / "Nereal. zisk" columns are the
+    actual market value of the shares held on each day - quantity held that day
+    times the historical closing price on/before that day (fetched from Yahoo
+    Finance per ticker), exactly like AkcieStatistika.bas's GetPriceAtOrBefore.
+    They are NOT the invested amount merely re-expressed in CZK (that used to
+    be the case here, which meant "Nereal. zisk" only ever reflected FX-rate
+    drift, never a real stock-price gain or loss).
     """
     existing_prices = {
         row.ticker: row.current_price for row in db.scalars(select(PortfolioPosition)).all() if row.ticker and row.current_price is not None
@@ -432,6 +441,10 @@ def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | Non
     daily_buys: dict[date, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
     daily_invested: dict[date, Decimal] = defaultdict(Decimal)
     daily_dividends: dict[date, Decimal] = defaultdict(Decimal)
+    # Signed quantity change per ticker per day - needed to reconstruct how many
+    # shares were actually held on any given historical day, so they can be
+    # valued at that day's price.
+    ticker_qty_events: dict[str, dict[date, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
 
     for transaction in transactions:
         ticker = normalize_ticker(transaction.ticker, transaction.market)
@@ -477,6 +490,7 @@ def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | Non
                 buy_dates.add(traded_on)
                 daily_buys[traded_on][currency] += gross
                 daily_invested[traded_on] += amount_czk
+                ticker_qty_events[ticker][traded_on] += quantity
                 if position["first_buy_date"] is None or traded_on < position["first_buy_date"]:
                     position["first_buy_date"] = traded_on
         elif movement_is_sell(movement):
@@ -485,6 +499,8 @@ def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | Non
                 average_cost = position["invested_czk"] / old_quantity
                 position["invested_czk"] -= abs(quantity) * average_cost
             position["quantity"] += quantity
+            if traded_on:
+                ticker_qty_events[ticker][traded_on] += quantity
 
     computed_positions: list[PortfolioPosition] = []
     total_market_value = ZERO
@@ -531,7 +547,30 @@ def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | Non
         calendar_dates = [start_date + timedelta(days=offset) for offset in range((end_date - start_date).days + 1)]
     else:
         calendar_dates = []
-    previous_value_czk = ZERO
+
+    # Historical closing prices per ticker, fetched once for the whole range -
+    # mirrors AkcieStatistika.bas's "Krok 5b" Yahoo Finance step.
+    price_dates: dict[str, list[date]] = {}
+    price_values: dict[str, list[Decimal]] = {}
+    if calendar_dates:
+        for ticker in positions:
+            history = fetch_yahoo_history(ticker, start_date, date.today())
+            points = sorted(history.get("points") or [])
+            price_dates[ticker] = [point[0] for point in points]
+            price_values[ticker] = [point[1] for point in points]
+
+    def price_at_or_before(ticker: str, target: date) -> Decimal | None:
+        dates = price_dates.get(ticker)
+        if not dates:
+            return None
+        idx = bisect.bisect_right(dates, target) - 1
+        if idx < 0:
+            return None
+        return price_values[ticker][idx]
+
+    ticker_running_qty: dict[str, Decimal] = defaultdict(Decimal)
+    previous_total_value_czk = ZERO
+    previous_invested_total = ZERO
     for stat_date in calendar_dates:
         bought_eur = daily_buys[stat_date]["EUR"]
         bought_usd = daily_buys[stat_date]["USD"]
@@ -545,10 +584,39 @@ def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | Non
         usd_rate = rate_for_day(db, "USD", stat_date)
         eur_in_czk = total_eur * eur_rate
         usd_in_czk = total_usd * usd_rate
-        value_czk = total_czk + eur_in_czk + usd_in_czk
-        unrealized = value_czk - invested_total
-        daily_profit = value_czk - previous_value_czk
-        previous_value_czk = value_czk
+
+        for ticker, events in ticker_qty_events.items():
+            change = events.get(stat_date)
+            if change:
+                ticker_running_qty[ticker] += change
+
+        # Market value of everything actually held on this day, bucketed by
+        # trading currency - not the invested/purchased amount.
+        value_eur = ZERO
+        value_usd = ZERO
+        value_czk = ZERO
+        for ticker, qty in ticker_running_qty.items():
+            if qty <= ZERO:
+                continue
+            price = price_at_or_before(ticker, stat_date)
+            if price is None:
+                continue
+            ticker_currency = (positions[ticker]["currency"] or "CZK").upper()
+            holding_value = qty * price
+            if ticker_currency == "EUR":
+                value_eur += holding_value
+            elif ticker_currency == "USD":
+                value_usd += holding_value
+            else:
+                value_czk += holding_value
+
+        total_value_czk = value_czk + (value_eur * eur_rate) + (value_usd * usd_rate)
+        unrealized = total_value_czk - invested_total
+        # Daily P&L excludes money newly invested that day - only the change in
+        # market value of what was already held, matching AkcieStatistika.bas.
+        daily_profit = (total_value_czk - previous_total_value_czk) - (invested_total - previous_invested_total)
+        previous_total_value_czk = total_value_czk
+        previous_invested_total = invested_total
         if date_from is not None and stat_date < date_from:
             continue
         computed_stats.append(
@@ -557,22 +625,24 @@ def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | Non
                 bought_eur=bought_eur,
                 total_eur=total_eur,
                 eur_in_czk=eur_in_czk,
-                value_eur=total_eur,
+                value_eur=value_eur,
                 eur_rate=eur_rate,
                 bought_usd=bought_usd,
                 total_usd=total_usd,
                 usd_in_czk=usd_in_czk,
-                value_usd=total_usd,
+                value_usd=value_usd,
                 usd_rate=usd_rate,
                 bought_czk=bought_czk,
                 total_czk=total_czk,
                 value_czk=value_czk,
                 invested_czk=invested_total,
-                total_value_czk=value_czk,
+                total_value_czk=total_value_czk,
                 unrealized_profit_czk=unrealized,
                 dividends=daily_dividends[stat_date],
                 dividends_total=dividends_total,
-                profit_pct=(unrealized / invested_total) if invested_total else None,
+                profit_pct=(
+                    ((total_value_czk + dividends_total - invested_total) / invested_total) if invested_total else None
+                ),
                 daily_profit_czk=daily_profit,
                 alerts=None,
             )

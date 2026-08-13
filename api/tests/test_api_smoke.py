@@ -169,7 +169,7 @@ def test_stocks_alerts_endpoint_requires_auth(client):
 
 
 @requires_db
-def test_recalculate_stocks_date_from_preserves_earlier_rows(db_session):
+def test_recalculate_stocks_date_from_preserves_earlier_rows(db_session, monkeypatch):
     """`date_from` should behave like the VBA "Zpracovat od" cell: cumulative
     totals are always computed from the very first transaction (so later rows
     stay correct), but rows before `date_from` are left untouched in the DB
@@ -185,6 +185,12 @@ def test_recalculate_stocks_date_from_preserves_earlier_rows(db_session):
 
     from app import stock_services
     from app.models import DailyStatistic, StockTransaction
+
+    # recalculate_stocks now fetches historical prices per ticker to compute
+    # real market value - stub it out so this test stays a pure DB test with
+    # no real network dependency (it only asserts on the invested-amount
+    # columns, not market value).
+    monkeypatch.setattr(stock_services, "fetch_yahoo_history", lambda ticker, date_from, date_to: {"currency": "CZK", "points": []})
 
     for day, qty, price in [(date(2024, 1, 5), 1, 100), (date(2024, 1, 20), 1, 110), (date(2024, 2, 10), 1, 120)]:
         db_session.add(
@@ -234,7 +240,7 @@ def test_recalculate_stocks_date_from_preserves_earlier_rows(db_session):
 
 
 @requires_db
-def test_recalculate_stocks_ignores_watchlist_tip_and_plan_rows(db_session):
+def test_recalculate_stocks_ignores_watchlist_tip_and_plan_rows(db_session, monkeypatch):
     """Regression test: watchlist/tip/plan rows in `stock_transactions` (imported
     verbatim from the "Akcie" sheet, which mixes real purchases with hypothetical
     ones) must not be counted as real purchases - AkcieStatistika.bas only ever
@@ -244,6 +250,8 @@ def test_recalculate_stocks_ignores_watchlist_tip_and_plan_rows(db_session):
     figures showed."""
     from app import stock_services
     from app.models import PortfolioPosition, StockTransaction
+
+    monkeypatch.setattr(stock_services, "fetch_yahoo_history", lambda ticker, date_from, date_to: {"currency": "CZK", "points": []})
 
     # A real purchase of 1 share for 1000 CZK.
     db_session.add(
@@ -284,3 +292,56 @@ def test_recalculate_stocks_ignores_watchlist_tip_and_plan_rows(db_session):
     assert position.invested_czk == Decimal("1000")
     # The real purchase date, not the earlier watchlist/tip/plan row's date.
     assert position.first_buy_date == date(2024, 1, 10)
+
+
+@requires_db
+def test_recalculate_stocks_unrealized_profit_reflects_price_history(db_session, monkeypatch):
+    """Regression test for the actual bug this feature was supposed to fix:
+    'Nereal. zisk' (unrealized profit) and the 'Hod./Celk. Hod.' market-value
+    columns must reflect the ticker's real historical price on each day
+    (AkcieStatistika.bas's GetPriceAtOrBefore), not just the invested amount
+    re-expressed via that day's FX rate. Before the fix, a CZK-denominated
+    purchase always showed ~0 unrealized profit no matter how much the share
+    price actually moved, because "value" was computed purely from money
+    invested, never from quantity held x historical price."""
+    from app import stock_services
+    from app.models import DailyStatistic, StockTransaction
+
+    buy_date = date(2024, 1, 5)
+    later_date = date(2024, 1, 10)
+
+    db_session.add(
+        StockTransaction(
+            traded_on=buy_date,
+            movement_type="Nákup",
+            instrument_name="Test Corp",
+            ticker="TEST",
+            quantity=Decimal("10"),
+            unit_price_ccy=Decimal("100"),
+            gross_amount_ccy=Decimal("1000"),
+            currency="CZK",
+            amount_czk=Decimal("1000"),
+        )
+    )
+    db_session.commit()
+
+    def fake_history(ticker, date_from, date_to):
+        assert ticker == "TEST"
+        # Price rose from 100 to 150 CZK/share between the purchase and later_date.
+        return {"currency": "CZK", "points": [(buy_date, Decimal("100")), (later_date, Decimal("150"))]}
+
+    monkeypatch.setattr(stock_services, "fetch_yahoo_history", fake_history)
+
+    stock_services.recalculate_stocks(db_session, dry_run=False)
+
+    buy_day_row = db_session.get(DailyStatistic, buy_date)
+    assert buy_day_row is not None
+    assert buy_day_row.total_value_czk == Decimal("1000")  # 10 x 100, bought at cost
+    assert buy_day_row.unrealized_profit_czk == Decimal("0")
+
+    later_row = db_session.get(DailyStatistic, later_date)
+    assert later_row is not None
+    assert later_row.value_czk == Decimal("1500")  # 10 shares x 150 CZK
+    assert later_row.total_value_czk == Decimal("1500")
+    assert later_row.invested_czk == Decimal("1000")  # unchanged - still only ever paid 1000
+    assert later_row.unrealized_profit_czk == Decimal("500")  # 1500 - 1000, the real price gain
