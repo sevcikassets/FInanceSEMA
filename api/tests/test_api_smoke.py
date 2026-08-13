@@ -169,6 +169,33 @@ def test_stocks_alerts_endpoint_requires_auth(client):
 
 
 @requires_db
+def test_recalculate_endpoint_returns_proper_error_instead_of_bare_crash(client, monkeypatch):
+    """Regression test for the "Failed to fetch" report: an unhandled
+    exception inside the recalculate endpoint used to reach the browser as a
+    bare 500 with no CORS headers (Starlette's outermost error handler sits
+    above CORSMiddleware), which browsers report as a CORS failure with no
+    hint of the real cause. It must come back as a normal JSON error instead,
+    which the TestClient (and a real browser) can read the body of."""
+    from app import main
+
+    def boom(db, dry_run=False, date_from=None, threshold_pct=None):
+        raise RuntimeError("simulated crash deep in the recalculation")
+
+    monkeypatch.setattr(main, "recalculate_stocks", boom)
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}", "Origin": "http://localhost:3010"}
+    response = client.post("/stocks/recalculate?dry_run=true", headers=headers)
+
+    assert response.status_code == 500
+    assert "simulated crash" in response.json()["detail"]
+    # This is the exact symptom that was reported: a crash reaching the
+    # browser with no CORS header shows up there as "blocked by CORS policy"
+    # / "Failed to fetch", masking the real 500 underneath.
+    assert response.headers.get("access-control-allow-origin") == "http://localhost:3010"
+
+
+@requires_db
 def test_recalculate_stocks_date_from_preserves_earlier_rows(db_session, monkeypatch):
     """`date_from` should behave like the VBA "Zpracovat od" cell: cumulative
     totals are always computed from the very first transaction (so later rows
@@ -620,3 +647,70 @@ def test_ensure_cnb_rates_up_to_date_skips_when_history_empty(db_session, monkey
 
     assert added == 0
     assert called is False
+
+
+def test_fetch_cnb_rates_skips_malformed_lines_instead_of_raising(monkeypatch):
+    """A single unexpected/malformed line in CNB's daily rates feed (odd
+    formatting, a withdrawn currency, a zero amount) must not blow up the
+    whole request - previously an uncaught Decimal/ZeroDivisionError here
+    surfaced to the browser as a bare 500 with no CORS headers, which shows
+    up misleadingly as "Failed to fetch" instead of a real error message."""
+    from app import main
+
+    cnb_text = (
+        "země|měna|množství|kód|kurz\n"
+        "EMU|euro|1|EUR|25,150\n"
+        "garbled|line|not|enough\n"  # too few columns - already skipped before
+        "USA|dolar|1|USD|0|not-a-number\n"  # amount is 0 -> ZeroDivisionError if unhandled
+        "Some|thing|1|XXX|not-a-decimal\n"  # rate isn't a valid Decimal
+        "Japonsko|jen|100|JPY|15,234\n"
+    )
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return cnb_text.encode("windows-1250")
+
+    monkeypatch.setattr(main, "urlopen", lambda url, timeout=15: FakeResponse())
+
+    rows = main.fetch_cnb_rates(date(2024, 1, 8))
+
+    # Only the two well-formed lines survive - the malformed ones are skipped,
+    # not raised.
+    currencies = {row["currency"] for row in rows}
+    assert currencies == {"EUR", "JPY"}
+
+
+@requires_db
+def test_ensure_cnb_rates_up_to_date_survives_one_bad_day(db_session, monkeypatch):
+    """If fetch_cnb_rates raises for one day in the range (network hiccup,
+    unexpected format), the remaining days must still get filled in - a
+    single bad day must not take down the whole recalculation."""
+    from app import main
+    from app.models import ExchangeRate
+
+    last_stored = date(2024, 1, 8)  # Monday
+    for currency, rate in (("EUR", "25.0"), ("USD", "23.0")):
+        db_session.add(ExchangeRate(rate_date=last_stored, currency=currency, rate_to_czk=Decimal(rate)))
+    db_session.commit()
+
+    monkeypatch.setattr(main, "cnb_cutoff_date", lambda: date(2024, 1, 10))
+
+    def flaky_fetch(rate_date):
+        if rate_date == date(2024, 1, 9):
+            raise ValueError("unexpected CNB response shape")
+        return [
+            {"rate_date": rate_date, "currency": "EUR", "rate_to_czk": Decimal("25.1")},
+            {"rate_date": rate_date, "currency": "USD", "rate_to_czk": Decimal("23.1")},
+        ]
+
+    monkeypatch.setattr(main, "fetch_cnb_rates", flaky_fetch)
+
+    added = main.ensure_cnb_rates_up_to_date(db_session)  # must not raise
+
+    assert added == 2  # only 2024-01-10 succeeded (2 currencies); 01-09 was skipped

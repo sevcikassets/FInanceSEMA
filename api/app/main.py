@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+import logging
 import unicodedata
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -163,9 +164,15 @@ def fetch_cnb_rates(rate_date: date) -> list[dict[str, Any]]:
         parts = line.split("|")
         if len(parts) != 5 or parts[0] == "země":
             continue
-        amount = Decimal(parts[2].replace(",", "."))
-        code = parts[3].strip().upper()
-        rate = Decimal(parts[4].replace(",", ".")) / amount
+        # A malformed/unexpected line (CNB has occasionally shipped odd rows
+        # for withdrawn currencies or formatting quirks) must not blow up the
+        # whole recalculation - skip just that line instead of raising.
+        try:
+            amount = Decimal(parts[2].replace(",", "."))
+            code = parts[3].strip().upper()
+            rate = Decimal(parts[4].replace(",", ".")) / amount
+        except (InvalidOperation, ZeroDivisionError, IndexError):
+            continue
         rows.append({"rate_date": rate_date, "currency": code, "rate_to_czk": rate})
     if not rows:
         raise HTTPException(status_code=502, detail="CNB response did not contain exchange rates")
@@ -206,7 +213,11 @@ def ensure_cnb_rates_up_to_date(db: Session) -> int:
         if check_date.weekday() < 5:  # CNB doesn't publish on weekends
             try:
                 rows = fetch_cnb_rates(check_date)
-            except HTTPException:
+            except Exception:
+                # A single day's CNB request failing (network hiccup, malformed
+                # response, unexpected format) must not take down the whole
+                # recalculation - the rest of the range still gets a chance,
+                # and this day's rate can simply be filled in on a later run.
                 rows = []
             for row in rows:
                 if row["currency"] in ("EUR", "USD"):
@@ -217,6 +228,8 @@ def ensure_cnb_rates_up_to_date(db: Session) -> int:
         db.commit()
     return added
 
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FinanceSEMA API")
 settings = get_settings()
@@ -527,11 +540,24 @@ def recalculate_stock_data(
     date_from: date | None = Query(default=None),
     threshold_pct: Decimal = Query(default=Decimal("10")),
 ) -> dict[str, Any]:
-    # Auto-fetch missing CNB rates first, same as AktualizujStatistiku always
-    # does before recomputing - but only for a real (non-preview) run, so
-    # "Kontrola (náhled)" keeps its "nothing gets saved" promise.
-    cnb_rates_added = ensure_cnb_rates_up_to_date(db) if not dry_run else 0
-    result = recalculate_stocks(db, dry_run=dry_run, date_from=date_from, threshold_pct=threshold_pct)
+    # An unhandled exception here used to reach the browser as a bare 500
+    # with no CORS headers (Starlette's outermost error handler sits above
+    # CORSMiddleware) - the browser then reports it as a CORS failure
+    # ("Failed to fetch") with no hint of the real cause. Catch broadly and
+    # re-raise as a normal HTTPException instead, which *does* get CORS
+    # headers and puts the actual error text in front of the user/logs.
+    try:
+        # Auto-fetch missing CNB rates first, same as AktualizujStatistiku always
+        # does before recomputing - but only for a real (non-preview) run, so
+        # "Kontrola (náhled)" keeps its "nothing gets saved" promise.
+        cnb_rates_added = ensure_cnb_rates_up_to_date(db) if not dry_run else 0
+        result = recalculate_stocks(db, dry_run=dry_run, date_from=date_from, threshold_pct=threshold_pct)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - last-resort safety net, see above
+        db.rollback()
+        logger.exception("recalculate_stock_data failed")
+        raise HTTPException(status_code=500, detail=f"Přepočet selhal: {exc}") from exc
     result["cnb_rates_added"] = cnb_rates_added
     return result
 
