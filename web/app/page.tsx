@@ -309,6 +309,32 @@ const historyColumns = [
   "profit_czk",
 ];
 
+function RecalcFromField({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  return (
+    <div className="recalc-from">
+      <label>
+        Napočítat od
+        <span className="recalc-from-input-row">
+          <input type="date" autoComplete="off" value={value} onChange={(event) => onChange(event.target.value)} />
+          {value && (
+            <button
+              type="button"
+              className="recalc-from-clear"
+              onClick={() => onChange("")}
+              title="Vymazat datum - příští přepočet pak projde celou historii"
+            >
+              <X size={14} />
+            </button>
+          )}
+        </span>
+      </label>
+      <span className="field-hint">
+        {value ? `Přepočítají se jen dny od ${value} dál, starší řádky zůstanou beze změny.` : "Prázdné = přepočítá se celá historie."}
+      </span>
+    </div>
+  );
+}
+
 function interestPlanEntries(asset: Row): [string, number][] {
   const plan = asset.computed_interest_plan;
   if (!plan || typeof plan !== "object" || Array.isArray(plan)) return [];
@@ -1052,18 +1078,15 @@ export default function Page() {
                   <RefreshCw size={16} />
                   <span>Ceny</span>
                 </button>
-                <label className="recalc-from">
-                  Napočítat od
-                  <input
-                    type="date"
-                    value={recalcFromDate}
-                    onChange={(event) => setRecalcFromDate(event.target.value)}
-                    title="Prázdné = přepočítat celou historii denní statistiky. Vyplněné datum přepočítá jen dny od tohoto data dál, starší řádky zůstanou beze změny."
-                  />
-                </label>
-                <button className="action-button" onClick={() => recalculateStockData(true)} disabled={stockBusy}>
+                <RecalcFromField value={recalcFromDate} onChange={setRecalcFromDate} />
+                <button
+                  className="action-button"
+                  onClick={() => recalculateStockData(true)}
+                  disabled={stockBusy}
+                  title="Jen náhled počtů - nic se neuloží do databáze"
+                >
                   <Calculator size={16} />
-                  <span>Kontrola</span>
+                  <span>Kontrola (náhled)</span>
                 </button>
                 <button className="action-button" onClick={() => recalculateStockData(false)} disabled={stockBusy}>
                   <Calculator size={16} />
@@ -1210,15 +1233,7 @@ export default function Page() {
                 <button className="action-button" onClick={() => setShowStatDetail((value) => !value)}>
                   <span>{showStatDetail ? "Skrýt detail" : "Zobrazit detail"}</span>
                 </button>
-                <label className="recalc-from">
-                  Napočítat od
-                  <input
-                    type="date"
-                    value={recalcFromDate}
-                    onChange={(event) => setRecalcFromDate(event.target.value)}
-                    title="Prázdné = přepočítat celou historii. Vyplněné datum přepočítá jen dny od tohoto data dál, starší řádky zůstanou beze změny."
-                  />
-                </label>
+                <RecalcFromField value={recalcFromDate} onChange={setRecalcFromDate} />
                 <button className="action-button" onClick={() => recalculateStockData(false)} disabled={stockBusy}>
                   <Calculator size={16} />
                   <span>Napočítat denní statistiky</span>

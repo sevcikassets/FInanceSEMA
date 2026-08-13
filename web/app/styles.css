@@ -448,14 +448,50 @@ nav button:hover {
 
 .recalc-from {
   display: grid;
+  gap: 4px;
+  margin: 0;
+}
+
+.recalc-from label {
+  display: grid;
   gap: 6px;
   margin: 0;
   color: var(--muted);
   font-size: 12px;
 }
 
-.recalc-from input {
+.recalc-from-input-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.recalc-from-input-row input {
   min-width: 150px;
+}
+
+.recalc-from-clear {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0;
+}
+
+.recalc-from-clear:hover {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+.field-hint {
+  color: var(--muted);
+  font-size: 11px;
+  max-width: 220px;
 }
 
 .patria-import {
