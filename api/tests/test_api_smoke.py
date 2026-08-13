@@ -436,6 +436,46 @@ def test_recalculate_stocks_computes_alerts_column(db_session, monkeypatch):
 
 
 @requires_db
+def test_recalculate_stocks_reports_price_fetch_failures(db_session, monkeypatch):
+    """When Yahoo returns no history at all for a ticker (network outage,
+    rate limiting, unknown symbol), that must be visible as a top-level count
+    on the recalculate result - not just buried inside per-day alert strings,
+    which is easy to miss and previously left market values silently at 0."""
+    from app import stock_services
+    from app.models import StockTransaction
+
+    day1 = date(2024, 1, 8)  # Monday
+
+    for ticker in ("TEST", "NODATA"):
+        db_session.add(
+            StockTransaction(
+                traded_on=day1,
+                movement_type="Nákup",
+                instrument_name=ticker,
+                ticker=ticker,
+                quantity=Decimal("1"),
+                unit_price_ccy=Decimal("100"),
+                gross_amount_ccy=Decimal("100"),
+                currency="CZK",
+                amount_czk=Decimal("100"),
+            )
+        )
+    db_session.commit()
+
+    def fake_history(ticker, date_from, date_to):
+        if ticker == "TEST":
+            return {"currency": "CZK", "points": [(day1, Decimal("100"))]}
+        return {"currency": "CZK", "points": []}
+
+    monkeypatch.setattr(stock_services, "fetch_yahoo_history", fake_history)
+
+    result = stock_services.recalculate_stocks(db_session, dry_run=False)
+
+    assert result["price_fetch_failures"] == 1
+    assert result["price_fetch_failed_tickers"] == ["NODATA"]
+
+
+@requires_db
 def test_ensure_cnb_rates_up_to_date_fills_missing_weekdays(db_session, monkeypatch):
     """Port of KurzyCNB.bas's FetchCNBIfNeeded(): fetch any missing EUR/USD
     rates between the last stored date and the publish cutoff, skipping

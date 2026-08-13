@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -245,18 +246,48 @@ def import_patria_trades(db: Session, text: str) -> dict[str, Any]:
     return {"parsed": len(trades), "inserted": inserted, "skipped_duplicates": skipped}
 
 
+# Yahoo's chart endpoint blocks requests whose User-Agent doesn't look like a
+# real browser (a generic UA like "FinanceSEMA/1.0" gets silently refused with
+# a 403/999 on some networks) - mirrors an actual Chrome UA to stay reliable.
+YAHOO_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+}
+
+
+def _yahoo_get(url: str, timeout: int, attempts: int = 2) -> dict[str, Any] | None:
+    """GET a Yahoo chart URL, with one short retry - Yahoo occasionally throttles
+    back-to-back requests (recalculating a portfolio with many tickers fires
+    dozens of these in a row), and a bare single attempt turns a transient
+    throttle into a permanently-missing price for that ticker/day.
+    """
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            request = Request(url, headers=YAHOO_HEADERS)
+            with urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - network is inherently flaky here
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(0.4)
+    if last_error is not None:
+        raise last_error
+    return None
+
+
 def fetch_yahoo_price(ticker: str) -> dict[str, Decimal | str | None]:
     symbol = quote(ticker)
     urls = [
         f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d",
         f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d",
     ]
-    headers = {"User-Agent": "FinanceSEMA/1.0"}
     for url in urls:
         try:
-            request = Request(url, headers=headers)
-            with urlopen(request, timeout=12) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+            payload = _yahoo_get(url, timeout=12)
             result = payload["chart"]["result"][0]
             meta = result.get("meta", {})
             price = meta.get("regularMarketPrice") or meta.get("previousClose")
@@ -565,12 +596,19 @@ def recalculate_stocks(
     # mirrors AkcieStatistika.bas's "Krok 5b" Yahoo Finance step.
     price_dates: dict[str, list[date]] = {}
     price_values: dict[str, list[Decimal]] = {}
+    # Tickers for which Yahoo returned no price history at all (network problem,
+    # rate limiting, or an unrecognised symbol) - tracked separately from the
+    # per-day "Chybí cena" alerts so a full outage is visible as one clear
+    # number instead of being buried inside dozens of daily alert strings.
+    tickers_without_price_history: list[str] = []
     if calendar_dates:
         for ticker in positions:
             history = fetch_yahoo_history(ticker, start_date, date.today())
             points = sorted(history.get("points") or [])
             price_dates[ticker] = [point[0] for point in points]
             price_values[ticker] = [point[1] for point in points]
+            if not points:
+                tickers_without_price_history.append(ticker)
 
     def price_at_or_before(ticker: str, target: date) -> Decimal | None:
         dates = price_dates.get(ticker)
@@ -698,6 +736,8 @@ def recalculate_stocks(
         "transactions": len(transactions),
         "portfolio_positions": len(computed_positions),
         "daily_statistics": len(computed_stats),
+        "price_fetch_failures": len(tickers_without_price_history),
+        "price_fetch_failed_tickers": sorted(tickers_without_price_history)[:25],
     }
 
 
@@ -711,12 +751,9 @@ def fetch_yahoo_history(ticker: str, date_from: date, date_to: date) -> dict[str
         f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?period1={period1}&period2={period2}&interval=1d",
         f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?period1={period1}&period2={period2}&interval=1d",
     ]
-    headers = {"User-Agent": "FinanceSEMA/1.0"}
     for url in urls:
         try:
-            request = Request(url, headers=headers)
-            with urlopen(request, timeout=15) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+            payload = _yahoo_get(url, timeout=15)
             result = payload["chart"]["result"][0]
             timestamps = result.get("timestamp") or []
             closes = result["indicators"]["quote"][0].get("close") or []

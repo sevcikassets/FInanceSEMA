@@ -962,8 +962,12 @@ export default function Page() {
         result.daily_statistics === 0 && result.date_from
           ? " Zadané datum leží až po posledním dni, který má být napočítán (dnešek nebo poslední nákup) - proto se nepřepočetl žádný den. Pro plný přepočet pole vyprázdni."
           : "";
+      const priceFailureHint =
+        result.price_fetch_failures > 0
+          ? ` Pozor: pro ${result.price_fetch_failures} akcií se nepodařilo stáhnout historii cen z Yahoo Finance (${result.price_fetch_failed_tickers?.join(", ")}${result.price_fetch_failures > (result.price_fetch_failed_tickers?.length ?? 0) ? ", ..." : ""}) - jejich tržní hodnota a nerealizovaný zisk proto v daných dnech chybí nebo jsou nižší, než ve skutečnosti jsou. Zkus přepočet zopakovat později.`
+          : "";
       setStockActionStatus(
-        `${dryRun ? "Kontrolní přepočet" : "Přepočet"}${result.date_from ? ` od ${result.date_from}` : " (celá historie)"}: transakce ${result.transactions}, portfolio ${result.portfolio_positions}, statistiky ${result.daily_statistics}.${zeroStatsHint}`,
+        `${dryRun ? "Kontrolní přepočet" : "Přepočet"}${result.date_from ? ` od ${result.date_from}` : " (celá historie)"}: transakce ${result.transactions}, portfolio ${result.portfolio_positions}, statistiky ${result.daily_statistics}.${zeroStatsHint}${priceFailureHint}`,
       );
       if (!dryRun) await loadAll();
     } catch (err) {
