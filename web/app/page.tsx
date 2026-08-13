@@ -717,8 +717,12 @@ export default function Page() {
       const params = new URLSearchParams({ dry_run: dryRun ? "true" : "false" });
       if (fromDate) params.set("date_from", fromDate);
       const result = await api(`/stocks/recalculate?${params.toString()}`, { method: "POST" });
+      const zeroStatsHint =
+        result.daily_statistics === 0 && result.date_from
+          ? " Zadané datum leží až po posledním dni, který má být napočítán (dnešek nebo poslední nákup) - proto se nepřepočetl žádný den. Pro plný přepočet pole vyprázdni."
+          : "";
       setStockActionStatus(
-        `${dryRun ? "Kontrolní přepočet" : "Přepočet"}${result.date_from ? ` od ${result.date_from}` : " (celá historie)"}: transakce ${result.transactions}, portfolio ${result.portfolio_positions}, statistiky ${result.daily_statistics}.`,
+        `${dryRun ? "Kontrolní přepočet" : "Přepočet"}${result.date_from ? ` od ${result.date_from}` : " (celá historie)"}: transakce ${result.transactions}, portfolio ${result.portfolio_positions}, statistiky ${result.daily_statistics}.${zeroStatsHint}`,
       );
       if (!dryRun) await loadAll();
     } catch (err) {
@@ -1228,19 +1232,14 @@ export default function Page() {
               <div>
                 <h2>Měsíční mezisoučty</h2>
                 <p>{showStatDetail ? "Zobrazené jsou měsíce i denní detail." : "Zobrazené jsou pouze měsíční souhrny."}</p>
+                <p className="field-hint">
+                  Denní statistiky se přepočítají tlačítkem „Přepočítat" v panelu Akciový souhrn výše (podle data v poli
+                  „Napočítat od" tamtéž - {recalcFromDate ? `nyní: od ${recalcFromDate}` : "nyní: celá historie"}).
+                </p>
               </div>
               <div className="stock-actions">
                 <button className="action-button" onClick={() => setShowStatDetail((value) => !value)}>
                   <span>{showStatDetail ? "Skrýt detail" : "Zobrazit detail"}</span>
-                </button>
-                <button
-                  className="action-button"
-                  onClick={() => recalculateStockData(false)}
-                  disabled={stockBusy}
-                  title="Použije pole „Napočítat od” v panelu Akciový souhrn výše"
-                >
-                  <Calculator size={16} />
-                  <span>Napočítat denní statistiky</span>
                 </button>
               </div>
             </div>
