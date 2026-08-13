@@ -1,0 +1,58 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-finance_sema}
+      POSTGRES_USER: ${POSTGRES_USER:-finance}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-finance}
+    volumes:
+      - finance-sema-db:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5440:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-finance} -d ${POSTGRES_DB:-finance_sema}"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+
+  api:
+    build:
+      context: ./api
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://finance:finance@db:5432/finance_sema}
+      API_CORS_ORIGINS: ${API_CORS_ORIGINS:-http://localhost:3010}
+      APP_USERNAME: ${FINANCE_APP_USERNAME:-admin}
+      APP_PASSWORD: ${FINANCE_APP_PASSWORD:-finance}
+      APP_TOKEN_SECRET: ${FINANCE_APP_TOKEN_SECRET:-local-dev-secret}
+    volumes:
+      - ./imports:/imports
+      - ./exports:/app/exports
+    ports:
+      - "127.0.0.1:8010:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8010}
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8010}
+    ports:
+      - "127.0.0.1:3010:3000"
+    depends_on:
+      - api
+
+volumes:
+  finance-sema-db:

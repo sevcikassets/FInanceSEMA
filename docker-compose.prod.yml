@@ -1,0 +1,69 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-finance_sema}
+      POSTGRES_USER: ${POSTGRES_USER:-finance}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - finance-sema-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-finance} -d ${POSTGRES_DB:-finance_sema}"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+
+  api:
+    build:
+      context: ./api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-finance}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-finance_sema}
+      APP_USERNAME: ${FINANCE_APP_USERNAME}
+      APP_PASSWORD: ${FINANCE_APP_PASSWORD}
+      APP_TOKEN_SECRET: ${FINANCE_APP_TOKEN_SECRET}
+    volumes:
+      - ./imports:/imports
+      - ./exports:/app/exports
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - default
+      - proxy
+
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_API_URL: https://${DOMAIN}/api
+    restart: unless-stopped
+    env_file:
+      - .env
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.finance-sema.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.finance-sema.entrypoints=websecure"
+      - "traefik.http.routers.finance-sema.tls.certresolver=letsencrypt"
+      - "traefik.http.services.finance-sema.loadbalancer.server.port=3000"
+      - "traefik.http.routers.finance-sema-api.rule=Host(`${DOMAIN}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.finance-sema-api.entrypoints=websecure"
+      - "traefik.http.routers.finance-sema-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.finance-sema-api.middlewares=finance-sema-api-strip"
+      - "traefik.http.middlewares.finance-sema-api-strip.stripprefix.prefixes=/api"
+      - "traefik.http.services.finance-sema-api.loadbalancer.server.port=8000"
+    networks:
+      - default
+      - proxy
+    depends_on:
+      - api
+
+volumes:
+  finance-sema-db:
+
+networks:
+  proxy:
+    external: true
