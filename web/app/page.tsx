@@ -1233,8 +1233,12 @@ export default function Page() {
                 <button className="action-button" onClick={() => setShowStatDetail((value) => !value)}>
                   <span>{showStatDetail ? "Skrýt detail" : "Zobrazit detail"}</span>
                 </button>
-                <RecalcFromField value={recalcFromDate} onChange={setRecalcFromDate} />
-                <button className="action-button" onClick={() => recalculateStockData(false)} disabled={stockBusy}>
+                <button
+                  className="action-button"
+                  onClick={() => recalculateStockData(false)}
+                  disabled={stockBusy}
+                  title="Použije pole „Napočítat od” v panelu Akciový souhrn výše"
+                >
                   <Calculator size={16} />
                   <span>Napočítat denní statistiky</span>
                 </button>
