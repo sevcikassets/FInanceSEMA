@@ -21,7 +21,7 @@ import {
   WalletCards,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8010";
 
@@ -345,6 +345,169 @@ function interestPlanEntries(asset: Row): [string, number][] {
     .sort((a, b) => a[0].localeCompare(b[0]));
 }
 
+type ChartPoint = { date: string; [key: string]: number | string };
+type ChartSeriesDef = { key: string; label: string; color: string };
+
+// Lightweight custom SVG charts - no charting library dependency, so a Docker
+// rebuild never needs to fetch a new npm package. Port of AkcieStatistika.bas's
+// "Graf" sheet (Hodnota vs Investice / Nerealizovany zisk / Dividendy), fed
+// from the same daily_statistics rows already shown in the table below.
+function PortfolioChart({
+  title,
+  data,
+  mode,
+  series,
+  formatValue: formatY,
+}: {
+  title: string;
+  data: ChartPoint[];
+  mode: "lines" | "area" | "diverging-area";
+  series: ChartSeriesDef[];
+  formatValue: (value: number) => string;
+}) {
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+
+  if (data.length < 2) {
+    return (
+      <div className="portfolio-chart portfolio-chart-empty">
+        <h3>{title}</h3>
+        <p className="field-hint">Zatím málo dat pro graf.</p>
+      </div>
+    );
+  }
+
+  const width = 640;
+  const height = 220;
+  const marginLeft = 8;
+  const marginRight = 8;
+  const marginTop = 12;
+  const marginBottom = 22;
+  const plotWidth = width - marginLeft - marginRight;
+  const plotHeight = height - marginTop - marginBottom;
+
+  const allValues: number[] = [0];
+  for (const point of data) {
+    for (const s of series) allValues.push(numberValue(point[s.key]));
+  }
+  let min = Math.min(...allValues);
+  let max = Math.max(...allValues);
+  if (min === max) {
+    min -= 1;
+    max += 1;
+  }
+  const pad = (max - min) * 0.08;
+  min -= pad;
+  max += pad;
+
+  const xAt = (index: number) => marginLeft + (data.length === 1 ? plotWidth / 2 : (index / (data.length - 1)) * plotWidth);
+  const yAt = (value: number) => marginTop + plotHeight - ((value - min) / (max - min)) * plotHeight;
+  const zeroY = yAt(0);
+
+  function linePath(key: string) {
+    return data.map((point, index) => `${index === 0 ? "M" : "L"} ${xAt(index).toFixed(1)} ${yAt(numberValue(point[key])).toFixed(1)}`).join(" ");
+  }
+
+  function areaPath(key: string, clamp: "positive" | "negative" | null) {
+    const values = data.map((point) => {
+      const raw = numberValue(point[key]);
+      if (clamp === "positive") return Math.max(raw, 0);
+      if (clamp === "negative") return Math.min(raw, 0);
+      return raw;
+    });
+    const top = values.map((value, index) => `${index === 0 ? "M" : "L"} ${xAt(index).toFixed(1)} ${yAt(value).toFixed(1)}`).join(" ");
+    return `${top} L ${xAt(data.length - 1).toFixed(1)} ${zeroY.toFixed(1)} L ${xAt(0).toFixed(1)} ${zeroY.toFixed(1)} Z`;
+  }
+
+  function handleMove(event: ReactMouseEvent<SVGSVGElement>) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (rect.width === 0) return;
+    const relativeX = ((event.clientX - rect.left) / rect.width) * width;
+    const ratio = (relativeX - marginLeft) / plotWidth;
+    const index = Math.round(ratio * (data.length - 1));
+    setHoverIndex(Math.min(Math.max(index, 0), data.length - 1));
+  }
+
+  const hoverPoint = hoverIndex !== null ? data[hoverIndex] : null;
+
+  return (
+    <div className="portfolio-chart">
+      <div className="portfolio-chart-header">
+        <h3>{title}</h3>
+        {mode === "lines" && (
+          <div className="portfolio-chart-legend">
+            {series.map((s) => (
+              <span key={s.key} className="portfolio-chart-legend-item">
+                <span className="portfolio-chart-swatch" style={{ background: s.color }} />
+                {s.label}
+              </span>
+            ))}
+          </div>
+        )}
+        {mode === "diverging-area" && (
+          <div className="portfolio-chart-legend">
+            <span className="portfolio-chart-legend-item">
+              <span className="portfolio-chart-swatch positive" />
+              Zisk
+            </span>
+            <span className="portfolio-chart-legend-item">
+              <span className="portfolio-chart-swatch negative" />
+              Ztráta
+            </span>
+          </div>
+        )}
+      </div>
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        preserveAspectRatio="none"
+        className="portfolio-chart-svg"
+        onMouseMove={handleMove}
+        onMouseLeave={() => setHoverIndex(null)}
+        role="img"
+        aria-label={title}
+      >
+        {mode !== "lines" && (
+          <line x1={marginLeft} x2={width - marginRight} y1={zeroY} y2={zeroY} className="portfolio-chart-baseline" />
+        )}
+        {mode === "lines" &&
+          series.map((s) => <path key={s.key} d={linePath(s.key)} fill="none" stroke={s.color} strokeWidth={2} />)}
+        {mode === "area" && (
+          <path d={areaPath(series[0].key, null)} fill={series[0].color} fillOpacity={0.22} stroke={series[0].color} strokeWidth={2} />
+        )}
+        {mode === "diverging-area" && (
+          <>
+            <path d={areaPath(series[0].key, "positive")} className="portfolio-chart-fill positive" stroke="none" />
+            <path d={areaPath(series[0].key, "negative")} className="portfolio-chart-fill negative" stroke="none" />
+            <path d={linePath(series[0].key)} fill="none" stroke="var(--accent)" strokeWidth={1.5} />
+          </>
+        )}
+        {hoverPoint && (
+          <line
+            x1={xAt(hoverIndex as number)}
+            x2={xAt(hoverIndex as number)}
+            y1={marginTop}
+            y2={marginTop + plotHeight}
+            className="portfolio-chart-crosshair"
+          />
+        )}
+      </svg>
+      <div className="portfolio-chart-axis">
+        <span>{formatDateWithWeekday(String(data[0].date))}</span>
+        <span>{formatDateWithWeekday(String(data[data.length - 1].date))}</span>
+      </div>
+      {hoverPoint && (
+        <div className="portfolio-chart-tooltip">
+          <strong>{formatDateWithWeekday(String(hoverPoint.date))}</strong>
+          {series.map((s) => (
+            <span key={s.key}>
+              {s.label}: {formatY(numberValue(hoverPoint[s.key]))}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Fields that are genuinely a fraction (0.05 = 5 %). Everything else called
 // "*_rate" (eur_rate, usd_rate, rate_to_czk, the ticker-history "rate" column)
 // is an actual exchange rate/kurz (e.g. 24.685 CZK per EUR), not a percentage -
@@ -363,6 +526,23 @@ function formatValue(key: string, value: Row[string]) {
     return new Intl.NumberFormat("cs-CZ", { maximumFractionDigits: 2 }).format(value);
   }
   return String(value);
+}
+
+const STAT_RATE_COLUMNS = new Set(["eur_rate", "usd_rate"]);
+
+// Same fixed decimal counts as the Excel sheet's number formats ("#,##0" for
+// money, "#,##0.0000" for Kurz EUR/USD) - a FIXED (not maximum) number of
+// decimal places everywhere, so the digits line up column by column instead
+// of drifting depending on whether a given day happens to be a whole number.
+function formatStatValue(key: string, value: Row[string]) {
+  if (typeof value !== "number") return formatValue(key, value);
+  if (PERCENT_KEYS.has(key)) {
+    return new Intl.NumberFormat("cs-CZ", { style: "percent", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
+  }
+  if (STAT_RATE_COLUMNS.has(key)) {
+    return new Intl.NumberFormat("cs-CZ", { minimumFractionDigits: 4, maximumFractionDigits: 4 }).format(value);
+  }
+  return new Intl.NumberFormat("cs-CZ", { minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(value);
 }
 
 function isNumericCell(value: Row[string]) {
@@ -544,6 +724,19 @@ export default function Page() {
       : activeTab === "costs"
         ? buildCostRows(rows, costAssetFilter, showCostDetail)
         : rows;
+  const chartData = useMemo(() => {
+    if (activeTab !== "stats") return [];
+    return [...rows]
+      .filter((row) => row.stat_date)
+      .sort((a, b) => String(a.stat_date).localeCompare(String(b.stat_date)))
+      .map((row) => ({
+        date: String(row.stat_date),
+        invested_czk: numberValue(row.invested_czk),
+        total_value_czk: numberValue(row.total_value_czk),
+        unrealized_profit_czk: numberValue(row.unrealized_profit_czk),
+        dividends_total: numberValue(row.dividends_total),
+      }));
+  }, [rows, activeTab]);
 
   function toggleStatMonth(monthKey: string) {
     setExpandedStatMonths((current) => {
@@ -1274,6 +1467,42 @@ export default function Page() {
           </section>
         )}
 
+        {activeTab === "stats" && chartData.length > 0 && (
+          <section className="work-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Grafy portfolia</h2>
+                <p>Z posledních {chartData.length} obchodních dnů.</p>
+              </div>
+            </div>
+            <div className="portfolio-charts-grid">
+              <PortfolioChart
+                title="Hodnota portfolia vs Investice"
+                mode="lines"
+                data={chartData}
+                series={[
+                  { key: "invested_czk", label: "Investice CZK", color: "#2a78d6" },
+                  { key: "total_value_czk", label: "Hodnota CZK", color: "#eb6834" },
+                ]}
+                formatValue={money}
+              />
+              <PortfolioChart
+                title="Nerealizovaný zisk / ztráta (CZK)"
+                mode="diverging-area"
+                data={chartData}
+                series={[{ key: "unrealized_profit_czk", label: "Nereal. zisk", color: "var(--accent)" }]}
+                formatValue={money}
+              />
+              <PortfolioChart
+                title="Dividendy kumulativně"
+                mode="area"
+                data={chartData}
+                series={[{ key: "dividends_total", label: "Dividendy", color: "#1baf7a" }]}
+                formatValue={money}
+              />
+            </div>
+          </section>
+        )}
 
         {activeTab === "assets" && assetAgendas.length > 0 && (
           <section className="asset-agendas">
@@ -1391,6 +1620,8 @@ export default function Page() {
                           <span className={numberValue(row[col]) >= 0 ? "positive" : "negative"}>
                             {formatSignedProfit(numberValue(row[col]))}
                           </span>
+                        ) : activeTab === "stats" ? (
+                          formatStatValue(col, row[col])
                         ) : (
                           formatValue(col, row[col])
                         )}

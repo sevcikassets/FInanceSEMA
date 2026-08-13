@@ -386,3 +386,114 @@ def test_recalculate_stocks_excludes_weekend_fill_days(db_session, monkeypatch):
     assert db_session.get(DailyStatistic, saturday_with_trade) is not None  # real trade, kept despite weekend
     assert db_session.get(DailyStatistic, sunday_empty) is None  # empty weekend fill day - excluded
     assert db_session.get(DailyStatistic, next_monday) is not None  # weekday
+
+
+@requires_db
+def test_recalculate_stocks_computes_alerts_column(db_session, monkeypatch):
+    """Port of AkcieStatistika.bas's 'Upozorneni' column: a day-over-day price
+    move past the threshold, and a ticker with no price data at all, must both
+    show up in DailyStatistic.alerts - it used to always be written as None."""
+    from app import stock_services
+    from app.models import DailyStatistic, StockTransaction
+
+    day1 = date(2024, 1, 8)  # Monday
+    day2 = date(2024, 1, 9)  # Tuesday - flat price, no data for NODATA
+    day3 = date(2024, 1, 10)  # Wednesday - TEST jumps +30%, still no data for NODATA
+
+    for ticker, price in (("TEST", 100), ("NODATA", 50)):
+        db_session.add(
+            StockTransaction(
+                traded_on=day1,
+                movement_type="Nákup",
+                instrument_name=ticker,
+                ticker=ticker,
+                quantity=Decimal("1"),
+                unit_price_ccy=Decimal(price),
+                gross_amount_ccy=Decimal(price),
+                currency="CZK",
+                amount_czk=Decimal(price),
+            )
+        )
+    db_session.commit()
+
+    def fake_history(ticker, date_from, date_to):
+        if ticker == "TEST":
+            return {"currency": "CZK", "points": [(day1, Decimal("100")), (day2, Decimal("100")), (day3, Decimal("130"))]}
+        return {"currency": "CZK", "points": []}  # NODATA: nothing ever comes back from Yahoo
+
+    monkeypatch.setattr(stock_services, "fetch_yahoo_history", fake_history)
+
+    stock_services.recalculate_stocks(db_session, dry_run=False, threshold_pct=Decimal("10"))
+
+    day2_row = db_session.get(DailyStatistic, day2)
+    assert day2_row is not None
+    assert day2_row.alerts == "Chybí cena: NODATA"  # TEST unchanged (0%), below threshold - no mover listed
+
+    day3_row = db_session.get(DailyStatistic, day3)
+    assert day3_row is not None
+    assert "TEST (D:+30.0%)" in day3_row.alerts
+    assert "Chybí cena: NODATA" in day3_row.alerts
+
+
+@requires_db
+def test_ensure_cnb_rates_up_to_date_fills_missing_weekdays(db_session, monkeypatch):
+    """Port of KurzyCNB.bas's FetchCNBIfNeeded(): fetch any missing EUR/USD
+    rates between the last stored date and the publish cutoff, skipping
+    weekends. Previously nothing called this automatically before a
+    recalculate - rates only ever updated via a separate manual step."""
+    from app import main
+    from app.models import ExchangeRate
+
+    last_stored = date(2024, 1, 5)  # Friday
+    for currency, rate in (("EUR", "25.0"), ("USD", "23.0")):
+        db_session.add(ExchangeRate(rate_date=last_stored, currency=currency, rate_to_czk=Decimal(rate)))
+    db_session.commit()
+
+    # Cutoff a week later so the fill spans a weekend that must be skipped.
+    monkeypatch.setattr(main, "cnb_cutoff_date", lambda: date(2024, 1, 12))
+
+    fetched_dates: list[date] = []
+
+    def fake_fetch(rate_date):
+        fetched_dates.append(rate_date)
+        return [
+            {"rate_date": rate_date, "currency": "EUR", "rate_to_czk": Decimal("25.1")},
+            {"rate_date": rate_date, "currency": "USD", "rate_to_czk": Decimal("23.1")},
+        ]
+
+    monkeypatch.setattr(main, "fetch_cnb_rates", fake_fetch)
+
+    added = main.ensure_cnb_rates_up_to_date(db_session)
+
+    # 2024-01-08 .. 2024-01-12 are Mon-Fri; 01-06/01-07 (Sat/Sun) must be skipped.
+    assert fetched_dates == [date(2024, 1, 8), date(2024, 1, 9), date(2024, 1, 10), date(2024, 1, 11), date(2024, 1, 12)]
+    assert added == 10  # 5 days x 2 currencies
+
+    from sqlalchemy import select as sa_select
+
+    friday_rate = db_session.scalar(
+        sa_select(ExchangeRate).where(ExchangeRate.rate_date == date(2024, 1, 12), ExchangeRate.currency == "EUR")
+    )
+    assert friday_rate is not None
+    assert friday_rate.rate_to_czk == Decimal("25.1")
+
+
+@requires_db
+def test_ensure_cnb_rates_up_to_date_skips_when_history_empty(db_session, monkeypatch):
+    """Matches the VBA's own guard: an empty rates table is left alone rather
+    than triggering a bulk backfill as a side effect of a routine recompute."""
+    from app import main
+
+    called = False
+
+    def fake_fetch(rate_date):
+        nonlocal called
+        called = True
+        return []
+
+    monkeypatch.setattr(main, "fetch_cnb_rates", fake_fetch)
+
+    added = main.ensure_cnb_rates_up_to_date(db_session)
+
+    assert added == 0
+    assert called is False

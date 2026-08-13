@@ -411,7 +411,9 @@ def movement_is_dividend(value: str | None) -> bool:
     return text in {"dividenda", "dividend"}
 
 
-def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | None = None) -> dict[str, Any]:
+def recalculate_stocks(
+    db: Session, dry_run: bool = False, date_from: date | None = None, threshold_pct: Decimal | float = Decimal("10")
+) -> dict[str, Any]:
     """Recompute portfolio positions and daily statistics from `stock_transactions`.
 
     Portfolio positions are always a full recompute (they reflect current state,
@@ -534,6 +536,7 @@ def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | Non
             decimal_or_zero(position.market_value_czk) / total_market_value if total_market_value else None
         )
 
+    alert_threshold = Decimal(str(threshold_pct))
     computed_stats: list[DailyStatistic] = []
     total_eur = ZERO
     total_usd = ZERO
@@ -601,15 +604,21 @@ def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | Non
                 ticker_running_qty[ticker] += change
 
         # Market value of everything actually held on this day, bucketed by
-        # trading currency - not the invested/purchased amount.
+        # trading currency - not the invested/purchased amount. Also flags two
+        # kinds of "Upozorneni" (AkcieStatistika.bas): a day-over-day price
+        # move past `alert_threshold`, or a ticker held that day with no price
+        # data at all for it.
         value_eur = ZERO
         value_usd = ZERO
         value_czk = ZERO
+        movers: list[str] = []
+        missing_price_tickers: list[str] = []
         for ticker, qty in ticker_running_qty.items():
             if qty <= ZERO:
                 continue
             price = price_at_or_before(ticker, stat_date)
             if price is None:
+                missing_price_tickers.append(ticker)
                 continue
             ticker_currency = (positions[ticker]["currency"] or "CZK").upper()
             holding_value = qty * price
@@ -619,6 +628,19 @@ def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | Non
                 value_usd += holding_value
             else:
                 value_czk += holding_value
+
+            price_yesterday = price_at_or_before(ticker, stat_date - timedelta(days=1))
+            if price_yesterday and price_yesterday > ZERO:
+                pct_change = (price / price_yesterday - ONE) * Decimal("100")
+                if abs(pct_change) >= alert_threshold:
+                    movers.append(f"{ticker} (D:{pct_change:+.1f}%)")
+
+        alert_bits = []
+        if movers:
+            alert_bits.append(", ".join(movers))
+        if missing_price_tickers:
+            alert_bits.append("Chybí cena: " + ", ".join(missing_price_tickers))
+        day_alerts = " | ".join(alert_bits) if alert_bits else None
 
         total_value_czk = value_czk + (value_eur * eur_rate) + (value_usd * usd_rate)
         unrealized = total_value_czk - invested_total
@@ -654,7 +676,7 @@ def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | Non
                     ((total_value_czk + dividends_total - invested_total) / invested_total) if invested_total else None
                 ),
                 daily_profit_czk=daily_profit,
-                alerts=None,
+                alerts=day_alerts,
             )
         )
 

@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import unicodedata
 from pathlib import Path
@@ -6,6 +6,13 @@ from tempfile import NamedTemporaryFile
 from typing import Any
 from urllib.parse import urlencode
 from urllib.request import urlopen
+
+try:
+    from zoneinfo import ZoneInfo
+
+    PRAGUE_TZ: Any = ZoneInfo("Europe/Prague")
+except Exception:  # tzdata not installed - fall back to naive local time
+    PRAGUE_TZ = None
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -163,6 +170,52 @@ def fetch_cnb_rates(rate_date: date) -> list[dict[str, Any]]:
     if not rows:
         raise HTTPException(status_code=502, detail="CNB response did not contain exchange rates")
     return rows
+
+
+def cnb_cutoff_date() -> date:
+    """CNB publishes each day's rate around 14:30 Prague time - before that,
+    only yesterday's rate is available yet. Mirrors KurzyCNB.bas's
+    FetchCNBIfNeeded ("pred 14:30 -> do vcera, po 14:30 -> vcetne dneska")."""
+    now = datetime.now(PRAGUE_TZ) if PRAGUE_TZ else datetime.now()
+    if (now.hour, now.minute) >= (14, 30):
+        return now.date()
+    return now.date() - timedelta(days=1)
+
+
+def ensure_cnb_rates_up_to_date(db: Session) -> int:
+    """Auto-fetch any missing EUR/USD CNB rates up to the publish cutoff, so a
+    recalculation always uses current exchange rates without a separate manual
+    "Kurzy CNB" step - mirrors AktualizujStatistiku's automatic call to
+    FetchCNBIfNeeded() at the start of every recompute. If either currency has
+    no rates stored at all yet, this is skipped (same as the VBA's empty-sheet
+    guard) - a first manual fetch is expected to seed the history.
+    """
+    last_dates: list[date] = []
+    for currency in ("EUR", "USD"):
+        row = db.scalar(
+            select(ExchangeRate).where(ExchangeRate.currency == currency).order_by(desc(ExchangeRate.rate_date)).limit(1)
+        )
+        if row is None:
+            return 0
+        last_dates.append(row.rate_date)
+
+    cutoff = cnb_cutoff_date()
+    check_date = min(last_dates) + timedelta(days=1)
+    added = 0
+    while check_date <= cutoff:
+        if check_date.weekday() < 5:  # CNB doesn't publish on weekends
+            try:
+                rows = fetch_cnb_rates(check_date)
+            except HTTPException:
+                rows = []
+            for row in rows:
+                if row["currency"] in ("EUR", "USD"):
+                    upsert_rate(db, row["rate_date"], row["currency"], row["rate_to_czk"])
+                    added += 1
+        check_date += timedelta(days=1)
+    if added:
+        db.commit()
+    return added
 
 
 app = FastAPI(title="FinanceSEMA API")
@@ -472,8 +525,15 @@ def recalculate_stock_data(
     db: Session = Depends(get_db),
     dry_run: bool = False,
     date_from: date | None = Query(default=None),
+    threshold_pct: Decimal = Query(default=Decimal("10")),
 ) -> dict[str, Any]:
-    return recalculate_stocks(db, dry_run=dry_run, date_from=date_from)
+    # Auto-fetch missing CNB rates first, same as AktualizujStatistiku always
+    # does before recomputing - but only for a real (non-preview) run, so
+    # "Kontrola (náhled)" keeps its "nothing gets saved" promise.
+    cnb_rates_added = ensure_cnb_rates_up_to_date(db) if not dry_run else 0
+    result = recalculate_stocks(db, dry_run=dry_run, date_from=date_from, threshold_pct=threshold_pct)
+    result["cnb_rates_added"] = cnb_rates_added
+    return result
 
 
 @app.get("/rates")

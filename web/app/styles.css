@@ -848,6 +848,127 @@ nav button:hover {
   max-height: calc(100vh - 300px);
 }
 
+.portfolio-charts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px;
+}
+
+.portfolio-chart {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px 8px;
+  background: #fff;
+  position: relative;
+}
+
+.portfolio-chart-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 120px;
+  justify-content: center;
+}
+
+.portfolio-chart-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.portfolio-chart-header h3 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.portfolio-chart-legend {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.portfolio-chart-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.portfolio-chart-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+.portfolio-chart-swatch.positive {
+  background: var(--good);
+}
+
+.portfolio-chart-swatch.negative {
+  background: var(--bad);
+}
+
+.portfolio-chart-svg {
+  width: 100%;
+  height: 160px;
+  display: block;
+  cursor: crosshair;
+}
+
+.portfolio-chart-fill.positive {
+  fill: var(--good);
+  fill-opacity: 0.2;
+}
+
+.portfolio-chart-fill.negative {
+  fill: var(--bad);
+  fill-opacity: 0.2;
+}
+
+.portfolio-chart-baseline {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.portfolio-chart-crosshair {
+  stroke: var(--muted);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+
+.portfolio-chart-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.portfolio-chart-tooltip {
+  position: absolute;
+  top: 30px;
+  right: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.08);
+  pointer-events: none;
+}
+
+.portfolio-chart-tooltip strong {
+  font-size: 11px;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

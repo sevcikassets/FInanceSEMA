@@ -6,3 +6,4 @@ pydantic-settings==2.7.0
 python-multipart==0.0.20
 openpyxl==3.1.5
 PyJWT==2.10.1
+tzdata==2024.2
