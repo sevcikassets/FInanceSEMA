@@ -451,6 +451,7 @@ export default function Page() {
   const [historyTo, setHistoryTo] = useState(new Date().toISOString().slice(0, 10));
   const [historyResult, setHistoryResult] = useState<TickerHistoryResult | null>(null);
   const [historyBusy, setHistoryBusy] = useState(false);
+  const [recalcFromDate, setRecalcFromDate] = useState("");
   const [workingMessage, setWorkingMessage] = useState<string | null>(null);
   const [newUser, setNewUser] = useState({
     username: "",
@@ -678,11 +679,20 @@ export default function Page() {
     setError(null);
     setStockActionStatus(null);
     setStockBusy(true);
-    setWorkingMessage(dryRun ? "Počítám kontrolní náhled portfolia a denní statistiky" : "Přepočítávám portfolio a denní statistiku");
+    const fromDate = recalcFromDate.trim();
+    setWorkingMessage(
+      dryRun
+        ? "Počítám kontrolní náhled portfolia a denní statistiky"
+        : fromDate
+          ? `Přepočítávám portfolio a denní statistiku od ${fromDate}`
+          : "Přepočítávám portfolio a celou historii denní statistiky",
+    );
     try {
-      const result = await api(`/stocks/recalculate?dry_run=${dryRun ? "true" : "false"}`, { method: "POST" });
+      const params = new URLSearchParams({ dry_run: dryRun ? "true" : "false" });
+      if (fromDate) params.set("date_from", fromDate);
+      const result = await api(`/stocks/recalculate?${params.toString()}`, { method: "POST" });
       setStockActionStatus(
-        `${dryRun ? "Kontrolní přepočet" : "Přepočet"}: transakce ${result.transactions}, portfolio ${result.portfolio_positions}, statistiky ${result.daily_statistics}.`,
+        `${dryRun ? "Kontrolní přepočet" : "Přepočet"}${result.date_from ? ` od ${result.date_from}` : " (celá historie)"}: transakce ${result.transactions}, portfolio ${result.portfolio_positions}, statistiky ${result.daily_statistics}.`,
       );
       if (!dryRun) await loadAll();
     } catch (err) {
@@ -1042,6 +1052,15 @@ export default function Page() {
                   <RefreshCw size={16} />
                   <span>Ceny</span>
                 </button>
+                <label className="recalc-from">
+                  Napočítat od
+                  <input
+                    type="date"
+                    value={recalcFromDate}
+                    onChange={(event) => setRecalcFromDate(event.target.value)}
+                    title="Prázdné = přepočítat celou historii denní statistiky. Vyplněné datum přepočítá jen dny od tohoto data dál, starší řádky zůstanou beze změny."
+                  />
+                </label>
                 <button className="action-button" onClick={() => recalculateStockData(true)} disabled={stockBusy}>
                   <Calculator size={16} />
                   <span>Kontrola</span>

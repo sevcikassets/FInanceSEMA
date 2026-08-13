@@ -471,8 +471,9 @@ def recalculate_stock_data(
     _: str = Depends(require_user),
     db: Session = Depends(get_db),
     dry_run: bool = False,
+    date_from: date | None = Query(default=None),
 ) -> dict[str, Any]:
-    return recalculate_stocks(db, dry_run=dry_run)
+    return recalculate_stocks(db, dry_run=dry_run, date_from=date_from)
 
 
 @app.get("/rates")

@@ -441,8 +441,21 @@ nav button:hover {
 .stock-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: end;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.recalc-from {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.recalc-from input {
+  min-width: 150px;
 }
 
 .patria-import {

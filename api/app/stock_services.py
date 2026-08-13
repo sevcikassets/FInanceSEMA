@@ -405,7 +405,18 @@ def movement_is_dividend(value: str | None) -> bool:
     return text in {"dividenda", "dividend"}
 
 
-def recalculate_stocks(db: Session, dry_run: bool = False) -> dict[str, Any]:
+def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | None = None) -> dict[str, Any]:
+    """Recompute portfolio positions and daily statistics from `stock_transactions`.
+
+    Portfolio positions are always a full recompute (they reflect current state,
+    not a point in time). Daily statistics mirror the incremental behaviour of
+    `AktualizujStatistiku` in AkcieStatistika.bas ("Zpracovat od"): cumulative
+    running totals (Σ EUR/USD/CZK, invested, dividends) are always accumulated
+    from the very first transaction so the figures stay correct, but when
+    `date_from` is given, only statistic rows on or after that date are
+    (re)written - earlier rows already stored in `daily_statistics` are left
+    untouched. Omit `date_from` for a full recompute of the whole history.
+    """
     existing_prices = {
         row.ticker: row.current_price for row in db.scalars(select(PortfolioPosition)).all() if row.ticker and row.current_price is not None
     }
@@ -530,6 +541,8 @@ def recalculate_stocks(db: Session, dry_run: bool = False) -> dict[str, Any]:
         unrealized = value_czk - invested_total
         daily_profit = value_czk - previous_value_czk
         previous_value_czk = value_czk
+        if date_from is not None and stat_date < date_from:
+            continue
         computed_stats.append(
             DailyStatistic(
                 stat_date=stat_date,
@@ -559,15 +572,19 @@ def recalculate_stocks(db: Session, dry_run: bool = False) -> dict[str, Any]:
 
     if not dry_run:
         db.query(PortfolioPosition).delete()
-        db.query(DailyStatistic).delete()
         for position in computed_positions:
             db.add(position)
+        if date_from is not None:
+            db.query(DailyStatistic).filter(DailyStatistic.stat_date >= date_from).delete()
+        else:
+            db.query(DailyStatistic).delete()
         for statistic in computed_stats:
             db.add(statistic)
         db.commit()
 
     return {
         "dry_run": dry_run,
+        "date_from": date_from,
         "transactions": len(transactions),
         "portfolio_positions": len(computed_positions),
         "daily_statistics": len(computed_stats),
