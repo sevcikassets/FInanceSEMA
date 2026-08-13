@@ -391,8 +391,13 @@ def compute_alerts(db: Session, threshold_pct: Decimal | float = Decimal("10")) 
 
 
 def movement_is_buy(value: str | None) -> bool:
+    # AkcieStatistika.bas is explicit about this: "POUZE nakup a prodej -- vsechny
+    # ostatni pohyby (Tip apod.) se preskakuji" - watchlist/tip/plan rows are
+    # hypothetical, not real purchases, and must not feed the real portfolio or
+    # daily-statistics totals (that previously made recalculated figures diverge
+    # from the imported Excel numbers).
     text = (value or "").strip().lower()
-    return text in {"nákup", "nakup", "buy", "plán", "plan", "tip", "watchlist"}
+    return text in {"nákup", "nakup", "buy"}
 
 
 def movement_is_sell(value: str | None) -> bool:
@@ -451,7 +456,10 @@ def recalculate_stocks(db: Session, dry_run: bool = False, date_from: date | Non
                 "name": transaction.instrument_name,
                 "quantity": ZERO,
                 "invested_czk": ZERO,
-                "first_buy_date": traded_on,
+                # Only ever set from an actual "nákup" row below - a watchlist/tip/plan
+                # row touching this ticker first (chronologically) must not masquerade
+                # as the real first purchase date.
+                "first_buy_date": None,
                 "currency": currency,
                 "current_price": existing_prices.get(ticker) or transaction.current_price,
             },

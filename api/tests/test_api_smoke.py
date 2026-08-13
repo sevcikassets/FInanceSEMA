@@ -231,3 +231,56 @@ def test_recalculate_stocks_date_from_preserves_earlier_rows(db_session):
     assert feb10_after is not None
     # Cumulative total still reflects all three purchases (100+110+120), not just the Feb one.
     assert feb10_after.total_czk == Decimal("330")
+
+
+@requires_db
+def test_recalculate_stocks_ignores_watchlist_tip_and_plan_rows(db_session):
+    """Regression test: watchlist/tip/plan rows in `stock_transactions` (imported
+    verbatim from the "Akcie" sheet, which mixes real purchases with hypothetical
+    ones) must not be counted as real purchases - AkcieStatistika.bas only ever
+    processes "nakup"/"prodej" rows. Before the fix, `movement_is_buy` treated
+    "tip"/"watchlist"/"plán" as regular buys, which inflated portfolio quantity/
+    invested_czk and the daily statistics totals beyond what the imported Excel
+    figures showed."""
+    from app import stock_services
+    from app.models import PortfolioPosition, StockTransaction
+
+    # A real purchase of 1 share for 1000 CZK.
+    db_session.add(
+        StockTransaction(
+            traded_on=date(2024, 1, 10),
+            movement_type="Nákup",
+            instrument_name="Apple",
+            ticker="AAPL",
+            quantity=Decimal("1"),
+            unit_price_ccy=Decimal("1000"),
+            gross_amount_ccy=Decimal("1000"),
+            currency="CZK",
+            amount_czk=Decimal("1000"),
+        )
+    )
+    # A watchlist/tip/plan row for the same ticker that must be ignored entirely.
+    for movement in ("Tip", "Sledované", "Plán"):
+        db_session.add(
+            StockTransaction(
+                traded_on=date(2023, 1, 1),  # earlier than the real purchase, to also exercise first_buy_date
+                movement_type=movement,
+                instrument_name="Apple",
+                ticker="AAPL",
+                quantity=Decimal("100"),
+                unit_price_ccy=Decimal("1"),
+                gross_amount_ccy=Decimal("100"),
+                currency="CZK",
+                amount_czk=Decimal("100"),
+            )
+        )
+    db_session.commit()
+
+    stock_services.recalculate_stocks(db_session, dry_run=False)
+
+    position = db_session.get(PortfolioPosition, "AAPL")
+    assert position is not None
+    assert position.quantity == Decimal("1")
+    assert position.invested_czk == Decimal("1000")
+    # The real purchase date, not the earlier watchlist/tip/plan row's date.
+    assert position.first_buy_date == date(2024, 1, 10)

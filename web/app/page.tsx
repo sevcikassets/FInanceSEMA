@@ -1206,13 +1206,24 @@ export default function Page() {
                 <h2>Měsíční mezisoučty</h2>
                 <p>{showStatDetail ? "Zobrazené jsou měsíce i denní detail." : "Zobrazené jsou pouze měsíční souhrny."}</p>
               </div>
-              <button className="action-button" onClick={() => setShowStatDetail((value) => !value)}>
-                <span>{showStatDetail ? "Skrýt detail" : "Zobrazit detail"}</span>
-              </button>
-              <button className="action-button" onClick={() => recalculateStockData(false)} disabled={stockBusy}>
-                <Calculator size={16} />
-                <span>Napočítat denní statistiky</span>
-              </button>
+              <div className="stock-actions">
+                <button className="action-button" onClick={() => setShowStatDetail((value) => !value)}>
+                  <span>{showStatDetail ? "Skrýt detail" : "Zobrazit detail"}</span>
+                </button>
+                <label className="recalc-from">
+                  Napočítat od
+                  <input
+                    type="date"
+                    value={recalcFromDate}
+                    onChange={(event) => setRecalcFromDate(event.target.value)}
+                    title="Prázdné = přepočítat celou historii. Vyplněné datum přepočítá jen dny od tohoto data dál, starší řádky zůstanou beze změny."
+                  />
+                </label>
+                <button className="action-button" onClick={() => recalculateStockData(false)} disabled={stockBusy}>
+                  <Calculator size={16} />
+                  <span>Napočítat denní statistiky</span>
+                </button>
+              </div>
             </div>
           </section>
         )}

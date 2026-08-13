@@ -38,8 +38,15 @@ def test_normalize_ticker_adds_exchange_suffix():
 
 def test_movement_classification_helpers():
     assert movement_is_buy("Nákup")
-    assert movement_is_buy("watchlist")
+    assert movement_is_buy("nakup")
     assert not movement_is_buy("Prodej")
+    # AkcieStatistika.bas is explicit: "POUZE nakup a prodej -- vsechny ostatni
+    # pohyby (Tip apod.) se preskakuji". Watchlist/tip/plan rows are hypothetical
+    # and must never be counted as real purchases.
+    assert not movement_is_buy("watchlist")
+    assert not movement_is_buy("tip")
+    assert not movement_is_buy("plán")
+    assert not movement_is_buy("plan")
     assert movement_is_sell("prodej")
     assert movement_is_dividend("Dividenda")
     assert not movement_is_dividend("Nákup")
