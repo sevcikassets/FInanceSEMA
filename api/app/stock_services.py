@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import re
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -406,13 +407,18 @@ def refresh_current_prices(db: Session, threshold_pct: Decimal | float = Decimal
     return {"updated": updated, "errors": errors[:25], "movers": sorted(movers, key=lambda m: abs(m["change_pct"]), reverse=True)}
 
 
+DAILY_MOVER_RE = re.compile(r"(\S+) \(D:([+-][\d.]+)%\)")
+
+
 def compute_alerts(db: Session, threshold_pct: Decimal | float = Decimal("10")) -> dict[str, Any]:
-    """Pragmatic replacement for the watchlist/drawdown alerts computed by
-    AktualizujHodnotu.bas / AkcieStatistika.bas: tickers whose price has reached
-    the watchlist limit, and portfolio positions down more than ``threshold_pct``
-    versus their average purchase cost. Day-over-day price-move alerts are
-    reported by `refresh_current_prices` (its `movers` list), since that is the
-    point where the previous price is still known.
+    """The three "Upozorneni" categories AkcieStatistika.bas/AktualizujHodnotu.bas
+    surface: tickers whose price has reached the watchlist limit, portfolio
+    positions down more than ``threshold_pct`` versus their average purchase
+    cost, and day-over-day price moves past the same threshold. The first two
+    are computed live from current prices; day movers are parsed out of the
+    most recent DailyStatistic.alerts text (already computed properly from
+    Yahoo historical closes during a recalculation - see recalculate_stocks),
+    rather than recomputed here from only the last-refreshed price.
     """
     threshold = Decimal(str(threshold_pct))
     watchlist_alerts: list[dict[str, Any]] = []
@@ -445,10 +451,19 @@ def compute_alerts(db: Session, threshold_pct: Decimal | float = Decimal("10")) 
                 }
             )
 
+    latest_stat = db.scalar(select(DailyStatistic).order_by(desc(DailyStatistic.stat_date)).limit(1))
+    daily_movers: list[dict[str, Any]] = []
+    if latest_stat is not None and latest_stat.alerts:
+        for ticker, pct_text in DAILY_MOVER_RE.findall(latest_stat.alerts):
+            daily_movers.append({"ticker": ticker, "change_pct": float(pct_text)})
+    daily_movers.sort(key=lambda item: abs(item["change_pct"]), reverse=True)
+
     return {
         "threshold_pct": to_number(threshold),
         "watchlist_limit_breaches": sorted(watchlist_alerts, key=lambda item: item["ticker"] or ""),
         "portfolio_drawdowns": sorted(drawdown_alerts, key=lambda item: item["profit_pct"]),
+        "daily_movers": daily_movers,
+        "daily_movers_as_of": latest_stat.stat_date.isoformat() if latest_stat is not None else None,
     }
 
 

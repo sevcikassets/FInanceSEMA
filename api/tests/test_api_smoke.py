@@ -6,8 +6,10 @@ All figures below are fictional test fixtures, not real financial data.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
+
+from sqlalchemy import select
 
 from .conftest import requires_db
 
@@ -47,7 +49,7 @@ def test_refresh_current_prices_does_not_crash_for_watchlist_only_ticker(db_sess
 @requires_db
 def test_compute_alerts_reports_watchlist_breach_and_drawdown(db_session):
     from app import stock_services
-    from app.models import PortfolioPosition, WatchlistStock
+    from app.models import DailyStatistic, PortfolioPosition, WatchlistStock
 
     db_session.add(
         WatchlistStock(
@@ -72,11 +74,25 @@ def test_compute_alerts_reports_watchlist_breach_and_drawdown(db_session):
             profit_pct=Decimal("-0.3333"),
         )
     )
+    # The daily-statistics "Upozorneni" text is where day-over-day price
+    # movers actually get computed (from real historical closes, during a
+    # recalculation) - compute_alerts must surface them as a third,
+    # structured category instead of leaving them buried in that text blob.
+    db_session.add(
+        DailyStatistic(
+            stat_date=date(2024, 1, 10),
+            alerts="INTC (D:-11.3%), AMD (D:+12.0%) | Chybí cena: XYZ",
+        )
+    )
     db_session.commit()
 
     alerts = stock_services.compute_alerts(db_session, threshold_pct=Decimal("10"))
     assert any(a["ticker"] == "AAPL" for a in alerts["watchlist_limit_breaches"])
     assert any(a["ticker"] == "MSFT" for a in alerts["portfolio_drawdowns"])
+    movers = {m["ticker"]: m["change_pct"] for m in alerts["daily_movers"]}
+    assert movers == {"INTC": -11.3, "AMD": 12.0}
+    assert "XYZ" not in movers  # the missing-price part must not be parsed as a mover
+    assert alerts["daily_movers_as_of"] == "2024-01-10"
 
 
 @requires_db
@@ -714,3 +730,57 @@ def test_ensure_cnb_rates_up_to_date_survives_one_bad_day(db_session, monkeypatc
     added = main.ensure_cnb_rates_up_to_date(db_session)  # must not raise
 
     assert added == 2  # only 2024-01-10 succeeded (2 currencies); 01-09 was skipped
+
+
+@requires_db
+def test_import_loans_skips_baked_in_subtotal_rows(db_session):
+    """The source 'Půjčky Pohyby' sheet has monthly/yearly subtotal rows
+    physically sitting between the real movements (column A holds a text
+    label like "Leden 2023" or "2023" instead of a date, lender/borrower
+    blank). These must not be imported as if they were real loan movements -
+    the app computes its own collapsible subtotals instead."""
+    from openpyxl import Workbook
+
+    from app.excel_import import import_loans
+    from app.models import LoanMovement
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Půjčky Pohyby"
+    ws.append(["Datum", "Věřitel", "Dlužník", "Částka", "Úrok", "Perioda úroku", "Plán ukončení", "Ukončeno", "Popis"])
+    ws.append([datetime(2023, 1, 15), "Martin Ševčík", "Magda Havlíková", 54139, None, None, None, None, None])
+    ws.append(["Leden 2023", None, None, 54139, None, None, None, None, None])  # month subtotal - must be skipped
+    ws.append([datetime(2023, 3, 1), "TANAKA, s.r.o.", "ACE-TECH, s.r.o.", 7000000, 0.06, "měsíčně", None, None, None])
+    ws.append(["2023", None, None, 7054139, None, None, None, None, None])  # year subtotal - must be skipped
+
+    count = import_loans(db_session, wb)
+    db_session.commit()
+
+    assert count == 2  # only the two real movements
+    rows = db_session.scalars(select(LoanMovement)).all()
+    assert len(rows) == 2
+    assert all(row.movement_date is not None for row in rows)
+    assert {row.amount for row in rows} == {Decimal("54139"), Decimal("7000000")}
+
+
+@requires_db
+def test_cleanup_loan_subtotals_endpoint_removes_only_dateless_rows(client, db_session):
+    """Regression cleanup path for databases imported before the fix: a
+    dateless LoanMovement (the old subtotal artifact) must be deleted, a
+    real dated movement must survive."""
+    from app.models import LoanMovement
+
+    db_session.add(LoanMovement(movement_date=None, amount=Decimal("54139"), source_row=3))
+    db_session.add(LoanMovement(movement_date=date(2023, 1, 15), amount=Decimal("54139"), source_row=2))
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    response = client.post("/loans/cleanup-imported-subtotals", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["deleted"] == 1
+
+    remaining = db_session.scalars(select(LoanMovement)).all()
+    assert len(remaining) == 1
+    assert remaining[0].movement_date == date(2023, 1, 15)

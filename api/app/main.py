@@ -18,7 +18,7 @@ except Exception:  # tzdata not installed - fall back to naive local time
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import desc, func, select
+from sqlalchemy import delete, desc, func, select
 from sqlalchemy.orm import Session
 
 from .auth import ALL_AGENDAS, authenticate, create_token, hash_password, require_user, verify_password
@@ -344,6 +344,22 @@ def loan_movements(_: str = Depends(require_user), db: Session = Depends(get_db)
         data["borrower"] = party_names.get(row.borrower_id)
         result.append(data)
     return result
+
+
+@app.post("/loans/cleanup-imported-subtotals")
+def cleanup_loan_subtotals(_: str = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """One-off cleanup for databases imported before the fix: the source
+    "Půjčky Pohyby" sheet has monthly/yearly subtotal rows baked directly
+    into the data (a "Leden 2023"/"2023" text label instead of a real date,
+    no lender/borrower) which used to be imported as if they were real loan
+    movements. import_loans no longer creates these, but a database imported
+    before that fix still has the old ones sitting in it - this deletes just
+    those (movement_date IS NULL, never true for a real movement) without
+    touching any real loan data or requiring a full destructive re-import.
+    """
+    deleted = db.execute(delete(LoanMovement).where(LoanMovement.movement_date.is_(None))).rowcount
+    db.commit()
+    return {"deleted": deleted}
 
 
 @app.get("/assets")

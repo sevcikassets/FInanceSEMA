@@ -18,6 +18,7 @@ import {
   RefreshCw,
   Save,
   ShieldCheck,
+  TrendingUp,
   WalletCards,
   X,
 } from "lucide-react";
@@ -53,6 +54,8 @@ type Alerts = {
   threshold_pct: number;
   watchlist_limit_breaches: Row[];
   portfolio_drawdowns: Row[];
+  daily_movers: Row[];
+  daily_movers_as_of: string | null;
 };
 
 type TickerHistoryResult = {
@@ -86,6 +89,7 @@ const tabs = [
   { id: "watchlist", label: "Sledované", icon: ListChecks, endpoint: "/stocks/watchlist" },
   { id: "stats", label: "Denní statistika", icon: ShieldCheck, endpoint: "/stocks/statistics" },
   { id: "portfolio", label: "Portfolio", icon: LineChart, endpoint: "/stocks/portfolio" },
+  { id: "history", label: "Sledování kurzu", icon: TrendingUp, endpoint: "/stocks/transactions" },
   { id: "rates", label: "Denní kurzy", icon: CalendarDays, endpoint: "/rates/daily?limit=500" },
   { id: "users", label: "Uživatelé", icon: Lock, endpoint: "/users" },
 ];
@@ -93,7 +97,7 @@ const tabs = [
 const navGroups = [
   { label: "Majetek", items: ["assets", "costs"] },
   { label: "Půjčky", items: ["loans"] },
-  { label: "Akcie", items: ["transactions", "watchlist", "stats", "portfolio"] },
+  { label: "Akcie", items: ["transactions", "watchlist", "stats", "portfolio", "history"] },
   { label: "Nastavení", items: ["rates", "users"] },
 ];
 
@@ -103,7 +107,7 @@ const columns: Record<string, string[]> = {
   portfolio: ["ticker", "name", "quantity", "currency", "market_value_czk", "invested_czk", "profit_czk", "profit_pct"],
   assets: ["code", "owner", "asset_type", "name", "total_value", "own_funds", "borrowed_amount", "interest_rate"],
   costs: ["cost_date", "asset", "payer", "supplier", "category", "item", "amount"],
-  loans: ["movement_date", "period_label", "lender", "borrower", "amount", "interest_rate", "planned_end_date", "description"],
+  loans: ["period_label", "lender", "borrower", "amount", "interest_rate", "planned_end_date", "description"],
   transactions: [
     "traded_on",
     "instrument_type",
@@ -661,6 +665,58 @@ function buildCostRows(rows: Row[], assetFilter: string, showDetail: boolean) {
   return result;
 }
 
+// Two-level collapsible subtotals (year, then month within it) for the loans
+// table - the source Excel had these subtotal rows baked directly into the
+// data (a "Leden 2023"/"2023" row physically sitting between real
+// movements); the app now computes them itself instead of importing them as
+// if they were real loan movements.
+function buildLoanRows(rows: Row[], expandedYears: Set<string>, expandedMonths: Set<string>) {
+  const byYear = new Map<string, Row[]>();
+  for (const row of rows) {
+    const dateText = String(row.movement_date || "");
+    if (!dateText) continue;
+    const year = dateText.slice(0, 4);
+    const group = byYear.get(year) || [];
+    group.push(row);
+    byYear.set(year, group);
+  }
+
+  const result: Row[] = [];
+  for (const [year, yearRows] of [...byYear.entries()].sort((a, b) => b[0].localeCompare(a[0]))) {
+    result.push({
+      row_kind: "year-summary",
+      year_key: year,
+      period_label: `Rok ${year}`,
+      amount: yearRows.reduce((total, row) => total + numberValue(row.amount), 0),
+    });
+    if (!expandedYears.has(year)) continue;
+
+    const byMonth = new Map<string, Row[]>();
+    for (const row of yearRows) {
+      const monthKey = String(row.movement_date).slice(0, 7);
+      const group = byMonth.get(monthKey) || [];
+      group.push(row);
+      byMonth.set(monthKey, group);
+    }
+    for (const [monthKey, monthRows] of [...byMonth.entries()].sort((a, b) => b[0].localeCompare(a[0]))) {
+      result.push({
+        row_kind: "month-summary",
+        year_key: year,
+        month_key: monthKey,
+        period_label: monthLabel(`${monthKey}-01`),
+        amount: monthRows.reduce((total, row) => total + numberValue(row.amount), 0),
+      });
+      if (!expandedMonths.has(monthKey)) continue;
+
+      const sortedRows = [...monthRows].sort((a, b) => String(b.movement_date || "").localeCompare(String(a.movement_date || "")));
+      for (const row of sortedRows) {
+        result.push({ ...row, row_kind: "detail", period_label: formatDateWithWeekday(String(row.movement_date || "")) });
+      }
+    }
+  }
+  return result;
+}
+
 export default function Page() {
   const [token, setToken] = useState<string | null>(null);
   const [username, setUsername] = useState("admin");
@@ -676,6 +732,10 @@ export default function Page() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [expandedStatMonths, setExpandedStatMonths] = useState<Set<string>>(() => new Set());
+  const [expandedLoanYears, setExpandedLoanYears] = useState<Set<string>>(() => new Set());
+  const [expandedLoanMonths, setExpandedLoanMonths] = useState<Set<string>>(() => new Set());
+  const [loanCleanupStatus, setLoanCleanupStatus] = useState<string | null>(null);
+  const [loanCleanupBusy, setLoanCleanupBusy] = useState(false);
   const [showCostDetail, setShowCostDetail] = useState(true);
   const [costAssetFilter, setCostAssetFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -723,7 +783,9 @@ export default function Page() {
       ? buildStatisticRows(rows, expandedStatMonths)
       : activeTab === "costs"
         ? buildCostRows(rows, costAssetFilter, showCostDetail)
-        : rows;
+        : activeTab === "loans"
+          ? buildLoanRows(rows, expandedLoanYears, expandedLoanMonths)
+          : rows;
   const chartData = useMemo(() => {
     if (activeTab !== "stats") return [];
     return [...rows]
@@ -740,6 +802,30 @@ export default function Page() {
 
   function toggleStatMonth(monthKey: string) {
     setExpandedStatMonths((current) => {
+      const next = new Set(current);
+      if (next.has(monthKey)) {
+        next.delete(monthKey);
+      } else {
+        next.add(monthKey);
+      }
+      return next;
+    });
+  }
+
+  function toggleLoanYear(year: string) {
+    setExpandedLoanYears((current) => {
+      const next = new Set(current);
+      if (next.has(year)) {
+        next.delete(year);
+      } else {
+        next.add(year);
+      }
+      return next;
+    });
+  }
+
+  function toggleLoanMonth(monthKey: string) {
+    setExpandedLoanMonths((current) => {
       const next = new Set(current);
       if (next.has(monthKey)) {
         next.delete(monthKey);
@@ -892,6 +978,25 @@ export default function Page() {
       setError(err instanceof Error ? err.message : "Uživatele se nepodařilo vytvořit");
     } finally {
       setWorkingMessage(null);
+    }
+  }
+
+  async function cleanupLoanSubtotals() {
+    setError(null);
+    setLoanCleanupStatus(null);
+    setLoanCleanupBusy(true);
+    try {
+      const result = await api("/loans/cleanup-imported-subtotals", { method: "POST" });
+      setLoanCleanupStatus(
+        result.deleted > 0
+          ? `Odstraněno ${result.deleted} importovaných mezisoučtových řádků.`
+          : "Žádné importované mezisoučty k odstranění nebyly nalezeny.",
+      );
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Vyčištění mezisoučtů se nepodařilo");
+    } finally {
+      setLoanCleanupBusy(false);
     }
   }
 
@@ -1124,6 +1229,24 @@ export default function Page() {
           </section>
         )}
 
+        {activeTab === "loans" && (
+          <section className="work-panel compact-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Půjčky</h2>
+                <p>
+                  Součty po měsících a letech jsou počítané appkou (klikni na řádek pro rozbalení/sbalení) - ne
+                  naimportované z Excelu.
+                  {loanCleanupStatus ? ` ${loanCleanupStatus}` : ""}
+                </p>
+              </div>
+              <button className="action-button" onClick={cleanupLoanSubtotals} disabled={loanCleanupBusy}>
+                <span>{loanCleanupBusy ? "Čistím…" : "Vyčistit staré importované mezisoučty"}</span>
+              </button>
+            </div>
+          </section>
+        )}
+
         {activeTab === "costs" && (
           <section className="work-panel compact-panel">
             <div className="panel-header">
@@ -1275,13 +1398,34 @@ export default function Page() {
             <div className="panel-header">
               <div>
                 <h2>Upozornění</h2>
-                <p>Sledované tituly pod limitní cenou a pozice s poklesem nad {alerts.threshold_pct} %.</p>
+                <p>
+                  Denní pohyby{alerts.daily_movers_as_of ? ` (k ${alerts.daily_movers_as_of})` : ""}, sledované tituly pod
+                  limitní cenou a pozice s poklesem nad {alerts.threshold_pct} %.
+                </p>
               </div>
             </div>
-            {alerts.watchlist_limit_breaches.length === 0 && alerts.portfolio_drawdowns.length === 0 ? (
+            {alerts.daily_movers.length === 0 &&
+            alerts.watchlist_limit_breaches.length === 0 &&
+            alerts.portfolio_drawdowns.length === 0 ? (
               <p className="alert-empty">Žádná aktivní upozornění.</p>
             ) : (
               <div className="mini-grids">
+                <div>
+                  <h3>Denní pohyby</h3>
+                  {alerts.daily_movers.length === 0 && (
+                    <p>
+                      <span>Žádné</span>
+                    </p>
+                  )}
+                  {alerts.daily_movers.map((row) => (
+                    <p key={`mover-${String(row.ticker)}`}>
+                      <span>{String(row.ticker)}</span>
+                      <strong className={numberValue(row.change_pct) >= 0 ? "positive" : "negative"}>
+                        {formatSignedProfit(numberValue(row.change_pct))}
+                      </strong>
+                    </p>
+                  ))}
+                </div>
                 <div>
                   <h3>Sledované pod limitem</h3>
                   {alerts.watchlist_limit_breaches.length === 0 && (
@@ -1317,51 +1461,14 @@ export default function Page() {
           </section>
         )}
 
-        {["transactions", "watchlist", "portfolio", "stats"].includes(activeTab) && stockOverview && (
+        {activeTab === "history" && (
           <section className="work-panel">
             <div className="panel-header">
               <div>
-                <h2>Akciový souhrn</h2>
-                <p>Přehled je zatím počítaný z importovaných excelových dat.</p>
-              </div>
-              <div className="stock-actions">
-                <button className="action-button" onClick={refreshStockPrices} disabled={stockBusy}>
-                  <RefreshCw size={16} />
-                  <span>Ceny</span>
-                </button>
-                <RecalcFromField value={recalcFromDate} onChange={setRecalcFromDate} />
-                <button
-                  className="action-button"
-                  onClick={() => recalculateStockData(true)}
-                  disabled={stockBusy}
-                  title="Jen náhled počtů - nic se neuloží do databáze"
-                >
-                  <Calculator size={16} />
-                  <span>Kontrola (náhled)</span>
-                </button>
-                <button className="action-button" onClick={() => recalculateStockData(false)} disabled={stockBusy}>
-                  <Calculator size={16} />
-                  <span>Přepočítat</span>
-                </button>
+                <h2>Sledování kurzu akcií</h2>
+                <p>Denní kurzy, nákupy a vyhodnocení zisku/ztráty daného titulu za zvolené období.</p>
               </div>
             </div>
-            {activeTab === "transactions" && (
-              <div className="patria-import">
-                <label>
-                  Import Patria
-                  <textarea
-                    value={patriaText}
-                    onChange={(event) => setPatriaText(event.target.value)}
-                    placeholder="Vložte zkopírovaný dvouřádkový export obchodů z Patrie"
-                  />
-                </label>
-                <button className="action-button" onClick={importPatriaTrades} disabled={stockBusy || !patriaText.trim()}>
-                  <Download size={16} />
-                  <span>Importovat Patria</span>
-                </button>
-              </div>
-            )}
-            {activeTab === "transactions" && (
               <form className="history-form" onSubmit={loadTickerHistory}>
                 <label>
                   Ticker
@@ -1384,8 +1491,7 @@ export default function Page() {
                   <span>Historie tickeru</span>
                 </button>
               </form>
-            )}
-            {activeTab === "transactions" && historyResult && (
+            {historyResult && (
               <div className="history-block">
                 {historyResult.rows.length === 0 ? (
                   <p className="alert-empty">Pro zadaný ticker a období nejsou k dispozici žádná data.</p>
@@ -1441,6 +1547,53 @@ export default function Page() {
                     </div>
                   </>
                 )}
+              </div>
+            )}
+          </section>
+        )}
+
+        {["transactions", "watchlist", "portfolio", "stats"].includes(activeTab) && stockOverview && (
+          <section className="work-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Akciový souhrn</h2>
+                <p>Přehled je zatím počítaný z importovaných excelových dat.</p>
+              </div>
+              <div className="stock-actions">
+                <button className="action-button" onClick={refreshStockPrices} disabled={stockBusy}>
+                  <RefreshCw size={16} />
+                  <span>Ceny</span>
+                </button>
+                <RecalcFromField value={recalcFromDate} onChange={setRecalcFromDate} />
+                <button
+                  className="action-button"
+                  onClick={() => recalculateStockData(true)}
+                  disabled={stockBusy}
+                  title="Jen náhled počtů - nic se neuloží do databáze"
+                >
+                  <Calculator size={16} />
+                  <span>Kontrola (náhled)</span>
+                </button>
+                <button className="action-button" onClick={() => recalculateStockData(false)} disabled={stockBusy}>
+                  <Calculator size={16} />
+                  <span>Přepočítat</span>
+                </button>
+              </div>
+            </div>
+            {activeTab === "transactions" && (
+              <div className="patria-import">
+                <label>
+                  Import Patria
+                  <textarea
+                    value={patriaText}
+                    onChange={(event) => setPatriaText(event.target.value)}
+                    placeholder="Vložte zkopírovaný dvouřádkový export obchodů z Patrie"
+                  />
+                </label>
+                <button className="action-button" onClick={importPatriaTrades} disabled={stockBusy || !patriaText.trim()}>
+                  <Download size={16} />
+                  <span>Importovat Patria</span>
+                </button>
               </div>
             )}
             {stockActionStatus && <div className="success-notice">{stockActionStatus}</div>}
@@ -1595,7 +1748,7 @@ export default function Page() {
           </section>
         )}
 
-        {activeTab !== "assets" && (
+        {activeTab !== "assets" && activeTab !== "history" && (
         <section className={`table-wrap ${activeTab === "stats" ? "stats-table-wrap" : ""}`}>
           <table>
             <thead>
@@ -1608,18 +1761,36 @@ export default function Page() {
             <tbody>
               {tableRows.map((row, index) => {
                 const isStatSummary = activeTab === "stats" && row.row_kind === "summary";
+                const isLoanYearSummary = activeTab === "loans" && row.row_kind === "year-summary";
+                const isLoanMonthSummary = activeTab === "loans" && row.row_kind === "month-summary";
+                const isClickableSummary = isStatSummary || isLoanYearSummary || isLoanMonthSummary;
                 const monthKey = String(row.month_key || "");
+                const yearKey = String(row.year_key || "");
+                const handleRowClick = isStatSummary
+                  ? () => toggleStatMonth(monthKey)
+                  : isLoanYearSummary
+                    ? () => toggleLoanYear(yearKey)
+                    : isLoanMonthSummary
+                      ? () => toggleLoanMonth(monthKey)
+                      : undefined;
+                const summaryExpanded = isStatSummary
+                  ? expandedStatMonths.has(monthKey)
+                  : isLoanYearSummary
+                    ? expandedLoanYears.has(yearKey)
+                    : isLoanMonthSummary
+                      ? expandedLoanMonths.has(monthKey)
+                      : false;
                 return (
                   <tr
-                    className={`${String(row.row_kind || "")}${isStatSummary ? " clickable-row" : ""}`}
-                    key={String(row.id || row.ticker || row.stat_date || row.period_label || index)}
-                    onClick={isStatSummary ? () => toggleStatMonth(monthKey) : undefined}
+                    className={`${String(row.row_kind || "")}${isClickableSummary ? " clickable-row" : ""}`}
+                    key={String(row.id || row.ticker || row.stat_date || row.year_key || row.month_key || row.period_label || index)}
+                    onClick={handleRowClick}
                   >
                     {(columns[activeTab] || []).map((col, colIndex) => (
                       <td className={isNumericCell(row[col]) ? "numeric-cell" : ""} key={col}>
-                        {isStatSummary && colIndex === 0 ? (
-                          <span className="stat-month-toggle">
-                            {expandedStatMonths.has(monthKey) ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                        {isClickableSummary && colIndex === 0 ? (
+                          <span className={`stat-month-toggle${isLoanMonthSummary ? " nested-toggle" : ""}`}>
+                            {summaryExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                             {formatValue(col, row[col])}
                           </span>
                         ) : signedProfitColumns.has(col) && typeof row[col] === "number" ? (

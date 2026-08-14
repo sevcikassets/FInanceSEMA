@@ -1010,10 +1010,19 @@ td.numeric-cell {
   font-variant-numeric: tabular-nums;
 }
 
-tr.summary td {
+tr.summary td,
+tr.year-summary td {
   background: #eaf3f1;
   font-weight: 700;
   border-bottom-color: #b7d4ce;
+}
+
+/* Month subtotal nested under a year subtotal (loans table) - a lighter
+   shade than the year row so the two-level hierarchy is visually distinct. */
+tr.month-summary td {
+  background: #f2f8f6;
+  font-weight: 600;
+  border-bottom-color: #cfe3de;
 }
 
 tr.clickable-row {
@@ -1033,6 +1042,12 @@ tr.clickable-row:hover td {
 .stat-month-toggle svg {
   flex-shrink: 0;
   color: var(--muted);
+}
+
+/* Month-level toggle nested under a year-level toggle (loans table) - indent
+   so the two levels of the hierarchy read clearly at a glance. */
+.stat-month-toggle.nested-toggle {
+  padding-left: 20px;
 }
 
 tr.detail td:first-child {

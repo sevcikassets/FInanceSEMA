@@ -109,15 +109,18 @@ def import_loans(db: Session, wb) -> int:
         amount = as_decimal(ws.cell(r, 4).value)
         lender_name = as_text(ws.cell(r, 2).value)
         borrower_name = as_text(ws.cell(r, 3).value)
-        period_label = None
         movement_date = as_date(raw_date)
-        if movement_date is None and raw_date:
-            period_label = as_text(raw_date)
-        if amount is None and not period_label:
+        # The sheet has monthly/yearly subtotal rows baked right in between the
+        # real movements (column A holds a text label like "Leden 2023" or
+        # "2023" instead of a date, and lender/borrower are blank) - these are
+        # not real loan movements and must not be imported as if they were.
+        # The app builds its own (collapsible) month/year subtotals instead.
+        if movement_date is None:
+            continue
+        if amount is None:
             continue
         movement = LoanMovement(
             movement_date=movement_date,
-            period_label=period_label,
             lender=get_or_create_party(db, lender_name),
             borrower=get_or_create_party(db, borrower_name),
             amount=amount,
