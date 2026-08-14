@@ -56,6 +56,11 @@ services:
       - "traefik.http.middlewares.finance-sema-api-ratelimit.ratelimit.average=20"
       - "traefik.http.middlewares.finance-sema-api-ratelimit.ratelimit.burst=40"
       - "traefik.http.services.finance-sema-api.loadbalancer.server.port=8000"
+      # api is on two networks (default + proxy) - without this, Traefik can
+      # non-deterministically pick either one to reach the container, and
+      # picking "default" (which Traefik itself isn't on) is exactly what
+      # produces a 504 on every /api/* request despite the router matching.
+      - "traefik.docker.network=proxy"
     depends_on:
       db:
         condition: service_healthy
@@ -78,6 +83,7 @@ services:
       - "traefik.http.routers.finance-sema.tls.certresolver=letsencrypt"
       - "traefik.http.routers.finance-sema.service=finance-sema"
       - "traefik.http.services.finance-sema.loadbalancer.server.port=3000"
+      - "traefik.docker.network=proxy"
     networks:
       - default
       - proxy
