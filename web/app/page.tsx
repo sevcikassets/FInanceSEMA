@@ -12,6 +12,7 @@ import {
   ListChecks,
   LineChart,
   Lock,
+  LogOut,
   Menu,
   PanelLeftClose,
   PanelLeftOpen,
@@ -948,6 +949,17 @@ export default function Page() {
     loadAll();
   }, [token, activeTab]);
 
+  function logout() {
+    localStorage.removeItem("finance-token");
+    setToken(null);
+    setCurrentUser(null);
+    setPassword("");
+    setPendingToken(null);
+    setTwoFactorCode("");
+    setError(null);
+    setMobileMenuOpen(false);
+  }
+
   async function login(event: React.FormEvent) {
     event.preventDefault();
     setError(null);
@@ -1384,9 +1396,15 @@ export default function Page() {
               <p>{summary ? `${rows.length} záznamů v aktuálním pohledu` : "Čekám na importovaná data"}</p>
             </div>
           </div>
-          <button className="icon-button" onClick={loadAll} title="Obnovit data">
-            <RefreshCw size={18} />
-          </button>
+          <div className="topbar-actions">
+            <button className="icon-button" onClick={loadAll} title="Obnovit data">
+              <RefreshCw size={18} />
+            </button>
+            <span className="topbar-user">{currentUser?.username || username}</span>
+            <button className="icon-button" onClick={logout} title="Odhlásit se" aria-label="Odhlásit se">
+              <LogOut size={18} />
+            </button>
+          </div>
         </header>
 
         {summary && (

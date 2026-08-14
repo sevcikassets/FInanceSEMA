@@ -22,9 +22,14 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-finance}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-finance_sema}
-      APP_USERNAME: ${FINANCE_APP_USERNAME}
-      APP_PASSWORD: ${FINANCE_APP_PASSWORD}
-      APP_TOKEN_SECRET: ${FINANCE_APP_TOKEN_SECRET}
+      # Must match the public origin the browser actually loads the app from
+      # (the web container behind Traefik at https://${DOMAIN}), not the
+      # dev-only http://localhost:3010 default from .env/API_CORS_ORIGINS -
+      # otherwise every request from production gets rejected as CORS.
+      API_CORS_ORIGINS: https://${DOMAIN:?set DOMAIN in .env}
+      APP_USERNAME: ${FINANCE_APP_USERNAME:?set FINANCE_APP_USERNAME in .env}
+      APP_PASSWORD: ${FINANCE_APP_PASSWORD:?set FINANCE_APP_PASSWORD in .env}
+      APP_TOKEN_SECRET: ${FINANCE_APP_TOKEN_SECRET:?set FINANCE_APP_TOKEN_SECRET in .env (e.g. openssl rand -hex 32)}
     volumes:
       - ./imports:/imports
       - ./exports:/app/exports
@@ -39,7 +44,7 @@ services:
     build:
       context: ./web
       args:
-        NEXT_PUBLIC_API_URL: https://${DOMAIN}/api
+        NEXT_PUBLIC_API_URL: https://${DOMAIN:?set DOMAIN in .env}/api
     restart: unless-stopped
     env_file:
       - .env
@@ -52,8 +57,13 @@ services:
       - "traefik.http.routers.finance-sema-api.rule=Host(`${DOMAIN}`) && PathPrefix(`/api`)"
       - "traefik.http.routers.finance-sema-api.entrypoints=websecure"
       - "traefik.http.routers.finance-sema-api.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.finance-sema-api.middlewares=finance-sema-api-strip"
+      # Order matters: strip the /api prefix first, then rate-limit - a
+      # generous cap (well above normal UI usage) that still blunts a
+      # scripted brute-force run against /auth/login or /auth/2fa/login.
+      - "traefik.http.routers.finance-sema-api.middlewares=finance-sema-api-strip,finance-sema-api-ratelimit"
       - "traefik.http.middlewares.finance-sema-api-strip.stripprefix.prefixes=/api"
+      - "traefik.http.middlewares.finance-sema-api-ratelimit.ratelimit.average=20"
+      - "traefik.http.middlewares.finance-sema-api-ratelimit.ratelimit.burst=40"
       - "traefik.http.services.finance-sema-api.loadbalancer.server.port=8000"
     networks:
       - default

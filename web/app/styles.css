@@ -280,6 +280,19 @@ nav button:hover {
   padding: 0;
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.topbar-user {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
 .kpis {
   display: grid;
   grid-template-columns: repeat(4, minmax(160px, 1fr));
@@ -1228,6 +1241,10 @@ tr.detail td:first-child {
 
   .topbar h1 {
     font-size: 20px;
+  }
+
+  .topbar-user {
+    display: none;
   }
 
   .progress-copy {
