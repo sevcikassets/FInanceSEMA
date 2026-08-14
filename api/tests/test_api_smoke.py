@@ -784,3 +784,117 @@ def test_cleanup_loan_subtotals_endpoint_removes_only_dateless_rows(client, db_s
     remaining = db_session.scalars(select(LoanMovement)).all()
     assert len(remaining) == 1
     assert remaining[0].movement_date == date(2023, 1, 15)
+
+
+@requires_db
+def test_two_factor_setup_confirm_and_login_flow(client):
+    """End-to-end 2FA enrollment + login: setup returns a scannable secret,
+    confirm requires a real TOTP code (not just any string), and once
+    enabled, plain username+password login stops short of a full token until
+    the pending token is redeemed with a correct code."""
+    import pyotp
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    assert login.json()["requires_2fa"] is False
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+
+    setup = client.post("/auth/2fa/setup", headers=headers)
+    assert setup.status_code == 200
+    secret = setup.json()["secret"]
+    assert setup.json()["qr_code_png_base64"]
+
+    bad_confirm = client.post("/auth/2fa/confirm", headers=headers, json={"secret": secret, "code": "000000"})
+    assert bad_confirm.status_code == 400
+
+    code = pyotp.TOTP(secret).now()
+    confirm = client.post("/auth/2fa/confirm", headers=headers, json={"secret": secret, "code": code})
+    assert confirm.status_code == 200
+    assert confirm.json()["totp_enabled"] is True
+
+    me = client.get("/auth/me", headers=headers)
+    assert me.json()["totp_enabled"] is True
+
+    second_login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    assert second_login.status_code == 200
+    body = second_login.json()
+    assert body["requires_2fa"] is True
+    assert "token" not in body
+    pending_token = body["pending_token"]
+
+    # The pending token alone must not grant access to a real endpoint.
+    pending_headers = {"Authorization": f"Bearer {pending_token}"}
+    denied = client.get("/summary", headers=pending_headers)
+    assert denied.status_code == 401
+
+    wrong_code = client.post("/auth/2fa/login", json={"pending_token": pending_token, "code": "000000"})
+    assert wrong_code.status_code == 401
+
+    fresh_code = pyotp.TOTP(secret).now()
+    finish = client.post("/auth/2fa/login", json={"pending_token": pending_token, "code": fresh_code})
+    assert finish.status_code == 200
+    full_token = finish.json()["token"]
+
+    full_headers = {"Authorization": f"Bearer {full_token}"}
+    ok = client.get("/summary", headers=full_headers)
+    assert ok.status_code == 200
+
+    # Disable requires the correct password + a valid current code.
+    disable_wrong_password = client.post(
+        "/auth/2fa/disable", headers=full_headers, json={"password": "wrong", "code": pyotp.TOTP(secret).now()}
+    )
+    assert disable_wrong_password.status_code == 401
+
+    disable = client.post(
+        "/auth/2fa/disable", headers=full_headers, json={"password": "finance", "code": pyotp.TOTP(secret).now()}
+    )
+    assert disable.status_code == 200
+    assert disable.json()["totp_enabled"] is False
+
+    plain_login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    assert plain_login.json()["requires_2fa"] is False
+    assert "token" in plain_login.json()
+
+
+@requires_db
+def test_admin_reset_2fa_endpoint_clears_lost_device_lockout(client, db_session):
+    """Recovery path: an admin can force another user's 2FA back off (no
+    email/SMS backup exists), unblocking a user who lost their device."""
+    import pyotp
+
+    from app.auth import hash_password
+    from app.models import AppUser
+
+    db_session.add(
+        AppUser(
+            username="analyst",
+            password_hash=hash_password("s3cret!"),
+            full_name="Analyst",
+            is_active=True,
+            is_admin=False,
+            allowed_agendas=["portfolio"],
+        )
+    )
+    db_session.commit()
+
+    admin_login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['token']}"}
+
+    analyst_login = client.post("/auth/login", json={"username": "analyst", "password": "s3cret!"})
+    analyst_headers = {"Authorization": f"Bearer {analyst_login.json()['token']}"}
+    setup = client.post("/auth/2fa/setup", headers=analyst_headers).json()
+    code = pyotp.TOTP(setup["secret"]).now()
+    client.post("/auth/2fa/confirm", headers=analyst_headers, json={"secret": setup["secret"], "code": code})
+
+    locked_out_login = client.post("/auth/login", json={"username": "analyst", "password": "s3cret!"})
+    assert locked_out_login.json()["requires_2fa"] is True
+
+    reset = client.post("/users/analyst/2fa/reset", headers=admin_headers)
+    assert reset.status_code == 200
+    assert reset.json()["totp_enabled"] is False
+
+    recovered_login = client.post("/auth/login", json={"username": "analyst", "password": "s3cret!"})
+    assert recovered_login.json()["requires_2fa"] is False
+
+    # A non-admin cannot reset anyone's 2FA.
+    forbidden = client.post("/users/admin/2fa/reset", headers=analyst_headers)
+    assert forbidden.status_code == 403

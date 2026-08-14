@@ -39,6 +39,12 @@ class AppUser(Base):
     is_active: Mapped[bool] = mapped_column(default=True)
     is_admin: Mapped[bool] = mapped_column(default=False)
     allowed_agendas: Mapped[list] = mapped_column(JSONB, default=list)
+    # TOTP-based two-factor auth (RFC 6238, compatible with Google
+    # Authenticator/Authy/1Password/...). totp_secret is only ever set once
+    # totp_enabled flips to True (see /auth/2fa/confirm) - a half-finished
+    # setup never lands in the database.
+    totp_secret: Mapped[str | None] = mapped_column(String(64))
+    totp_enabled: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

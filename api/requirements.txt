@@ -7,3 +7,6 @@ python-multipart==0.0.20
 openpyxl==3.1.5
 PyJWT==2.10.1
 tzdata==2024.2
+pyotp==2.9.0
+qrcode==7.4.2
+pillow==11.0.0

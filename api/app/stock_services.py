@@ -910,7 +910,10 @@ def build_ticker_history(db: Session, ticker: str, date_from: date, date_to: dat
         cum_cost_czk += buy_czk
         value_cm = cum_qty * price_cm
         value_czk = cum_qty * price_czk
-        change_pct = ((price_cm - previous_price_cm) / previous_price_cm * 100) if previous_price_cm else None
+        # Stored as a fraction (0.0266 = 2.66%), matching every other *_pct
+        # field in the app (profit_pct, difference_pct, ...) so the frontend's
+        # shared percent formatter (Intl "percent" style) renders it correctly.
+        change_pct = ((price_cm - previous_price_cm) / previous_price_cm) if previous_price_cm else None
         change_value_cm = qty_before_today * (price_cm - previous_price_cm) if previous_price_cm is not None else None
         change_value_czk = (
             qty_before_today * (price_czk - previous_price_czk) if previous_price_czk is not None else None

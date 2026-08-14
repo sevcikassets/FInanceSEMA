@@ -79,6 +79,13 @@ type CurrentUser = {
   is_active: boolean;
   is_admin: boolean;
   allowed_agendas: string[];
+  totp_enabled: boolean;
+};
+
+type TwoFactorSetup = {
+  secret: string;
+  otpauth_uri: string;
+  qr_code_png_base64: string;
 };
 
 const tabs = [
@@ -89,7 +96,7 @@ const tabs = [
   { id: "watchlist", label: "Sledované", icon: ListChecks, endpoint: "/stocks/watchlist" },
   { id: "stats", label: "Denní statistika", icon: ShieldCheck, endpoint: "/stocks/statistics" },
   { id: "portfolio", label: "Portfolio", icon: LineChart, endpoint: "/stocks/portfolio" },
-  { id: "history", label: "Sledování kurzu", icon: TrendingUp, endpoint: "/stocks/transactions" },
+  { id: "history", label: "Sledování akcie", icon: TrendingUp, endpoint: "/stocks/transactions" },
   { id: "rates", label: "Denní kurzy", icon: CalendarDays, endpoint: "/rates/daily?limit=500" },
   { id: "users", label: "Uživatelé", icon: Lock, endpoint: "/users" },
 ];
@@ -149,7 +156,7 @@ const columns: Record<string, string[]> = {
     "new_price",
   ],
   rates: ["rate_date", "eur", "usd"],
-  users: ["username", "full_name", "is_admin", "is_active", "allowed_agendas"],
+  users: ["username", "full_name", "is_admin", "is_active", "totp_enabled", "allowed_agendas"],
   stats: [
     "period_label",
     "bought_eur",
@@ -281,6 +288,7 @@ const labels: Record<string, string> = {
   is_admin: "Administrátor",
   is_active: "Aktivní",
   allowed_agendas: "Povolené agendy",
+  totp_enabled: "2FA",
   trade_date: "Datum",
   rate: "Kurz",
   price_ccy: "Cena (CM)",
@@ -595,6 +603,31 @@ function formatSignedProfit(value: number) {
 
 const signedProfitColumns = new Set(["unrealized_profit_czk", "daily_profit_czk"]);
 
+// Sledování akcie (ticker price-history) table: fixed 2 decimal places
+// everywhere, blank cells instead of "0" for missing/zero data (matches the
+// source Excel's own convention - "Prázdné buňky = data nejsou k dispozici"),
+// and the same signed +green / -red styling as the profit columns above, but
+// kept to 2 decimal places instead of being rounded to whole numbers.
+const HISTORY_SIGNED_COLUMNS = new Set(["change_pct", "change_value_ccy", "change_value_czk", "profit_ccy", "profit_czk"]);
+
+function formatHistoryValue(key: string, value: Row[string]) {
+  if (value === null || value === undefined || value === "") return "";
+  if (typeof value !== "number") return String(value);
+  if (value === 0) return "";
+  if (key === "change_pct") {
+    return new Intl.NumberFormat("cs-CZ", { style: "percent", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
+  }
+  return new Intl.NumberFormat("cs-CZ", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
+}
+
+function formatSignedProfitPrecise(value: number, isPercent = false) {
+  if (!value) return "";
+  const formatted = isPercent
+    ? new Intl.NumberFormat("cs-CZ", { style: "percent", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Math.abs(value))
+    : new Intl.NumberFormat("cs-CZ", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Math.abs(value));
+  return value > 0 ? `+${formatted}` : `-${formatted}`;
+}
+
 function buildStatisticRows(rows: Row[], expandedMonths: Set<string>) {
   const groups = new Map<string, Row[]>();
   for (const row of rows) {
@@ -721,6 +754,20 @@ export default function Page() {
   const [token, setToken] = useState<string | null>(null);
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("");
+  const [pendingToken, setPendingToken] = useState<string | null>(null);
+  const [twoFactorCode, setTwoFactorCode] = useState("");
+  const [twoFactorBusy, setTwoFactorBusy] = useState(false);
+  const [twoFactorSetup, setTwoFactorSetup] = useState<TwoFactorSetup | null>(null);
+  const [twoFactorSetupCode, setTwoFactorSetupCode] = useState("");
+  const [twoFactorSetupBusy, setTwoFactorSetupBusy] = useState(false);
+  const [twoFactorDisableOpen, setTwoFactorDisableOpen] = useState(false);
+  const [twoFactorDisablePassword, setTwoFactorDisablePassword] = useState("");
+  const [twoFactorDisableCode, setTwoFactorDisableCode] = useState("");
+  const [twoFactorDisableBusy, setTwoFactorDisableBusy] = useState(false);
+  const [twoFactorStatus, setTwoFactorStatus] = useState<string | null>(null);
+  const [adminResetUsername, setAdminResetUsername] = useState("");
+  const [adminResetBusy, setAdminResetBusy] = useState(false);
+  const [adminResetStatus, setAdminResetStatus] = useState<string | null>(null);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [activeTab, setActiveTab] = useState(tabs[0].id);
@@ -912,10 +959,127 @@ export default function Page() {
       });
       if (!response.ok) throw new Error("Neplatné přihlašovací údaje");
       const data = await response.json();
+      if (data.requires_2fa) {
+        setPendingToken(data.pending_token);
+        setTwoFactorCode("");
+        return;
+      }
       localStorage.setItem("finance-token", data.token);
       setToken(data.token);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Přihlášení selhalo");
+    }
+  }
+
+  async function submitTwoFactorLogin(event: React.FormEvent) {
+    event.preventDefault();
+    if (!pendingToken) return;
+    setError(null);
+    setTwoFactorBusy(true);
+    try {
+      const response = await fetch(`${API_URL}/auth/2fa/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pending_token: pendingToken, code: twoFactorCode.trim() }),
+      });
+      if (!response.ok) throw new Error("Neplatný ověřovací kód");
+      const data = await response.json();
+      localStorage.setItem("finance-token", data.token);
+      setToken(data.token);
+      setPendingToken(null);
+      setTwoFactorCode("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Ověření se nezdařilo");
+    } finally {
+      setTwoFactorBusy(false);
+    }
+  }
+
+  function cancelTwoFactorLogin() {
+    setPendingToken(null);
+    setTwoFactorCode("");
+    setError(null);
+  }
+
+  async function startTwoFactorSetup() {
+    setError(null);
+    setTwoFactorStatus(null);
+    setTwoFactorSetupBusy(true);
+    try {
+      const result = await api("/auth/2fa/setup", { method: "POST" });
+      setTwoFactorSetup(result as TwoFactorSetup);
+      setTwoFactorSetupCode("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Nastavení 2FA se nepodařilo spustit");
+    } finally {
+      setTwoFactorSetupBusy(false);
+    }
+  }
+
+  async function confirmTwoFactorSetup(event: React.FormEvent) {
+    event.preventDefault();
+    if (!twoFactorSetup) return;
+    setError(null);
+    setTwoFactorSetupBusy(true);
+    try {
+      await api("/auth/2fa/confirm", {
+        method: "POST",
+        body: JSON.stringify({ secret: twoFactorSetup.secret, code: twoFactorSetupCode.trim() }),
+      });
+      setTwoFactorSetup(null);
+      setTwoFactorSetupCode("");
+      setTwoFactorStatus("Dvoufázové ověření je zapnuté.");
+      const profile = (await api("/auth/me")) as CurrentUser;
+      setCurrentUser(profile);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Neplatný ověřovací kód");
+    } finally {
+      setTwoFactorSetupBusy(false);
+    }
+  }
+
+  function cancelTwoFactorSetup() {
+    setTwoFactorSetup(null);
+    setTwoFactorSetupCode("");
+  }
+
+  async function disableTwoFactor(event: React.FormEvent) {
+    event.preventDefault();
+    setError(null);
+    setTwoFactorDisableBusy(true);
+    try {
+      await api("/auth/2fa/disable", {
+        method: "POST",
+        body: JSON.stringify({ password: twoFactorDisablePassword, code: twoFactorDisableCode.trim() }),
+      });
+      setTwoFactorDisableOpen(false);
+      setTwoFactorDisablePassword("");
+      setTwoFactorDisableCode("");
+      setTwoFactorStatus("Dvoufázové ověření bylo vypnuto.");
+      const profile = (await api("/auth/me")) as CurrentUser;
+      setCurrentUser(profile);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Vypnutí 2FA se nezdařilo");
+    } finally {
+      setTwoFactorDisableBusy(false);
+    }
+  }
+
+  async function adminResetTwoFactor(event: React.FormEvent) {
+    event.preventDefault();
+    setError(null);
+    setAdminResetStatus(null);
+    setAdminResetBusy(true);
+    try {
+      const target = adminResetUsername.trim();
+      await api(`/users/${encodeURIComponent(target)}/2fa/reset`, { method: "POST" });
+      setAdminResetStatus(`2FA pro uživatele „${target}" bylo vypnuto.`);
+      setAdminResetUsername("");
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Reset 2FA se nezdařil");
+    } finally {
+      setAdminResetBusy(false);
     }
   }
 
@@ -1102,6 +1266,37 @@ export default function Page() {
     } finally {
       setHistoryBusy(false);
     }
+  }
+
+  if (!token && pendingToken) {
+    return (
+      <main className="login-shell">
+        <form className="login-panel" onSubmit={submitTwoFactorLogin}>
+          <div className="brand-mark">
+            <Lock size={24} />
+          </div>
+          <h1>Ověřovací kód</h1>
+          <p>Zadejte 6místný kód z vaší aplikace pro dvoufázové ověření (Google Authenticator, Authy, …).</p>
+          <label>
+            Kód
+            <input
+              value={twoFactorCode}
+              onChange={(event) => setTwoFactorCode(event.target.value)}
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              autoFocus
+            />
+          </label>
+          {error && <p className="error">{error}</p>}
+          <button type="submit" disabled={twoFactorBusy || !twoFactorCode.trim()}>
+            {twoFactorBusy ? "Ověřuji…" : "Potvrdit"}
+          </button>
+          <button type="button" className="link-button" onClick={cancelTwoFactorLogin}>
+            Zpět na přihlášení
+          </button>
+        </form>
+      </main>
+    );
   }
 
   if (!token) {
@@ -1296,6 +1491,113 @@ export default function Page() {
                 <strong>{currentUser?.is_admin ? "Administrátor" : "Uživatel"}</strong>
               </div>
             </div>
+
+            <div className="security-panel">
+              <div className="panel-header">
+                <div>
+                  <h3>Dvoufázové ověření (2FA)</h3>
+                  <p>
+                    {currentUser?.totp_enabled
+                      ? "Zapnuto - při přihlášení bude vyžadován i kód z ověřovací aplikace."
+                      : "Vypnuto - doporučeno zapnout před nasazením do produkce, aplikace obsahuje citlivá finanční data."}
+                  </p>
+                </div>
+                {!currentUser?.totp_enabled && !twoFactorSetup && (
+                  <button className="action-button" onClick={startTwoFactorSetup} disabled={twoFactorSetupBusy}>
+                    <Lock size={16} />
+                    <span>{twoFactorSetupBusy ? "Zakládám…" : "Zapnout 2FA"}</span>
+                  </button>
+                )}
+                {currentUser?.totp_enabled && !twoFactorDisableOpen && (
+                  <button className="action-button" onClick={() => setTwoFactorDisableOpen(true)}>
+                    <span>Vypnout 2FA</span>
+                  </button>
+                )}
+              </div>
+              {twoFactorStatus && <div className="success-notice">{twoFactorStatus}</div>}
+
+              {twoFactorSetup && (
+                <form className="two-factor-setup" onSubmit={confirmTwoFactorSetup}>
+                  <p>Naskenujte QR kód aplikací pro dvoufázové ověření (Google Authenticator, Authy, 1Password, …):</p>
+                  <img
+                    className="two-factor-qr"
+                    src={`data:image/png;base64,${twoFactorSetup.qr_code_png_base64}`}
+                    alt="QR kód pro nastavení 2FA"
+                  />
+                  <p>
+                    Nebo zadejte kód ručně: <code>{twoFactorSetup.secret}</code>
+                  </p>
+                  <label>
+                    Ověřovací kód z aplikace
+                    <input
+                      value={twoFactorSetupCode}
+                      onChange={(event) => setTwoFactorSetupCode(event.target.value)}
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                    />
+                  </label>
+                  <div className="stock-actions">
+                    <button className="action-button" type="submit" disabled={twoFactorSetupBusy || !twoFactorSetupCode.trim()}>
+                      <Save size={16} />
+                      <span>Potvrdit a zapnout</span>
+                    </button>
+                    <button type="button" className="link-button" onClick={cancelTwoFactorSetup}>
+                      Zrušit
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {twoFactorDisableOpen && (
+                <form className="two-factor-setup" onSubmit={disableTwoFactor}>
+                  <label>
+                    Heslo
+                    <input
+                      value={twoFactorDisablePassword}
+                      onChange={(event) => setTwoFactorDisablePassword(event.target.value)}
+                      type="password"
+                      autoComplete="current-password"
+                    />
+                  </label>
+                  <label>
+                    Aktuální ověřovací kód
+                    <input
+                      value={twoFactorDisableCode}
+                      onChange={(event) => setTwoFactorDisableCode(event.target.value)}
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                    />
+                  </label>
+                  <div className="stock-actions">
+                    <button
+                      className="action-button"
+                      type="submit"
+                      disabled={twoFactorDisableBusy || !twoFactorDisablePassword || !twoFactorDisableCode.trim()}
+                    >
+                      <span>Vypnout</span>
+                    </button>
+                    <button type="button" className="link-button" onClick={() => setTwoFactorDisableOpen(false)}>
+                      Zrušit
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {currentUser?.is_admin && (
+                <form className="two-factor-setup admin-2fa-reset" onSubmit={adminResetTwoFactor}>
+                  <p>Uživatel ztratil zařízení s ověřovací aplikací? Administrátor mu může 2FA vypnout (uživatel si ho pak znovu nastaví).</p>
+                  <label>
+                    Uživatelské jméno
+                    <input value={adminResetUsername} onChange={(event) => setAdminResetUsername(event.target.value)} />
+                  </label>
+                  <button className="action-button" type="submit" disabled={adminResetBusy || !adminResetUsername.trim()}>
+                    <span>{adminResetBusy ? "Resetuji…" : "Resetovat 2FA"}</span>
+                  </button>
+                  {adminResetStatus && <div className="success-notice">{adminResetStatus}</div>}
+                </form>
+              )}
+            </div>
+
             {currentUser?.is_admin && (
               <form className="user-form" onSubmit={createUser}>
                 <label>
@@ -1465,7 +1767,7 @@ export default function Page() {
           <section className="work-panel">
             <div className="panel-header">
               <div>
-                <h2>Sledování kurzu akcií</h2>
+                <h2>Sledování akcie</h2>
                 <p>Denní kurzy, nákupy a vyhodnocení zisku/ztráty daného titulu za zvolené období.</p>
               </div>
             </div>
@@ -1507,18 +1809,18 @@ export default function Page() {
                         </div>
                         <div>
                           <span>Držených ks</span>
-                          <strong>{formatValue("cumulative_quantity", historyResult.summary.cumulative_quantity)}</strong>
+                          <strong>{formatHistoryValue("cumulative_quantity", historyResult.summary.cumulative_quantity)}</strong>
                         </div>
                         <div>
                           <span>Hodnota CZK</span>
-                          <strong>{formatValue("value_czk", historyResult.summary.value_czk)}</strong>
+                          <strong>{formatHistoryValue("value_czk", historyResult.summary.value_czk)}</strong>
                         </div>
                         <div>
                           <span>Zisk/Ztr. CZK</span>
                           <strong
                             className={numberValue(historyResult.summary.profit_czk) >= 0 ? "positive" : "negative"}
                           >
-                            {formatValue("profit_czk", historyResult.summary.profit_czk)}
+                            {formatSignedProfitPrecise(numberValue(historyResult.summary.profit_czk))}
                           </strong>
                         </div>
                       </div>
@@ -1535,11 +1837,21 @@ export default function Page() {
                         <tbody>
                           {historyResult.rows.map((row, index) => (
                             <tr key={String(row.trade_date || index)}>
-                              {historyColumns.map((col) => (
-                                <td className={isNumericCell(row[col]) ? "numeric-cell" : ""} key={col}>
-                                  {formatValue(col, row[col])}
-                                </td>
-                              ))}
+                              {historyColumns.map((col) => {
+                                const raw = row[col];
+                                const isSigned = HISTORY_SIGNED_COLUMNS.has(col) && typeof raw === "number";
+                                return (
+                                  <td className={isNumericCell(raw) ? "numeric-cell" : ""} key={col}>
+                                    {isSigned ? (
+                                      <span className={numberValue(raw) >= 0 ? "positive" : "negative"}>
+                                        {formatSignedProfitPrecise(numberValue(raw), col === "change_pct")}
+                                      </span>
+                                    ) : (
+                                      formatHistoryValue(col, raw)
+                                    )}
+                                  </td>
+                                );
+                              })}
                             </tr>
                           ))}
                         </tbody>

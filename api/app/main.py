@@ -1,5 +1,7 @@
+import base64
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+import io
 import logging
 import unicodedata
 from pathlib import Path
@@ -15,13 +17,25 @@ try:
 except Exception:  # tzdata not installed - fall back to naive local time
     PRAGUE_TZ = None
 
+import pyotp
+import qrcode
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import delete, desc, func, select
+from sqlalchemy import delete, desc, func, select, text
 from sqlalchemy.orm import Session
 
-from .auth import ALL_AGENDAS, authenticate, create_token, hash_password, require_user, verify_password
+from .auth import (
+    ALL_AGENDAS,
+    authenticate,
+    create_pending_2fa_token,
+    create_token,
+    hash_password,
+    require_user,
+    verify_password,
+    verify_pending_2fa_token,
+    verify_totp_code,
+)
 from .config import get_settings
 from .db import Base, engine, get_db
 from .excel_import import import_workbooks
@@ -39,6 +53,21 @@ from .stock_services import (
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class TwoFactorLoginRequest(BaseModel):
+    pending_token: str
+    code: str
+
+
+class TwoFactorConfirmRequest(BaseModel):
+    secret: str
+    code: str
+
+
+class TwoFactorDisableRequest(BaseModel):
+    password: str
+    code: str
 
 
 class UserInput(BaseModel):
@@ -91,6 +120,7 @@ def user_dict(row: AppUser) -> dict[str, Any]:
         "is_active": row.is_active,
         "is_admin": row.is_admin,
         "allowed_agendas": row.allowed_agendas or [],
+        "totp_enabled": bool(row.totp_enabled),
     }
 
 
@@ -242,9 +272,20 @@ app.add_middleware(
 )
 
 
+def ensure_schema_upgrades() -> None:
+    """This project uses Base.metadata.create_all (creates missing tables
+    only, never alters existing ones) instead of a real migration tool, so
+    columns added after the first deploy need an explicit, idempotent
+    ALTER TABLE here. Safe to run on every startup."""
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS totp_secret VARCHAR(64)"))
+        conn.execute(text("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
+    ensure_schema_upgrades()
     ensure_admin_user()
 
 
@@ -254,12 +295,91 @@ def health() -> dict[str, str]:
 
 
 @app.post("/auth/login")
-def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict[str, str]:
+def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     user = db.get(AppUser, payload.username)
     valid_db_user = bool(user and user.is_active and verify_password(payload.password, user.password_hash))
     if not valid_db_user and not authenticate(payload.username, payload.password):
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    return {"token": create_token(payload.username)}
+    if user is not None and user.totp_enabled:
+        return {"requires_2fa": True, "pending_token": create_pending_2fa_token(payload.username)}
+    return {"requires_2fa": False, "token": create_token(payload.username)}
+
+
+@app.post("/auth/2fa/login")
+def login_2fa(payload: TwoFactorLoginRequest, db: Session = Depends(get_db)) -> dict[str, str]:
+    username = verify_pending_2fa_token(payload.pending_token)
+    user = db.get(AppUser, username)
+    if user is None or not user.is_active or not user.totp_enabled or not user.totp_secret:
+        raise HTTPException(status_code=401, detail="Dvoufázové ověření není pro tento účet zapnuté")
+    if not verify_totp_code(user.totp_secret, payload.code):
+        raise HTTPException(status_code=401, detail="Neplatný ověřovací kód")
+    return {"token": create_token(username)}
+
+
+@app.post("/auth/2fa/setup")
+def setup_2fa(username: str = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, str]:
+    user = db.get(AppUser, username)
+    if user is None:
+        raise HTTPException(status_code=404, detail="Uživatel nenalezen")
+    if user.totp_enabled:
+        raise HTTPException(status_code=400, detail="Dvoufázové ověření je už zapnuté")
+    # Nothing is persisted here - the secret only gets saved once /auth/2fa/confirm
+    # proves the user actually scanned it into their authenticator app, so a
+    # setup the user never finishes never leaves a half-configured account.
+    secret = pyotp.random_base32()
+    uri = pyotp.totp.TOTP(secret).provisioning_uri(name=username, issuer_name="FinanceSEMA")
+    qr_image = qrcode.make(uri)
+    buffer = io.BytesIO()
+    qr_image.save(buffer, format="PNG")
+    qr_base64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return {"secret": secret, "otpauth_uri": uri, "qr_code_png_base64": qr_base64}
+
+
+@app.post("/auth/2fa/confirm")
+def confirm_2fa(
+    payload: TwoFactorConfirmRequest, username: str = Depends(require_user), db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    user = db.get(AppUser, username)
+    if user is None:
+        raise HTTPException(status_code=404, detail="Uživatel nenalezen")
+    if not verify_totp_code(payload.secret, payload.code):
+        raise HTTPException(status_code=400, detail="Neplatný ověřovací kód")
+    user.totp_secret = payload.secret
+    user.totp_enabled = True
+    db.commit()
+    return {"totp_enabled": True}
+
+
+@app.post("/auth/2fa/disable")
+def disable_2fa(
+    payload: TwoFactorDisableRequest, username: str = Depends(require_user), db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    user = db.get(AppUser, username)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=404, detail="Uživatel nenalezen")
+    valid_db_user = verify_password(payload.password, user.password_hash)
+    if not valid_db_user and not authenticate(username, payload.password):
+        raise HTTPException(status_code=401, detail="Nesprávné heslo")
+    if user.totp_enabled and user.totp_secret and not verify_totp_code(user.totp_secret, payload.code):
+        raise HTTPException(status_code=400, detail="Neplatný ověřovací kód")
+    user.totp_secret = None
+    user.totp_enabled = False
+    db.commit()
+    return {"totp_enabled": False}
+
+
+@app.post("/users/{target_username}/2fa/reset")
+def admin_reset_2fa(target_username: str, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Recovery path for a lost authenticator device - there is no email/SMS
+    backup, so an admin has to be able to force 2FA back off for someone
+    else's account. The user re-enrolls (setup + confirm) afterwards."""
+    user = db.get(AppUser, target_username)
+    if user is None:
+        raise HTTPException(status_code=404, detail="Uživatel nenalezen")
+    user.totp_secret = None
+    user.totp_enabled = False
+    db.commit()
+    return {"username": target_username, "totp_enabled": False}
 
 
 @app.get("/auth/me")
@@ -272,6 +392,7 @@ def me(username: str = Depends(require_user), db: Session = Depends(get_db)) -> 
             "is_active": True,
             "is_admin": username == settings.app_username,
             "allowed_agendas": ALL_AGENDAS,
+            "totp_enabled": False,
         }
     return user_dict(user)
 
