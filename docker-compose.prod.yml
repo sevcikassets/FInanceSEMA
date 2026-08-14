@@ -33,6 +33,29 @@ services:
     volumes:
       - ./imports:/imports
       - ./exports:/app/exports
+    labels:
+      # These must live on the api container, not web - a Traefik service's
+      # loadbalancer.server.port is resolved against whichever container
+      # carries that label. Both routers' labels used to sit on web,
+      # including this api one, so Traefik had two competing service
+      # definitions with no way to tell finance-sema and finance-sema-api
+      # apart ("cannot be linked automatically with multiple Services") and
+      # silently dropped both routers - the domain 404'd even though DNS
+      # and the containers were fine. traefik.http.routers.*.service pins
+      # each router to its service explicitly so this can't recur.
+      - "traefik.enable=true"
+      - "traefik.http.routers.finance-sema-api.rule=Host(`${DOMAIN:?set DOMAIN in .env}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.finance-sema-api.entrypoints=websecure"
+      - "traefik.http.routers.finance-sema-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.finance-sema-api.service=finance-sema-api"
+      # Order matters: strip the /api prefix first, then rate-limit - a
+      # generous cap (well above normal UI usage) that still blunts a
+      # scripted brute-force run against /auth/login or /auth/2fa/login.
+      - "traefik.http.routers.finance-sema-api.middlewares=finance-sema-api-strip,finance-sema-api-ratelimit"
+      - "traefik.http.middlewares.finance-sema-api-strip.stripprefix.prefixes=/api"
+      - "traefik.http.middlewares.finance-sema-api-ratelimit.ratelimit.average=20"
+      - "traefik.http.middlewares.finance-sema-api-ratelimit.ratelimit.burst=40"
+      - "traefik.http.services.finance-sema-api.loadbalancer.server.port=8000"
     depends_on:
       db:
         condition: service_healthy
@@ -53,18 +76,8 @@ services:
       - "traefik.http.routers.finance-sema.rule=Host(`${DOMAIN}`)"
       - "traefik.http.routers.finance-sema.entrypoints=websecure"
       - "traefik.http.routers.finance-sema.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.finance-sema.service=finance-sema"
       - "traefik.http.services.finance-sema.loadbalancer.server.port=3000"
-      - "traefik.http.routers.finance-sema-api.rule=Host(`${DOMAIN}`) && PathPrefix(`/api`)"
-      - "traefik.http.routers.finance-sema-api.entrypoints=websecure"
-      - "traefik.http.routers.finance-sema-api.tls.certresolver=letsencrypt"
-      # Order matters: strip the /api prefix first, then rate-limit - a
-      # generous cap (well above normal UI usage) that still blunts a
-      # scripted brute-force run against /auth/login or /auth/2fa/login.
-      - "traefik.http.routers.finance-sema-api.middlewares=finance-sema-api-strip,finance-sema-api-ratelimit"
-      - "traefik.http.middlewares.finance-sema-api-strip.stripprefix.prefixes=/api"
-      - "traefik.http.middlewares.finance-sema-api-ratelimit.ratelimit.average=20"
-      - "traefik.http.middlewares.finance-sema-api-ratelimit.ratelimit.burst=40"
-      - "traefik.http.services.finance-sema-api.loadbalancer.server.port=8000"
     networks:
       - default
       - proxy
