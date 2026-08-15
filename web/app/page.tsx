@@ -11,6 +11,7 @@ import {
   Coins,
   Download,
   FileSpreadsheet,
+  Layers,
   ListChecks,
   LineChart,
   Lock,
@@ -117,6 +118,7 @@ const tabs = [
   { id: "alerts", label: "Upozornění", icon: AlertTriangle, endpoint: "/stocks/alerts" },
   { id: "charts", label: "Grafy", icon: BarChart3, endpoint: "/stocks/statistics" },
   { id: "rates", label: "Denní kurzy", icon: CalendarDays, endpoint: "/rates/daily?limit=500" },
+  { id: "subjects", label: "Subjekty", icon: Layers, endpoint: "/portfolios" },
   { id: "users", label: "Uživatelé", icon: Lock, endpoint: "/users" },
   { id: "settings", label: "Nastavení", icon: SettingsIcon, endpoint: "/auth/me" },
 ];
@@ -128,7 +130,7 @@ const navGroups = [
   { label: "Majetek", items: ["assets", "costs"] },
   { label: "Půjčky", items: ["loans"] },
   { label: "Akcie", items: ["transactions", "watchlist", "stats", "portfolio", "history", "alerts", "charts"] },
-  { label: "Nastavení", items: ["rates", "users", "settings"] },
+  { label: "Nastavení", items: ["rates", "subjects", "users", "settings"] },
 ];
 
 const tabsById = Object.fromEntries(tabs.map((tab) => [tab.id, tab]));
@@ -140,12 +142,13 @@ const tabsById = Object.fromEntries(tabs.map((tab) => [tab.id, tab]));
 const STOCK_OVERVIEW_TABS = ["transactions", "watchlist", "portfolio"];
 
 // Tabs that render their own custom panel instead of the generic data table.
-const NON_TABLE_TABS = new Set(["assets", "history", "alerts", "charts", "settings"]);
+const NON_TABLE_TABS = new Set(["assets", "history", "alerts", "charts", "settings", "subjects"]);
 
-// "rates" (shared CNB exchange-rate history) and "users" (user management)
-// apply app-wide and stay governed by AppUser.allowed_agendas. Every other
-// tab is scoped per-Subjekt instead - see isTabVisible below.
-const GLOBAL_AGENDAS = new Set(["rates", "users"]);
+// "rates" (shared CNB exchange-rate history), "users" (user management) and
+// "subjects" (Subjekt management) apply app-wide and stay governed by
+// AppUser.allowed_agendas. Every other tab is scoped per-Subjekt instead -
+// see isTabVisible below.
+const GLOBAL_AGENDAS = new Set(["rates", "users", "subjects"]);
 const PORTFOLIO_SCOPED_TABS = tabs.filter((tab) => !GLOBAL_AGENDAS.has(tab.id) && tab.id !== "settings");
 
 const columns: Record<string, string[]> = {
@@ -889,6 +892,16 @@ export default function Page() {
   const [accessDraft, setAccessDraft] = useState<Record<string, string[]>>({});
   const [accessBusy, setAccessBusy] = useState(false);
   const [accessStatus, setAccessStatus] = useState<string | null>(null);
+  const [editingUserUsername, setEditingUserUsername] = useState<string | null>(null);
+  const [editUserDraft, setEditUserDraft] = useState({
+    full_name: "",
+    is_admin: false,
+    is_active: true,
+    allowed_agendas: [] as string[],
+    password: "",
+  });
+  const [editUserBusy, setEditUserBusy] = useState(false);
+  const [editUserStatus, setEditUserStatus] = useState<string | null>(null);
   const allowedAgendaSet = useMemo(
     () => new Set(currentUser?.is_admin ? tabs.map((tab) => tab.id) : currentUser?.allowed_agendas || tabs.map((tab) => tab.id)),
     [currentUser],
@@ -1075,13 +1088,16 @@ export default function Page() {
     try {
       const needsStockOverview = STOCK_OVERVIEW_TABS.includes(activeTab);
       const needsAlerts = activeTab === "alerts";
-      // "alerts" and "settings" render their own panel from dedicated state
-      // (alerts/currentUser) rather than the generic rows table, and their tab
-      // endpoint ("/stocks/alerts", "/auth/me") returns a single object, not an
-      // array - stuffing that into `rows` used to crash every unconditional
+      // "alerts", "settings" and "subjects" render their own panel from
+      // dedicated state (alerts/currentUser/portfolios) rather than the
+      // generic rows table, and "alerts"/"settings"'s tab endpoint
+      // ("/stocks/alerts", "/auth/me") returns a single object, not an array
+      // - stuffing that into `rows` used to crash every unconditional
       // `rows.map` elsewhere (e.g. costAssets) as soon as you opened the tab.
-      const needsRows = activeTab !== "alerts" && activeTab !== "settings";
-      const needsPortfolioList = activeTab === "users" && Boolean(currentUser?.is_admin);
+      const needsRows = activeTab !== "alerts" && activeTab !== "settings" && activeTab !== "subjects";
+      // Both "users" (per-user Subjekt-access editor) and "subjects" (create/
+      // rename Subjekty themselves) need the full Subjekt list.
+      const needsPortfolioList = (activeTab === "users" || activeTab === "subjects") && Boolean(currentUser?.is_admin);
       const requests: Promise<unknown>[] = [activePortfolioId ? api(withPortfolio("/summary")) : Promise.resolve(null)];
       if (needsRows) requests.push(api(withPortfolio(active.endpoint)));
       if (activeTab === "rates") requests.push(api("/rates/latest"));
@@ -1427,6 +1443,51 @@ export default function Page() {
       setAccessStatus(err instanceof Error ? err.message : "Přístup se nepodařilo uložit");
     } finally {
       setAccessBusy(false);
+    }
+  }
+
+  function openUserEditor(row: Row) {
+    setEditingUserUsername(String(row.username));
+    setEditUserDraft({
+      full_name: String(row.full_name || ""),
+      is_admin: Boolean(row.is_admin),
+      is_active: row.is_active !== false,
+      allowed_agendas: Array.isArray(row.allowed_agendas) ? (row.allowed_agendas as unknown as string[]) : [],
+      password: "",
+    });
+    setEditUserStatus(null);
+  }
+
+  function toggleEditUserAgenda(agendaId: string) {
+    setEditUserDraft((value) => {
+      const selected = new Set(value.allowed_agendas);
+      if (selected.has(agendaId)) selected.delete(agendaId);
+      else selected.add(agendaId);
+      return { ...value, allowed_agendas: [...selected] };
+    });
+  }
+
+  async function saveUserEdit() {
+    if (!editingUserUsername) return;
+    setEditUserBusy(true);
+    setEditUserStatus(null);
+    try {
+      await api(`/users/${encodeURIComponent(editingUserUsername)}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          full_name: editUserDraft.full_name.trim() || null,
+          is_admin: editUserDraft.is_admin,
+          is_active: editUserDraft.is_active,
+          allowed_agendas: editUserDraft.allowed_agendas,
+          password: editUserDraft.password.trim() || null,
+        }),
+      });
+      setEditingUserUsername(null);
+      await Promise.all([loadAll(), refreshCurrentUser()]);
+    } catch (err) {
+      setEditUserStatus(err instanceof Error ? err.message : "Uživatele se nepodařilo uložit");
+    } finally {
+      setEditUserBusy(false);
     }
   }
 
@@ -1965,52 +2026,8 @@ export default function Page() {
               <div className="security-panel">
                 <div className="panel-header">
                   <div>
-                    <h3>Subjekty</h3>
-                    <p>Subjekt sdružuje majetek, půjčky i akcie jednoho vlastníka - uživatelům se pak přiděluje přístup k jednotlivým subjektům a agendám níže.</p>
-                  </div>
-                </div>
-                {portfolioStatus && <div className="success-notice">{portfolioStatus}</div>}
-                <div className="portfolio-list">
-                  {portfolios.map((portfolio) =>
-                    renamingPortfolioId === portfolio.id ? (
-                      <form className="portfolio-row" key={portfolio.id} onSubmit={saveRenamedPortfolio}>
-                        <input value={renamePortfolioName} onChange={(event) => setRenamePortfolioName(event.target.value)} autoFocus />
-                        <button className="action-button" type="submit" disabled={portfolioBusy || !renamePortfolioName.trim()}>
-                          <Save size={16} />
-                        </button>
-                        <button type="button" className="link-button" onClick={() => setRenamingPortfolioId(null)}>
-                          Zrušit
-                        </button>
-                      </form>
-                    ) : (
-                      <div className="portfolio-row" key={portfolio.id}>
-                        <span>{portfolio.name}</span>
-                        <button type="button" className="link-button" onClick={() => startRenamingPortfolio(portfolio)}>
-                          Přejmenovat
-                        </button>
-                      </div>
-                    ),
-                  )}
-                </div>
-                <form className="rate-form" onSubmit={createPortfolio}>
-                  <label>
-                    Nový subjekt
-                    <input value={newPortfolioName} onChange={(event) => setNewPortfolioName(event.target.value)} placeholder="Např. Martin Ševčík" />
-                  </label>
-                  <button className="action-button" type="submit" disabled={portfolioBusy || !newPortfolioName.trim()}>
-                    <Save size={16} />
-                    <span>Vytvořit subjekt</span>
-                  </button>
-                </form>
-              </div>
-            )}
-
-            {currentUser?.is_admin && (
-              <div className="security-panel">
-                <div className="panel-header">
-                  <div>
-                    <h3>Přístup uživatelů k subjektům</h3>
-                    <p>Pro každý subjekt zvlášť vyber, které agendy v něm uživatel uvidí.</p>
+                    <h3>Správa uživatelů</h3>
+                    <p>Upravit jméno, roli a globální oprávnění, nebo pro každý subjekt zvlášť nastavit, které agendy v něm uživatel uvidí.</p>
                   </div>
                 </div>
                 <div className="portfolio-list">
@@ -2021,45 +2038,82 @@ export default function Page() {
                     // doesn't) - typeof-guard so that transitional window
                     // renders nothing here instead of bogus placeholder rows
                     // for whatever shape the previous tab's rows had.
-                    .filter((row) => typeof row.username === "string" && !row.is_admin)
+                    .filter((row) => typeof row.username === "string")
                     .map((row) => (
                       <div className="portfolio-row" key={String(row.username)}>
                         <span>{String(row.username)}</span>
-                        <button type="button" className="link-button" onClick={() => openAccessEditor(row)}>
-                          Spravovat přístup
+                        <button type="button" className="link-button" onClick={() => openUserEditor(row)}>
+                          Upravit
                         </button>
+                        {!row.is_admin && (
+                          <button type="button" className="link-button" onClick={() => openAccessEditor(row)}>
+                            Spravovat přístup
+                          </button>
+                        )}
                       </div>
                     ))}
                 </div>
-                {editingAccessUsername && (
+                {editingUserUsername && (
                   <div className="access-editor">
                     <p>
-                      Přístup uživatele <strong>{editingAccessUsername}</strong>:
+                      Úprava uživatele <strong>{editingUserUsername}</strong>:
                     </p>
-                    {portfolios.map((portfolio) => (
-                      <div key={portfolio.id} className="access-editor-portfolio">
-                        <h4>{portfolio.name}</h4>
-                        <div className="permissions-grid">
-                          {PORTFOLIO_SCOPED_TABS.map((tab) => (
+                    <label>
+                      Jméno
+                      <input
+                        value={editUserDraft.full_name}
+                        onChange={(event) => setEditUserDraft((value) => ({ ...value, full_name: event.target.value }))}
+                      />
+                    </label>
+                    <label className="checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={editUserDraft.is_admin}
+                        onChange={(event) => setEditUserDraft((value) => ({ ...value, is_admin: event.target.checked }))}
+                      />
+                      Administrátor
+                    </label>
+                    <label className="checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={editUserDraft.is_active}
+                        onChange={(event) => setEditUserDraft((value) => ({ ...value, is_active: event.target.checked }))}
+                      />
+                      Aktivní
+                    </label>
+                    {!editUserDraft.is_admin && (
+                      <div className="permissions-grid">
+                        {tabs
+                          .filter((tab) => GLOBAL_AGENDAS.has(tab.id))
+                          .map((tab) => (
                             <label className="checkbox-row" key={tab.id}>
                               <input
-                                checked={(accessDraft[portfolio.id] || []).includes(tab.id)}
-                                onChange={() => toggleAccessAgenda(portfolio.id, tab.id)}
                                 type="checkbox"
+                                checked={editUserDraft.allowed_agendas.includes(tab.id)}
+                                onChange={() => toggleEditUserAgenda(tab.id)}
                               />
                               {tab.label}
                             </label>
                           ))}
-                        </div>
                       </div>
-                    ))}
-                    {accessStatus && <div className="success-notice">{accessStatus}</div>}
+                    )}
+                    <label>
+                      Nové heslo
+                      <input
+                        type="password"
+                        value={editUserDraft.password}
+                        onChange={(event) => setEditUserDraft((value) => ({ ...value, password: event.target.value }))}
+                        placeholder="Ponechat prázdné = beze změny"
+                        autoComplete="new-password"
+                      />
+                    </label>
+                    {editUserStatus && <div className="success-notice">{editUserStatus}</div>}
                     <div className="stock-actions">
-                      <button className="action-button" onClick={saveAccessDraft} disabled={accessBusy}>
+                      <button className="action-button" onClick={saveUserEdit} disabled={editUserBusy}>
                         <Save size={16} />
-                        <span>Uložit přístup</span>
+                        <span>Uložit uživatele</span>
                       </button>
-                      <button type="button" className="link-button" onClick={() => setEditingAccessUsername(null)}>
+                      <button type="button" className="link-button" onClick={() => setEditingUserUsername(null)}>
                         Zrušit
                       </button>
                     </div>
@@ -2067,6 +2121,87 @@ export default function Page() {
                 )}
               </div>
             )}
+
+            {currentUser?.is_admin && editingAccessUsername && (
+              <div className="security-panel">
+                <div className="access-editor">
+                  <p>
+                    Přístup uživatele <strong>{editingAccessUsername}</strong>:
+                  </p>
+                  {portfolios.map((portfolio) => (
+                    <div key={portfolio.id} className="access-editor-portfolio">
+                      <h4>{portfolio.name}</h4>
+                      <div className="permissions-grid">
+                        {PORTFOLIO_SCOPED_TABS.map((tab) => (
+                          <label className="checkbox-row" key={tab.id}>
+                            <input
+                              checked={(accessDraft[portfolio.id] || []).includes(tab.id)}
+                              onChange={() => toggleAccessAgenda(portfolio.id, tab.id)}
+                              type="checkbox"
+                            />
+                            {tab.label}
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                  {accessStatus && <div className="success-notice">{accessStatus}</div>}
+                  <div className="stock-actions">
+                    <button className="action-button" onClick={saveAccessDraft} disabled={accessBusy}>
+                      <Save size={16} />
+                      <span>Uložit přístup</span>
+                    </button>
+                    <button type="button" className="link-button" onClick={() => setEditingAccessUsername(null)}>
+                      Zrušit
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        {activeTab === "subjects" && (
+          <section className="work-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Subjekty</h2>
+                <p>Subjekt sdružuje majetek, půjčky i akcie jednoho vlastníka - uživatelům se pak v záložce Uživatelé přiděluje přístup k jednotlivým subjektům a agendám.</p>
+              </div>
+            </div>
+            {portfolioStatus && <div className="success-notice">{portfolioStatus}</div>}
+            <div className="portfolio-list">
+              {portfolios.map((portfolio) =>
+                renamingPortfolioId === portfolio.id ? (
+                  <form className="portfolio-row" key={portfolio.id} onSubmit={saveRenamedPortfolio}>
+                    <input value={renamePortfolioName} onChange={(event) => setRenamePortfolioName(event.target.value)} autoFocus />
+                    <button className="action-button" type="submit" disabled={portfolioBusy || !renamePortfolioName.trim()}>
+                      <Save size={16} />
+                    </button>
+                    <button type="button" className="link-button" onClick={() => setRenamingPortfolioId(null)}>
+                      Zrušit
+                    </button>
+                  </form>
+                ) : (
+                  <div className="portfolio-row" key={portfolio.id}>
+                    <span>{portfolio.name}</span>
+                    <button type="button" className="link-button" onClick={() => startRenamingPortfolio(portfolio)}>
+                      Přejmenovat
+                    </button>
+                  </div>
+                ),
+              )}
+            </div>
+            <form className="rate-form" onSubmit={createPortfolio}>
+              <label>
+                Nový subjekt
+                <input value={newPortfolioName} onChange={(event) => setNewPortfolioName(event.target.value)} placeholder="Např. Martin Ševčík" />
+              </label>
+              <button className="action-button" type="submit" disabled={portfolioBusy || !newPortfolioName.trim()}>
+                <Save size={16} />
+                <span>Vytvořit subjekt</span>
+              </button>
+            </form>
           </section>
         )}
 

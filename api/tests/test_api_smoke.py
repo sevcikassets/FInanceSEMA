@@ -1137,3 +1137,59 @@ def test_portfolio_access_bulk_replace_round_trips_through_auth_me(client, db_se
 
     me_after_second = client.get("/auth/me", headers=scoped_headers).json()
     assert {row["id"]: row["allowed_agendas"] for row in me_after_second["portfolios"]} == {str(portfolio_a.id): ["assets"]}
+
+
+@requires_db
+def test_update_user_endpoint_edits_profile_and_login_still_works(client, db_session):
+    """PUT /users/{username}: full_name/is_admin/is_active/allowed_agendas
+    (global) are editable, password resets when provided (and login then
+    requires the NEW password), and an admin can't strip their own
+    is_admin/is_active (would be a self-lockout with no recovery path)."""
+    from app.auth import hash_password
+    from app.models import AppUser
+
+    db_session.add(
+        AppUser(username="editable", password_hash=hash_password("orig-pass"), full_name="Original Name", is_active=True, is_admin=False, allowed_agendas=[])
+    )
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+
+    updated = client.put(
+        "/users/editable",
+        headers=headers,
+        json={
+            "full_name": "New Name",
+            "is_admin": False,
+            "is_active": True,
+            "allowed_agendas": ["rates", "subjects"],
+            "password": "new-pass",
+        },
+    )
+    assert updated.status_code == 200
+    body = updated.json()
+    assert body["full_name"] == "New Name"
+    assert body["allowed_agendas"] == ["rates", "subjects"]
+
+    # Old password no longer works, new one does.
+    old_login = client.post("/auth/login", json={"username": "editable", "password": "orig-pass"})
+    assert old_login.status_code == 401
+    new_login = client.post("/auth/login", json={"username": "editable", "password": "new-pass"})
+    assert new_login.status_code == 200
+
+    # Editing without a password leaves the (new) password untouched.
+    no_password_change = client.put(
+        "/users/editable",
+        headers=headers,
+        json={"full_name": "New Name", "is_admin": False, "is_active": True, "allowed_agendas": []},
+    )
+    assert no_password_change.status_code == 200
+    still_works = client.post("/auth/login", json={"username": "editable", "password": "new-pass"})
+    assert still_works.status_code == 200
+
+    # Admin can't remove their own admin/active status via this endpoint.
+    self_lockout = client.put(
+        "/users/admin", headers=headers, json={"full_name": "Administrátor", "is_admin": False, "is_active": True, "allowed_agendas": []}
+    )
+    assert self_lockout.status_code == 400

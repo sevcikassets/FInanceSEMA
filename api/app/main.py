@@ -100,6 +100,16 @@ class UserInput(BaseModel):
     allowed_agendas: list[str] = []
 
 
+class UserUpdateInput(BaseModel):
+    full_name: str | None = None
+    is_admin: bool = False
+    is_active: bool = True
+    allowed_agendas: list[str] = []
+    # Optional - only set if provided, so editing a user never requires
+    # re-entering (or blanking out) their existing password.
+    password: str | None = None
+
+
 class ExchangeRateInput(BaseModel):
     rate_date: date
     currency: str
@@ -648,6 +658,35 @@ def create_user(payload: UserInput, _: str = Depends(require_admin), db: Session
     db.add(row)
     db.commit()
     return user_dict(row)
+
+
+@app.put("/users/{target_username}")
+def update_user(
+    target_username: str,
+    payload: UserUpdateInput,
+    acting_username: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Edits an existing user's display name, admin/active flags, global
+    (rates/users/subjects) agendas, and optionally resets their password.
+    Does not touch username (the primary key) or per-Subjekt access -
+    that's PUT /users/{username}/portfolio-access."""
+    user = db.get(AppUser, target_username)
+    if user is None:
+        raise HTTPException(status_code=404, detail="Uživatel nenalezen")
+    if target_username == acting_username and (not payload.is_admin or not payload.is_active):
+        raise HTTPException(status_code=400, detail="Nelze si sám sobě odebrat práva administrátora nebo se deaktivovat")
+    allowed = [agenda for agenda in payload.allowed_agendas if agenda in ALL_AGENDAS]
+    if payload.is_admin:
+        allowed = ALL_AGENDAS
+    user.full_name = payload.full_name
+    user.is_admin = payload.is_admin
+    user.is_active = payload.is_active
+    user.allowed_agendas = allowed
+    if payload.password:
+        user.password_hash = hash_password(payload.password)
+    db.commit()
+    return user_dict(user) | {"portfolios": user_portfolios(user.username, db)}
 
 
 @app.get("/portfolios")

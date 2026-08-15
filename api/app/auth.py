@@ -24,13 +24,15 @@ ALL_AGENDAS = [
     "charts",
     "rates",
     "users",
+    "subjects",
 ]
 
-# "rates" (shared CNB exchange-rate history) and "users" (user management)
-# apply app-wide and stay governed by AppUser.allowed_agendas. Every other
-# agenda is scoped per-Subjekt (Portfolio) via PortfolioAccess.allowed_agendas
-# instead - see require_portfolio_access in main.py.
-GLOBAL_AGENDAS = ["rates", "users"]
+# "rates" (shared CNB exchange-rate history), "users" (user management) and
+# "subjects" (Subjekt/Portfolio management) apply app-wide and stay governed
+# by AppUser.allowed_agendas. Every other agenda is scoped per-Subjekt
+# (Portfolio) via PortfolioAccess.allowed_agendas instead - see
+# require_portfolio_access in main.py.
+GLOBAL_AGENDAS = ["rates", "users", "subjects"]
 PORTFOLIO_SCOPED_AGENDAS = [agenda for agenda in ALL_AGENDAS if agenda not in GLOBAL_AGENDAS]
 
 # Marks a token issued after username+password succeed but before the TOTP
