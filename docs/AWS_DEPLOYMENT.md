@@ -56,12 +56,22 @@ Aplikace obsahuje citliva financni data, proto hned po prvnim prihlaseni:
 
 ## Import dat
 
-Nahrajte zdrojove soubory do `~/finance-sema-app/imports/`:
+Nahrajte zdrojove soubory z lokalniho pocitace do `~/finance-sema-app/imports/` na serveru, napr. z Windows pres `scp` (PowerShell):
+
+```powershell
+scp "C:\TEMP\Finance SEMA.xlsm" ubuntu@<server>:~/finance-sema-app/imports/
+scp "C:\TEMP\Finance RD Kvasice.xlsx" ubuntu@<server>:~/finance-sema-app/imports/
+```
+
+Pak na serveru:
 
 ```bash
+cd ~/finance-sema-app
 mkdir -p imports
 docker compose -f docker-compose.prod.yml exec api python -m app.excel_import --finance '/imports/Finance SEMA.xlsm' --property-costs '/imports/Finance RD Kvasice.xlsx'
 ```
+
+Import je bezpecne spustit i opakovane - pred naimportovanim si nejdriv smaze puvodni obsah importovanych tabulek (denni statistika, portfolio, kurzy, akciove transakce, watchlist, majetky/naklady, pohyby pujcek), takze nehrozi zdvojeni dat. Uzivatelske ucty (vcetne 2FA nastaveni) import nijak neovlivni.
 
 ## Zalohovani databaze
 
@@ -79,3 +89,33 @@ docker compose -f docker-compose.prod.yml up -d --build
 ```
 
 nebo pomoci `./update-finance-sema-app.sh`. Databaze pri aktualizaci zustava zachovana (volume `finance-sema-db`); nove sloupce v databazi (napr. pro 2FA) se pri startu API doplni automaticky.
+
+## Reseni problemu
+
+### 504 Gateway Timeout na `/api/*`, i kdyz kontejner `api` bezi a labely v `docker-compose.prod.yml` jsou spravne
+
+Tenhle projekt bezi na stejnem sdilenem Traefiku jako `Activities` a `vocab-app` (spravovanem mimo tento repozitar, typicky v `/opt/proxy/docker-compose.yml` na hostu). Pokud po restartu/rebootu hosta zacne `web` router fungovat, ale `/api/*` konzistentne pada na 504, i kdyz:
+
+- kontejner `finance-sema-app-api-1` bezi a `docker logs` ukazuje cisty start (`Uvicorn running on ...`),
+- primy test mezi kontejnery funguje (`docker exec finance-sema-app-web-1 wget -qO- http://finance-sema-app-api-1:8000/health`),
+- labely `traefik.http.services.finance-sema-api.loadbalancer.server.port` a `traefik.docker.network=proxy` jsou v `docker-compose.prod.yml` spravne,
+
+zkontrolujte na hostu (ne v tomto repozitari) soubor spravujici sdileny Traefik, jestli nema vynucenou starou verzi Docker API:
+
+```bash
+docker inspect traefik --format '{{json .Config.Cmd}}'
+cat /opt/proxy/docker-compose.yml   # cesta zjistitelna pres: docker inspect traefik --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}'
+```
+
+Konkretne `environment: DOCKER_API_VERSION: "1.40"` u sluzby `traefik` zpusobuje, ze si Traefik u kontejneru pripojenych na vice siti (zde `default` + `proxy`) nespravne vybere IP z prvni site v abecednim poradi (`...default`) misto site urcene labelem `traefik.docker.network=proxy` - a protoze samotny Traefik na te druhe siti neni, kazdy pozadavek na dany router skonci timeoutem (504) po defaultnich ~30 s, presto ze cilovy kontejner je zdravy a dostupny odjinud.
+
+Diagnostika (docasne zapnout podrobny log u sdileneho Traefiku, pridat do jeho `command:` a restartovat jen jeho):
+
+```yaml
+- "--accesslog=true"
+- "--log.level=DEBUG"
+```
+
+V logu (`docker logs --since 1m traefik | grep -i "Creating server URL"`) je videt presnou IP:port, kterou si Traefik pro danou sluzbu vybral - pokud neodpovida IP na siti `proxy` (`docker inspect <api-kontejner> --format '{{json .NetworkSettings.Networks}}'`), je to tento problem.
+
+Reseni: odstranit radek `environment: DOCKER_API_VERSION: "1.40"` ze sluzby `traefik` v `/opt/proxy/docker-compose.yml` a restartovat (`docker compose up -d` v `/opt/proxy`). Po overeni, ze vse funguje (vcetne ostatnich aplikaci na stejnem Traefiku), snizit `--log.level` zpet (napr. odebrat, defaultni uroven staci) - `--accesslog=true` je uzitecne nechat zapnute trvale.
