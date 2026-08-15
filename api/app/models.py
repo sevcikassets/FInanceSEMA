@@ -134,7 +134,14 @@ class AssetCost(Base):
     payer_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("parties.id"))
     supplier: Mapped[str | None] = mapped_column(String(255))
     item: Mapped[str] = mapped_column(Text)
+    # Legacy free-text category from the original Excel import - kept
+    # read-only/untouched for historical rows (never deleted, per project
+    # convention), but no longer written to. category_id below is the
+    # dictionary-backed replacement every new/edited row uses; ensure_schema_
+    # upgrades() backfills it from this column's existing distinct values on
+    # first deploy after this column was added (see main.py).
     category: Mapped[str | None] = mapped_column(String(128))
+    category_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("cost_categories.id"), index=True)
     amount: Mapped[Decimal | None] = mapped_column(Numeric(16, 2))
     note: Mapped[str | None] = mapped_column(Text)
     source_sheet: Mapped[str | None] = mapped_column(String(128))
@@ -142,6 +149,7 @@ class AssetCost(Base):
 
     asset: Mapped[Asset | None] = relationship()
     payer: Mapped[Party | None] = relationship()
+    category_ref: Mapped["CostCategory | None"] = relationship()
 
 
 class CostCategory(Base):

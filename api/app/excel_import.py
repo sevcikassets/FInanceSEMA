@@ -18,6 +18,7 @@ from .db import Base, SessionLocal, engine
 from .models import (
     Asset,
     AssetCost,
+    CostCategory,
     DailyStatistic,
     ExchangeRate,
     ImportBatch,
@@ -77,6 +78,23 @@ def get_or_create_party(db: Session, name: str | None, kind: str = "unknown") ->
     db.add(party)
     db.flush()
     return party
+
+
+def get_or_create_cost_category(db: Session, portfolio_id: uuid.UUID, name: str | None) -> CostCategory | None:
+    """Same get-or-create pattern as get_or_create_party above, scoped to
+    one Subjekt's category dictionary instead of the global Party table -
+    used both by the Excel import and the manual add/edit-cost endpoint in
+    main.py, so a category typed by hand lands in the same dictionary a
+    later import would create it in."""
+    if not name:
+        return None
+    existing = db.scalar(select(CostCategory).where(CostCategory.portfolio_id == portfolio_id, CostCategory.name == name))
+    if existing:
+        return existing
+    category = CostCategory(portfolio_id=portfolio_id, name=name)
+    db.add(category)
+    db.flush()
+    return category
 
 
 def normalize_match_text(value: str | None) -> str:
@@ -267,6 +285,7 @@ def import_property_costs(db: Session, path: Path, portfolio_id: uuid.UUID) -> i
             continue
         if not item and amount is None:
             continue
+        category = get_or_create_cost_category(db, portfolio_id, as_text(ws.cell(r, 5).value))
         db.add(
             AssetCost(
                 portfolio_id=portfolio_id,
@@ -275,7 +294,10 @@ def import_property_costs(db: Session, path: Path, portfolio_id: uuid.UUID) -> i
                 payer=get_or_create_party(db, as_text(ws.cell(r, 2).value), "payer"),
                 supplier=as_text(ws.cell(r, 3).value),
                 item=item or "Náklad",
-                category=as_text(ws.cell(r, 5).value),
+                # New imports go straight to the dictionary-backed
+                # category_id, not the legacy free-text `category` column -
+                # see CostCategory/AssetCost.category_id in models.py.
+                category_id=category.id if category else None,
                 amount=amount,
                 note=as_text(ws.cell(r, 7).value),
                 source_sheet="Finance RD Kvasice.xlsx/Finance",

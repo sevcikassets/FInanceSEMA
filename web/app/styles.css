@@ -841,6 +841,39 @@ nav button:hover {
   color: var(--muted);
 }
 
+.cost-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+.cost-form-grid label {
+  margin: 0;
+}
+
+.cost-form-note {
+  grid-column: 1 / -1;
+}
+
+.cost-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+
+.cost-row-actions .link-button {
+  white-space: nowrap;
+}
+
+.cost-attachment-upload {
+  cursor: pointer;
+}
+
+.cost-attachment-upload input[type="file"] {
+  display: none;
+}
+
 .two-factor-setup {
   display: grid;
   gap: 12px;

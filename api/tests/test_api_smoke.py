@@ -1235,3 +1235,161 @@ def test_cost_categories_admin_only_write_scoped_read(client, db_session, portfo
     assert deleted.status_code == 200
     listed_after = client.get("/assets/cost-categories", headers=admin_headers, params=params)
     assert listed_after.json() == []
+
+
+@requires_db
+def test_asset_cost_crud_resolves_category_and_payer_and_is_portfolio_scoped(client, db_session, portfolio_id):
+    """POST/PUT resolve free-text category/payer via get-or-create (so the
+    dictionary is reused, not duplicated), and every read/write is 404'd once
+    scoped to a portfolio_id the cost doesn't belong to."""
+    from app.models import Portfolio
+
+    other_portfolio = Portfolio(name="Jiny Subjekt")
+    db_session.add(other_portfolio)
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    created = client.post(
+        "/assets/costs",
+        headers=headers,
+        params=params,
+        json={"item": "Pojistka", "category": "Pojisteni", "amount": "1234.50", "payer": "Martin"},
+    )
+    assert created.status_code == 200
+    body = created.json()
+    cost_id = body["id"]
+    assert body["category"] == "Pojisteni"
+    assert body["payer"] == "Martin"
+    assert body["has_attachment"] is False
+
+    # A second cost reusing the same category/payer text must resolve to the
+    # same dictionary rows, not create duplicates.
+    from app.models import CostCategory, Party
+
+    assert db_session.query(CostCategory).filter_by(portfolio_id=portfolio_id, name="Pojisteni").count() == 1
+    assert db_session.query(Party).filter_by(name="Martin").count() == 1
+
+    listed = client.get("/assets/costs", headers=headers, params=params)
+    assert listed.status_code == 200
+    assert [row["item"] for row in listed.json()] == ["Pojistka"]
+
+    updated = client.put(
+        f"/assets/costs/{cost_id}",
+        headers=headers,
+        params=params,
+        json={"item": "Pojistka upravena", "category": "Pojisteni", "amount": "999"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["item"] == "Pojistka upravena"
+    assert updated.json()["payer"] is None  # PUT payload omitted payer - it's cleared, not left untouched.
+
+    # Scoped to the wrong Subjekt, the same cost is invisible.
+    other_params = {"portfolio_id": str(other_portfolio.id)}
+    wrong_scope_list = client.get("/assets/costs", headers=headers, params=other_params)
+    assert wrong_scope_list.json() == []
+    wrong_scope_update = client.put(
+        f"/assets/costs/{cost_id}", headers=headers, params=other_params, json={"item": "x"}
+    )
+    assert wrong_scope_update.status_code == 404
+    wrong_scope_delete = client.delete(f"/assets/costs/{cost_id}", headers=headers, params=other_params)
+    assert wrong_scope_delete.status_code == 404
+
+    deleted = client.delete(f"/assets/costs/{cost_id}", headers=headers, params=params)
+    assert deleted.status_code == 200
+    listed_after = client.get("/assets/costs", headers=headers, params=params)
+    assert listed_after.json() == []
+
+
+@requires_db
+def test_asset_cost_create_rejects_asset_from_another_portfolio(client, db_session, portfolio_id):
+    from app.models import Asset, Portfolio
+
+    other_portfolio = Portfolio(name="Jiny Subjekt")
+    db_session.add(other_portfolio)
+    db_session.commit()
+    foreign_asset = Asset(portfolio_id=other_portfolio.id, code="X-1", name="Cizi majetek")
+    db_session.add(foreign_asset)
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+
+    response = client.post(
+        "/assets/costs",
+        headers=headers,
+        params={"portfolio_id": str(portfolio_id)},
+        json={"item": "Test", "asset_id": str(foreign_asset.id)},
+    )
+    assert response.status_code == 404
+
+
+@requires_db
+def test_asset_cost_attachment_upload_download_delete(client, db_session, portfolio_id, tmp_path, monkeypatch):
+    """Attachments are stored as {cost.id}.pdf under ATTACHMENTS_DIR, gated by
+    a magic-bytes check (Content-Type is client-supplied and spoofable)."""
+    from app import main as main_module
+
+    monkeypatch.setattr(main_module.settings, "attachments_dir", str(tmp_path))
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    created = client.post("/assets/costs", headers=headers, params=params, json={"item": "Faktura"})
+    cost_id = created.json()["id"]
+
+    not_a_pdf = client.post(
+        f"/assets/costs/{cost_id}/attachment",
+        headers=headers,
+        params=params,
+        files={"file": ("fake.pdf", b"not actually a pdf", "application/pdf")},
+    )
+    assert not_a_pdf.status_code == 400
+
+    pdf_bytes = b"%PDF-1.4\n%%EOF"
+    uploaded = client.post(
+        f"/assets/costs/{cost_id}/attachment",
+        headers=headers,
+        params=params,
+        files={"file": ("real.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert uploaded.status_code == 200
+    assert (tmp_path / f"{cost_id}.pdf").read_bytes() == pdf_bytes
+
+    listed = client.get("/assets/costs", headers=headers, params=params)
+    assert listed.json()[0]["has_attachment"] is True
+
+    downloaded = client.get(f"/assets/costs/{cost_id}/attachment", headers=headers, params=params)
+    assert downloaded.status_code == 200
+    assert downloaded.content == pdf_bytes
+
+    deleted = client.delete(f"/assets/costs/{cost_id}/attachment", headers=headers, params=params)
+    assert deleted.status_code == 200
+    assert not (tmp_path / f"{cost_id}.pdf").exists()
+
+    after_delete = client.get(f"/assets/costs/{cost_id}/attachment", headers=headers, params=params)
+    assert after_delete.status_code == 404
+
+
+@requires_db
+def test_asset_cost_write_requires_costs_agenda_grant(client, db_session, portfolio_id):
+    from app.auth import hash_password
+    from app.models import AppUser, PortfolioAccess
+
+    db_session.add(
+        AppUser(username="viewer", password_hash=hash_password("s3cret!"), is_active=True, is_admin=False, allowed_agendas=[])
+    )
+    # Granted "assets" but not "costs" - can't touch cost endpoints even
+    # though they're on the same Subjekt.
+    db_session.add(PortfolioAccess(username="viewer", portfolio_id=portfolio_id, allowed_agendas=["assets"]))
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "viewer", "password": "s3cret!"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    response = client.post("/assets/costs", headers=headers, params=params, json={"item": "Test"})
+    assert response.status_code == 403

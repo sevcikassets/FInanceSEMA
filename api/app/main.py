@@ -23,6 +23,7 @@ import pyotp
 import qrcode
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, desc, func, select, text
 from sqlalchemy.orm import Session
@@ -42,7 +43,7 @@ from .auth import (
 )
 from .config import get_settings
 from .db import Base, engine, get_db
-from .excel_import import import_workbooks
+from .excel_import import get_or_create_cost_category, get_or_create_party, import_workbooks
 from .loan_calc import project_annual_interest
 from .models import (
     AppUser,
@@ -129,6 +130,17 @@ class CostCategoryInput(BaseModel):
     name: str
 
 
+class AssetCostInput(BaseModel):
+    asset_id: uuid.UUID | None = None
+    cost_date: date | None = None
+    item: str
+    category: str | None = None
+    amount: Decimal | None = None
+    supplier: str | None = None
+    payer: str | None = None
+    note: str | None = None
+
+
 class PortfolioAccessGrant(BaseModel):
     portfolio_id: uuid.UUID
     allowed_agendas: list[str] = []
@@ -181,6 +193,12 @@ def user_dict(row: AppUser) -> dict[str, Any]:
 
 def portfolio_dict(row: Portfolio) -> dict[str, Any]:
     return {"id": str(row.id), "name": row.name}
+
+
+def cost_attachment_path(cost_id: uuid.UUID) -> Path:
+    # Filename is always the cost's own UUID, never a user-supplied name -
+    # rules out path traversal entirely (see settings.attachments_dir).
+    return Path(settings.attachments_dir) / f"{cost_id}.pdf"
 
 
 def user_portfolios(username: str, db: Session) -> list[dict[str, Any]]:
@@ -498,12 +516,50 @@ def ensure_schema_upgrades() -> None:
                     {"u": username, "p": default_portfolio_id, "a": json.dumps(granted)},
                 )
 
+        # --- Cost categories: migrate legacy free-text AssetCost.category
+        # into the new dictionary-backed category_id, so the "Kategorie
+        # nákladů" agenda starts populated from whatever categories already
+        # exist in imported cost data instead of empty. Idempotent - only
+        # ever touches rows where category_id is still NULL, so once every
+        # row has been backfilled this is a cheap no-op on every startup.
+        conn.execute(text("ALTER TABLE asset_costs ADD COLUMN IF NOT EXISTS category_id UUID"))
+        category_fk_name = "fk_asset_costs_category_id"
+        if not _constraint_exists(conn, "asset_costs", category_fk_name):
+            conn.execute(
+                text(f"ALTER TABLE asset_costs ADD CONSTRAINT {category_fk_name} FOREIGN KEY (category_id) REFERENCES cost_categories (id)")
+            )
+        distinct_categories = conn.execute(
+            text(
+                "SELECT DISTINCT portfolio_id, category FROM asset_costs "
+                "WHERE category IS NOT NULL AND category != '' AND category_id IS NULL"
+            )
+        ).all()
+        for cat_portfolio_id, category_name in distinct_categories:
+            existing_category_id = conn.execute(
+                text("SELECT id FROM cost_categories WHERE portfolio_id = :p AND name = :n"),
+                {"p": cat_portfolio_id, "n": category_name},
+            ).scalar()
+            if existing_category_id is None:
+                existing_category_id = uuid.uuid4()
+                conn.execute(
+                    text("INSERT INTO cost_categories (id, portfolio_id, name) VALUES (:id, :p, :n)"),
+                    {"id": existing_category_id, "p": cat_portfolio_id, "n": category_name},
+                )
+            conn.execute(
+                text(
+                    "UPDATE asset_costs SET category_id = :cid "
+                    "WHERE portfolio_id = :p AND category = :n AND category_id IS NULL"
+                ),
+                {"cid": existing_category_id, "p": cat_portfolio_id, "n": category_name},
+            )
+
 
 @app.on_event("startup")
 def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
     ensure_schema_upgrades()
     ensure_admin_user()
+    Path(settings.attachments_dir).mkdir(parents=True, exist_ok=True)
 
 
 @app.get("/health")
@@ -934,7 +990,169 @@ def asset_costs(
     ).all()
     assets_by_id = {a.id: a.name for a in db.scalars(select(Asset)).all()}
     payers = {p.id: p.name for p in db.scalars(select(Party)).all()}
-    return [model_dict(row) | {"asset": assets_by_id.get(row.asset_id), "payer": payers.get(row.payer_id)} for row in rows]
+    categories_by_id = {
+        c.id: c.name for c in db.scalars(select(CostCategory).where(CostCategory.portfolio_id == portfolio_id)).all()
+    }
+    return [
+        model_dict(row)
+        | {
+            "asset": assets_by_id.get(row.asset_id),
+            "payer": payers.get(row.payer_id),
+            # Dictionary-backed name wins; legacy free-text is only a
+            # fallback for the rare pre-migration row that ensure_schema_
+            # upgrades() hasn't backfilled a category_id for yet.
+            "category": categories_by_id.get(row.category_id) or row.category,
+            "has_attachment": cost_attachment_path(row.id).exists(),
+        }
+        for row in rows
+    ]
+
+
+def _cost_dict(db: Session, row: AssetCost) -> dict[str, Any]:
+    asset = db.get(Asset, row.asset_id) if row.asset_id else None
+    payer = db.get(Party, row.payer_id) if row.payer_id else None
+    category = db.get(CostCategory, row.category_id) if row.category_id else None
+    return model_dict(row) | {
+        "asset": asset.name if asset else None,
+        "payer": payer.name if payer else None,
+        "category": category.name if category else row.category,
+        "has_attachment": cost_attachment_path(row.id).exists(),
+    }
+
+
+@app.post("/assets/costs")
+def create_asset_cost(
+    payload: AssetCostInput,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("costs")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if payload.asset_id is not None and db.scalar(
+        select(Asset).where(Asset.id == payload.asset_id, Asset.portfolio_id == portfolio_id)
+    ) is None:
+        raise HTTPException(status_code=404, detail="Majetek nenalezen")
+    item = payload.item.strip()
+    if not item:
+        raise HTTPException(status_code=400, detail="Položka je povinná")
+    category = get_or_create_cost_category(db, portfolio_id, (payload.category or "").strip() or None)
+    payer = get_or_create_party(db, (payload.payer or "").strip() or None, "payer")
+    row = AssetCost(
+        portfolio_id=portfolio_id,
+        asset_id=payload.asset_id,
+        cost_date=payload.cost_date,
+        item=item,
+        category_id=category.id if category else None,
+        amount=payload.amount,
+        supplier=(payload.supplier or "").strip() or None,
+        payer_id=payer.id if payer else None,
+        note=(payload.note or "").strip() or None,
+    )
+    db.add(row)
+    db.commit()
+    return _cost_dict(db, row)
+
+
+@app.put("/assets/costs/{cost_id}")
+def update_asset_cost(
+    cost_id: uuid.UUID,
+    payload: AssetCostInput,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("costs")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    row = db.scalar(select(AssetCost).where(AssetCost.id == cost_id, AssetCost.portfolio_id == portfolio_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Náklad nenalezen")
+    if payload.asset_id is not None and db.scalar(
+        select(Asset).where(Asset.id == payload.asset_id, Asset.portfolio_id == portfolio_id)
+    ) is None:
+        raise HTTPException(status_code=404, detail="Majetek nenalezen")
+    item = payload.item.strip()
+    if not item:
+        raise HTTPException(status_code=400, detail="Položka je povinná")
+    category = get_or_create_cost_category(db, portfolio_id, (payload.category or "").strip() or None)
+    payer = get_or_create_party(db, (payload.payer or "").strip() or None, "payer")
+    row.asset_id = payload.asset_id
+    row.cost_date = payload.cost_date
+    row.item = item
+    row.category_id = category.id if category else None
+    row.amount = payload.amount
+    row.supplier = (payload.supplier or "").strip() or None
+    row.payer_id = payer.id if payer else None
+    row.note = (payload.note or "").strip() or None
+    db.commit()
+    return _cost_dict(db, row)
+
+
+@app.delete("/assets/costs/{cost_id}")
+def delete_asset_cost(
+    cost_id: uuid.UUID,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("costs")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    row = db.scalar(select(AssetCost).where(AssetCost.id == cost_id, AssetCost.portfolio_id == portfolio_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Náklad nenalezen")
+    attachment = cost_attachment_path(cost_id)
+    if attachment.exists():
+        attachment.unlink()
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted"}
+
+
+PDF_MAGIC_BYTES = b"%PDF-"
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+
+
+@app.post("/assets/costs/{cost_id}/attachment")
+async def upload_cost_attachment(
+    cost_id: uuid.UUID,
+    file: UploadFile = File(...),
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("costs")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    row = db.scalar(select(AssetCost).where(AssetCost.id == cost_id, AssetCost.portfolio_id == portfolio_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Náklad nenalezen")
+    content = await file.read()
+    if len(content) > MAX_ATTACHMENT_BYTES:
+        raise HTTPException(status_code=400, detail="Příloha je příliš velká (max 20 MB)")
+    # Content-Type is client-supplied and easy to spoof - the magic-bytes
+    # check is what actually keeps this from writing arbitrary uploads to
+    # disk under a .pdf-shaped path.
+    if not content.startswith(PDF_MAGIC_BYTES):
+        raise HTTPException(status_code=400, detail="Přílohou může být jen platný PDF soubor")
+    cost_attachment_path(cost_id).write_bytes(content)
+    return {"status": "uploaded"}
+
+
+@app.get("/assets/costs/{cost_id}/attachment")
+def download_cost_attachment(
+    cost_id: uuid.UUID,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("costs")),
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    row = db.scalar(select(AssetCost).where(AssetCost.id == cost_id, AssetCost.portfolio_id == portfolio_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Náklad nenalezen")
+    path = cost_attachment_path(cost_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Příloha nenalezena")
+    return FileResponse(path, media_type="application/pdf", filename=f"{cost_id}.pdf")
+
+
+@app.delete("/assets/costs/{cost_id}/attachment")
+def delete_cost_attachment(
+    cost_id: uuid.UUID,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("costs")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    row = db.scalar(select(AssetCost).where(AssetCost.id == cost_id, AssetCost.portfolio_id == portfolio_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Náklad nenalezen")
+    path = cost_attachment_path(cost_id)
+    if path.exists():
+        path.unlink()
+    return {"status": "deleted"}
 
 
 @app.get("/assets/cost-categories")

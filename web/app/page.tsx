@@ -148,7 +148,7 @@ const PORTFOLIO_SCOPED_TABS = tabs.filter((tab) => !GLOBAL_AGENDAS.has(tab.id) &
 const columns: Record<string, string[]> = {
   portfolio: ["ticker", "name", "quantity", "currency", "market_value_czk", "invested_czk", "profit_czk", "profit_pct"],
   assets: ["code", "owner", "asset_type", "name", "total_value", "own_funds", "borrowed_amount", "interest_rate"],
-  costs: ["cost_date", "asset", "payer", "supplier", "category", "item", "amount"],
+  costs: ["cost_date", "asset", "payer", "supplier", "category", "item", "amount", "actions"],
   loans: ["period_label", "lender", "borrower", "amount", "interest_rate", "planned_end_date", "description"],
   transactions: [
     "traded_on",
@@ -317,6 +317,7 @@ const labels: Record<string, string> = {
   daily_profit_czk: "Denní zisk",
   alerts: "Varování",
   note: "Poznámka",
+  actions: "Akce",
   username: "Uživatelské jméno",
   full_name: "Jméno",
   is_admin: "Administrátor",
@@ -897,6 +898,22 @@ export default function Page() {
   const [newCategoryName, setNewCategoryName] = useState("");
   const [categoryBusy, setCategoryBusy] = useState(false);
   const [categoryStatus, setCategoryStatus] = useState<string | null>(null);
+  const [costAssetsList, setCostAssetsList] = useState<Row[]>([]);
+  const [costCategoriesList, setCostCategoriesList] = useState<Row[]>([]);
+  const [editingCostId, setEditingCostId] = useState<string | null>(null);
+  const [costDraft, setCostDraft] = useState({
+    asset_id: "",
+    cost_date: "",
+    item: "",
+    category: "",
+    amount: "",
+    supplier: "",
+    payer: "",
+    note: "",
+  });
+  const [costBusy, setCostBusy] = useState(false);
+  const [costStatus, setCostStatus] = useState<string | null>(null);
+  const [costAttachmentBusy, setCostAttachmentBusy] = useState<string | null>(null);
   const allowedAgendaSet = useMemo(
     () => new Set(currentUser?.is_admin ? tabs.map((tab) => tab.id) : currentUser?.allowed_agendas || tabs.map((tab) => tab.id)),
     [currentUser],
@@ -1093,12 +1110,18 @@ export default function Page() {
       // Both "users" (per-user Subjekt-access editor) and "subjects" (create/
       // rename Subjekty themselves) need the full Subjekt list.
       const needsPortfolioList = (activeTab === "users" || activeTab === "subjects") && Boolean(currentUser?.is_admin);
+      // The costs create/edit form needs the full asset list (for the asset
+      // picker) and the cost-category dictionary (for the category picker) -
+      // neither is present in `rows` while on the "costs" tab, since that's
+      // populated from /assets/costs, not /assets or /assets/cost-categories.
+      const needsCostExtras = activeTab === "costs";
       const requests: Promise<unknown>[] = [activePortfolioId ? api(withPortfolio("/summary")) : Promise.resolve(null)];
       if (needsRows) requests.push(api(withPortfolio(active.endpoint)));
       if (activeTab === "rates") requests.push(api("/rates/latest"));
       if (needsStockOverview) requests.push(api(withPortfolio("/stocks/overview")));
       if (needsAlerts) requests.push(api(withPortfolio("/stocks/alerts")));
       if (needsPortfolioList) requests.push(api("/portfolios"));
+      if (needsCostExtras) requests.push(api(withPortfolio("/assets")), api(withPortfolio("/assets/cost-categories")));
       const [summaryData, ...rest] = await Promise.all(requests);
       if (latestLoadRequestRef.current !== requestId) return;
       setSummary(summaryData as Summary | null);
@@ -1108,6 +1131,10 @@ export default function Page() {
       if (needsStockOverview) setStockOverview(rest[restIndex++] as StockOverview);
       if (needsAlerts) setAlerts(rest[restIndex++] as Alerts);
       if (needsPortfolioList) setPortfolios(rest[restIndex++] as { id: string; name: string }[]);
+      if (needsCostExtras) {
+        setCostAssetsList(rest[restIndex++] as Row[]);
+        setCostCategoriesList(rest[restIndex++] as Row[]);
+      }
     } catch (err) {
       if (latestLoadRequestRef.current !== requestId) return;
       setError(err instanceof Error ? err.message : "Nepodařilo se načíst data");
@@ -1515,6 +1542,128 @@ export default function Page() {
     }
   }
 
+  function openNewCostForm() {
+    setEditingCostId("__new__");
+    setCostDraft({ asset_id: "", cost_date: "", item: "", category: "", amount: "", supplier: "", payer: "", note: "" });
+    setCostStatus(null);
+  }
+
+  function openCostEditor(row: Row) {
+    setEditingCostId(String(row.id));
+    setCostDraft({
+      asset_id: row.asset_id ? String(row.asset_id) : "",
+      cost_date: row.cost_date ? String(row.cost_date) : "",
+      item: row.item ? String(row.item) : "",
+      category: row.category ? String(row.category) : "",
+      amount: row.amount != null ? String(row.amount) : "",
+      supplier: row.supplier ? String(row.supplier) : "",
+      payer: row.payer ? String(row.payer) : "",
+      note: row.note ? String(row.note) : "",
+    });
+    setCostStatus(null);
+  }
+
+  function closeCostEditor() {
+    setEditingCostId(null);
+  }
+
+  async function saveCostDraft(event: React.FormEvent) {
+    event.preventDefault();
+    if (!costDraft.item.trim() || !editingCostId) return;
+    setCostBusy(true);
+    setCostStatus(null);
+    try {
+      const payload = {
+        asset_id: costDraft.asset_id || null,
+        cost_date: costDraft.cost_date || null,
+        item: costDraft.item.trim(),
+        category: costDraft.category.trim() || null,
+        amount: costDraft.amount.trim() ? Number(costDraft.amount) : null,
+        supplier: costDraft.supplier.trim() || null,
+        payer: costDraft.payer.trim() || null,
+        note: costDraft.note.trim() || null,
+      };
+      if (editingCostId === "__new__") {
+        await api(withPortfolio("/assets/costs"), { method: "POST", body: JSON.stringify(payload) });
+      } else {
+        await api(withPortfolio(`/assets/costs/${editingCostId}`), { method: "PUT", body: JSON.stringify(payload) });
+      }
+      setEditingCostId(null);
+      await loadAll();
+    } catch (err) {
+      setCostStatus(err instanceof Error ? err.message : "Uložení nákladu se nezdařilo");
+    } finally {
+      setCostBusy(false);
+    }
+  }
+
+  async function deleteCost(costId: string) {
+    setCostBusy(true);
+    setError(null);
+    try {
+      await api(withPortfolio(`/assets/costs/${costId}`), { method: "DELETE" });
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Smazání nákladu se nezdařilo");
+    } finally {
+      setCostBusy(false);
+    }
+  }
+
+  // Bypasses the shared api() helper on purpose - it always forces
+  // Content-Type: application/json, which would break multipart form
+  // encoding for the file upload.
+  async function uploadCostAttachment(costId: string, file: File) {
+    setCostAttachmentBusy(costId);
+    setError(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const response = await fetch(`${API_URL}${withPortfolio(`/assets/costs/${costId}/attachment`)}`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: formData,
+      });
+      if (!response.ok) throw new Error(await response.text());
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Nahrání přílohy se nezdařilo");
+    } finally {
+      setCostAttachmentBusy(null);
+    }
+  }
+
+  // Fetches the PDF as an authenticated blob rather than linking directly -
+  // a plain <a href> can't carry the Authorization header the API requires.
+  async function viewCostAttachment(costId: string) {
+    setError(null);
+    try {
+      const response = await fetch(`${API_URL}${withPortfolio(`/assets/costs/${costId}/attachment`)}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      window.open(url, "_blank");
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Načtení přílohy se nezdařilo");
+    }
+  }
+
+  async function deleteCostAttachment(costId: string) {
+    setCostAttachmentBusy(costId);
+    setError(null);
+    try {
+      await api(withPortfolio(`/assets/costs/${costId}/attachment`), { method: "DELETE" });
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Smazání přílohy se nezdařilo");
+    } finally {
+      setCostAttachmentBusy(null);
+    }
+  }
+
   async function cleanupLoanSubtotals() {
     setError(null);
     setLoanCleanupStatus(null);
@@ -1844,9 +1993,14 @@ export default function Page() {
                 <h2>Náklady podle investice</h2>
                 <p>{showCostDetail ? "Zobrazené jsou měsíční mezisoučty i detailní položky." : "Zobrazené jsou pouze měsíční mezisoučty."}</p>
               </div>
-              <button className="action-button" onClick={() => setShowCostDetail((value) => !value)}>
-                <span>{showCostDetail ? "Skrýt detail" : "Zobrazit detail"}</span>
-              </button>
+              <div className="stock-actions">
+                <button className="action-button" onClick={() => setShowCostDetail((value) => !value)}>
+                  <span>{showCostDetail ? "Skrýt detail" : "Zobrazit detail"}</span>
+                </button>
+                <button className="action-button" onClick={openNewCostForm}>
+                  <span>+ Přidat náklad</span>
+                </button>
+              </div>
             </div>
             <div className="filter-row">
               <label>
@@ -1861,6 +2015,97 @@ export default function Page() {
                 </select>
               </label>
             </div>
+            {editingCostId && (
+              <div className="access-editor">
+                <p>{editingCostId === "__new__" ? "Nový náklad:" : "Úprava nákladu:"}</p>
+                <form className="cost-form-grid" onSubmit={saveCostDraft}>
+                  <label>
+                    Majetek
+                    <select
+                      value={costDraft.asset_id}
+                      onChange={(event) => setCostDraft((value) => ({ ...value, asset_id: event.target.value }))}
+                    >
+                      <option value="">Bez majetku</option>
+                      {costAssetsList.map((asset) => (
+                        <option value={String(asset.id)} key={String(asset.id)}>
+                          {String(asset.code)} — {String(asset.name)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Datum
+                    <input
+                      type="date"
+                      value={costDraft.cost_date}
+                      onChange={(event) => setCostDraft((value) => ({ ...value, cost_date: event.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Položka
+                    <input
+                      value={costDraft.item}
+                      onChange={(event) => setCostDraft((value) => ({ ...value, item: event.target.value }))}
+                      required
+                    />
+                  </label>
+                  <label>
+                    Kategorie
+                    <select
+                      value={costDraft.category}
+                      onChange={(event) => setCostDraft((value) => ({ ...value, category: event.target.value }))}
+                    >
+                      <option value="">Bez kategorie</option>
+                      {costCategoriesList.map((cat) => (
+                        <option value={String(cat.name)} key={String(cat.id)}>
+                          {String(cat.name)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Částka
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={costDraft.amount}
+                      onChange={(event) => setCostDraft((value) => ({ ...value, amount: event.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Dodavatel
+                    <input
+                      value={costDraft.supplier}
+                      onChange={(event) => setCostDraft((value) => ({ ...value, supplier: event.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Plátce
+                    <input
+                      value={costDraft.payer}
+                      onChange={(event) => setCostDraft((value) => ({ ...value, payer: event.target.value }))}
+                    />
+                  </label>
+                  <label className="cost-form-note">
+                    Poznámka
+                    <input
+                      value={costDraft.note}
+                      onChange={(event) => setCostDraft((value) => ({ ...value, note: event.target.value }))}
+                    />
+                  </label>
+                  {costStatus && <div className="success-notice cost-form-note">{costStatus}</div>}
+                  <div className="stock-actions cost-form-note">
+                    <button className="action-button" type="submit" disabled={costBusy || !costDraft.item.trim()}>
+                      <Save size={16} />
+                      <span>Uložit náklad</span>
+                    </button>
+                    <button type="button" className="link-button" onClick={closeCostEditor}>
+                      Zrušit
+                    </button>
+                  </div>
+                </form>
+              </div>
+            )}
           </section>
         )}
 
@@ -2740,7 +2985,51 @@ export default function Page() {
                   >
                     {(columns[activeTab] || []).map((col, colIndex) => (
                       <td className={isNumericCell(row[col]) ? "numeric-cell" : ""} key={col}>
-                        {isClickableSummary && colIndex === 0 ? (
+                        {col === "actions" && activeTab === "costs" ? (
+                          row.row_kind === "detail" ? (
+                            <div className="cost-row-actions" onClick={(event) => event.stopPropagation()}>
+                              <button type="button" className="link-button" onClick={() => openCostEditor(row)}>
+                                Upravit
+                              </button>
+                              <button
+                                type="button"
+                                className="link-button"
+                                onClick={() => deleteCost(String(row.id))}
+                                disabled={costBusy}
+                              >
+                                Smazat
+                              </button>
+                              {row.has_attachment ? (
+                                <>
+                                  <button type="button" className="link-button" onClick={() => viewCostAttachment(String(row.id))}>
+                                    Příloha
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="link-button"
+                                    onClick={() => deleteCostAttachment(String(row.id))}
+                                    disabled={costAttachmentBusy === String(row.id)}
+                                  >
+                                    Smazat přílohu
+                                  </button>
+                                </>
+                              ) : (
+                                <label className="link-button cost-attachment-upload">
+                                  {costAttachmentBusy === String(row.id) ? "Nahrávám…" : "Přidat přílohu"}
+                                  <input
+                                    type="file"
+                                    accept="application/pdf"
+                                    onChange={(event) => {
+                                      const file = event.target.files?.[0];
+                                      if (file) uploadCostAttachment(String(row.id), file);
+                                      event.target.value = "";
+                                    }}
+                                  />
+                                </label>
+                              )}
+                            </div>
+                          ) : null
+                        ) : isClickableSummary && colIndex === 0 ? (
                           <span className={`stat-month-toggle${isLoanMonthSummary ? " nested-toggle" : ""}`}>
                             {summaryExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                             {formatValue(col, row[col])}
