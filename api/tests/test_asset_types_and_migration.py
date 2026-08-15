@@ -302,11 +302,11 @@ def test_asset_type_crud_admin_only_write_scoped_read_and_in_use_guard(client, d
 
 
 @requires_db
-def test_owner_crud_any_user_read_admin_write_and_conflicts(client, db_session, portfolio_id):
+def test_payer_crud_any_user_read_admin_write_and_conflicts(client, db_session, portfolio_id):
     from app.auth import hash_password
-    from app.models import Asset, AppUser, Party
+    from app.models import AppUser, AssetCost, Party
 
-    # Granted nothing at all - proves owners is unconditionally readable.
+    # Granted nothing at all - proves payers is unconditionally readable.
     db_session.add(
         AppUser(username="nobody", password_hash=hash_password("s3cret!"), is_active=True, is_admin=False, allowed_agendas=[])
     )
@@ -317,40 +317,40 @@ def test_owner_crud_any_user_read_admin_write_and_conflicts(client, db_session, 
     nobody_login = client.post("/auth/login", json={"username": "nobody", "password": "s3cret!"})
     nobody_headers = {"Authorization": f"Bearer {nobody_login.json()['token']}"}
 
-    created = client.post("/parties/owners", headers=admin_headers, json={"name": "Martin"})
+    created = client.post("/parties/payers", headers=admin_headers, json={"name": "Martin"})
     assert created.status_code == 200
-    owner_id = created.json()["id"]
+    payer_id = created.json()["id"]
 
-    listed = client.get("/parties/owners", headers=nobody_headers)
+    listed = client.get("/parties/payers", headers=nobody_headers)
     assert listed.status_code == 200
     assert [row["name"] for row in listed.json()] == ["Martin"]
 
-    forbidden_create = client.post("/parties/owners", headers=nobody_headers, json={"name": "Jinak"})
+    forbidden_create = client.post("/parties/payers", headers=nobody_headers, json={"name": "Jinak"})
     assert forbidden_create.status_code == 403
 
-    duplicate_owner = client.post("/parties/owners", headers=admin_headers, json={"name": "Martin"})
-    assert duplicate_owner.status_code == 409
+    duplicate_payer = client.post("/parties/payers", headers=admin_headers, json={"name": "Martin"})
+    assert duplicate_payer.status_code == 409
 
     # Reusing an existing "unknown"-kind Party name upgrades it instead of conflicting.
     db_session.add(Party(name="Existing Unknown", kind="unknown"))
     db_session.commit()
-    upgraded = client.post("/parties/owners", headers=admin_headers, json={"name": "Existing Unknown"})
+    upgraded = client.post("/parties/payers", headers=admin_headers, json={"name": "Existing Unknown"})
     assert upgraded.status_code == 200
 
-    # A name already used by a different kind (e.g. payer) genuinely conflicts.
-    db_session.add(Party(name="Existing Payer", kind="payer"))
+    # A name already used by a different kind (e.g. owner) genuinely conflicts.
+    db_session.add(Party(name="Existing Owner", kind="owner"))
     db_session.commit()
-    conflict = client.post("/parties/owners", headers=admin_headers, json={"name": "Existing Payer"})
+    conflict = client.post("/parties/payers", headers=admin_headers, json={"name": "Existing Owner"})
     assert conflict.status_code == 409
 
-    db_session.add(Asset(portfolio_id=portfolio_id, code="X-2", name="X", owner_id=owner_id))
+    db_session.add(AssetCost(portfolio_id=portfolio_id, item="Test", payer_id=payer_id))
     db_session.commit()
-    blocked_delete = client.delete(f"/parties/owners/{owner_id}", headers=admin_headers)
+    blocked_delete = client.delete(f"/parties/payers/{payer_id}", headers=admin_headers)
     assert blocked_delete.status_code == 409
 
-    db_session.execute(Asset.__table__.delete().where(Asset.code == "X-2"))
+    db_session.execute(AssetCost.__table__.delete().where(AssetCost.item == "Test"))
     db_session.commit()
-    deleted = client.delete(f"/parties/owners/{owner_id}", headers=admin_headers)
+    deleted = client.delete(f"/parties/payers/{payer_id}", headers=admin_headers)
     assert deleted.status_code == 200
 
 
@@ -390,13 +390,21 @@ def test_asset_crud_full_lifecycle_and_validation(client, db_session, portfolio_
     )
     assert self_link.status_code == 400
 
-    missing_owner = client.put(
+    # owner is free text (get-or-create against Party, kind="owner") - not a
+    # dictionary FK pick like asset_type_id/linked_asset_id above, since
+    # asset ownership reverted to plain free text (the "Vlastníci" registry
+    # was redirected to manage cost payers instead, see "Plátci").
+    from app.models import Party
+
+    owner_set = client.put(
         f"/assets/{asset_id}",
         headers=headers,
         params=params,
-        json={"code": "T-1", "name": "Testovaci byt", "owner_id": "00000000-0000-0000-0000-000000000000"},
+        json={"code": "T-1", "name": "Testovaci byt", "owner": "Nový vlastník"},
     )
-    assert missing_owner.status_code == 404
+    assert owner_set.status_code == 200
+    assert owner_set.json()["owner"] == "Nový vlastník"
+    assert db_session.query(Party).filter_by(name="Nový vlastník", kind="owner").count() == 1
 
     updated = client.put(f"/assets/{asset_id}", headers=headers, params=params, json={"code": "T-1", "name": "Upraveny nazev", "total_value": "2000000"})
     assert updated.status_code == 200

@@ -165,7 +165,7 @@ class LoanMovementInput(BaseModel):
 # validate AssetTypeInput.required_fields and to drive the create/edit
 # form's field checklist on the frontend.
 ASSET_REQUIRED_FIELD_CHOICES = [
-    "owner_id",
+    "owner",
     "total_value",
     "own_funds",
     "borrowed_amount",
@@ -185,14 +185,18 @@ class AssetTypeInput(BaseModel):
     required_fields: list[str] = []
 
 
-class OwnerInput(BaseModel):
+class PayerInput(BaseModel):
     name: str
 
 
 class AssetInput(BaseModel):
     code: str
     name: str
-    owner_id: uuid.UUID | None = None
+    # Free text, resolved via get_or_create_party - asset ownership isn't a
+    # managed dictionary (that's what "Plátci" manages now, for AssetCost's
+    # payer field), so this works the same way it did before either registry
+    # existed: type a name, reuse the existing Party if it already matches.
+    owner: str | None = None
     asset_type_id: uuid.UUID | None = None
     linked_asset_id: uuid.UUID | None = None
     total_value: Decimal | None = None
@@ -1238,11 +1242,6 @@ def _asset_dict(db: Session, row: Asset) -> dict[str, Any]:
     }
 
 
-def _validate_asset_owner(db: Session, owner_id: uuid.UUID | None) -> None:
-    if owner_id is not None and db.get(Party, owner_id) is None:
-        raise HTTPException(status_code=404, detail="Vlastník nenalezen")
-
-
 def _validate_asset_type_id(db: Session, portfolio_id: uuid.UUID, asset_type_id: uuid.UUID | None) -> AssetType | None:
     if asset_type_id is None:
         return None
@@ -1303,14 +1302,14 @@ def create_asset(
         raise HTTPException(status_code=400, detail="Kód a název jsou povinné")
     if db.scalar(select(Asset).where(Asset.portfolio_id == portfolio_id, Asset.code == code)) is not None:
         raise HTTPException(status_code=409, detail="Majetek s tímto kódem už existuje")
-    _validate_asset_owner(db, payload.owner_id)
+    owner = get_or_create_party(db, (payload.owner or "").strip() or None, "owner")
     _validate_asset_type_id(db, portfolio_id, payload.asset_type_id)
     _validate_linked_asset_id(db, portfolio_id, payload.linked_asset_id, None)
     row = Asset(
         portfolio_id=portfolio_id,
         code=code,
         name=name,
-        owner_id=payload.owner_id,
+        owner_id=owner.id if owner else None,
         asset_type_id=payload.asset_type_id,
         linked_asset_id=payload.linked_asset_id,
         total_value=payload.total_value,
@@ -1347,12 +1346,12 @@ def update_asset(
         select(Asset).where(Asset.portfolio_id == portfolio_id, Asset.code == code, Asset.id != asset_id)
     ) is not None:
         raise HTTPException(status_code=409, detail="Majetek s tímto kódem už existuje")
-    _validate_asset_owner(db, payload.owner_id)
+    owner = get_or_create_party(db, (payload.owner or "").strip() or None, "owner")
     _validate_asset_type_id(db, portfolio_id, payload.asset_type_id)
     _validate_linked_asset_id(db, portfolio_id, payload.linked_asset_id, asset_id)
     row.code = code
     row.name = name
-    row.owner_id = payload.owner_id
+    row.owner_id = owner.id if owner else None
     row.asset_type_id = payload.asset_type_id
     row.linked_asset_id = payload.linked_asset_id
     row.total_value = payload.total_value
@@ -1512,39 +1511,39 @@ def delete_asset_type(type_id: uuid.UUID, _: str = Depends(require_admin), db: S
     return {"status": "deleted"}
 
 
-@app.get("/parties/owners")
-def list_owners(_: str = Depends(require_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    rows = db.scalars(select(Party).where(Party.kind == "owner").order_by(Party.name)).all()
+@app.get("/parties/payers")
+def list_payers(_: str = Depends(require_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    rows = db.scalars(select(Party).where(Party.kind == "payer").order_by(Party.name)).all()
     return [{"id": str(row.id), "name": row.name} for row in rows]
 
 
-@app.post("/parties/owners")
-def create_owner(payload: OwnerInput, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+@app.post("/parties/payers")
+def create_payer(payload: PayerInput, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     name = payload.name.strip()
     if not name:
-        raise HTTPException(status_code=400, detail="Jméno vlastníka je povinné")
+        raise HTTPException(status_code=400, detail="Jméno plátce je povinné")
     existing = db.scalar(select(Party).where(Party.name == name))
     if existing is not None:
-        if existing.kind == "owner":
-            raise HTTPException(status_code=409, detail="Vlastník s tímto jménem už existuje")
+        if existing.kind == "payer":
+            raise HTTPException(status_code=409, detail="Plátce s tímto jménem už existuje")
         if existing.kind != "unknown":
-            raise HTTPException(status_code=409, detail=f"Jméno „{name}“ už existuje jako jiný typ záznamu, nelze jej použít pro vlastníka")
-        existing.kind = "owner"
+            raise HTTPException(status_code=409, detail=f"Jméno „{name}“ už existuje jako jiný typ záznamu, nelze jej použít pro plátce")
+        existing.kind = "payer"
         db.commit()
         return {"id": str(existing.id), "name": existing.name}
-    row = Party(name=name, kind="owner")
+    row = Party(name=name, kind="payer")
     db.add(row)
     db.commit()
     return {"id": str(row.id), "name": row.name}
 
 
-@app.delete("/parties/owners/{owner_id}")
-def delete_owner(owner_id: uuid.UUID, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
-    row = db.get(Party, owner_id)
-    if row is None or row.kind != "owner":
-        raise HTTPException(status_code=404, detail="Vlastník nenalezen")
-    if db.scalar(select(func.count()).select_from(Asset).where(Asset.owner_id == owner_id)) > 0:
-        raise HTTPException(status_code=409, detail="Vlastník je použit u majetku, nelze jej smazat")
+@app.delete("/parties/payers/{payer_id}")
+def delete_payer(payer_id: uuid.UUID, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    row = db.get(Party, payer_id)
+    if row is None or row.kind != "payer":
+        raise HTTPException(status_code=404, detail="Plátce nenalezen")
+    if db.scalar(select(func.count()).select_from(AssetCost).where(AssetCost.payer_id == payer_id)) > 0:
+        raise HTTPException(status_code=409, detail="Plátce je použit u nákladu, nelze jej smazat")
     db.delete(row)
     db.commit()
     return {"status": "deleted"}

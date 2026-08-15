@@ -109,7 +109,7 @@ type TwoFactorSetup = {
 const tabs = [
   { id: "assets", label: "Majetek", icon: Building2, endpoint: "/assets" },
   { id: "asset_types", label: "Typy majetku", icon: Tags, endpoint: "/assets/asset-types" },
-  { id: "owners", label: "Vlastníci", icon: Users, endpoint: "/parties/owners" },
+  { id: "payers", label: "Plátci", icon: Users, endpoint: "/parties/payers" },
   { id: "costs", label: "Náklady", icon: WalletCards, endpoint: "/assets/costs" },
   { id: "categories", label: "Kategorie nákladů", icon: Tag, endpoint: "/assets/cost-categories" },
   { id: "loans", label: "Půjčky", icon: Coins, endpoint: "/loans/movements" },
@@ -130,7 +130,7 @@ const tabs = [
 // here - it's always visible to every logged-in user regardless of agenda
 // permissions, see visibleTabs/visibleNavGroups below.
 const navGroups = [
-  { label: "Majetek", items: ["assets", "asset_types", "owners", "costs", "categories"] },
+  { label: "Majetek", items: ["assets", "asset_types", "payers", "costs", "categories"] },
   { label: "Půjčky", items: ["loans"] },
   { label: "Akcie", items: ["transactions", "watchlist", "stats", "portfolio", "history", "alerts", "charts"] },
   { label: "Nastavení", items: ["rates", "subjects", "users", "settings"] },
@@ -145,16 +145,16 @@ const tabsById = Object.fromEntries(tabs.map((tab) => [tab.id, tab]));
 const STOCK_OVERVIEW_TABS = ["transactions", "watchlist", "portfolio"];
 
 // Tabs that render their own custom panel instead of the generic data table.
-const NON_TABLE_TABS = new Set(["assets", "history", "alerts", "charts", "settings", "subjects", "categories", "asset_types", "owners"]);
+const NON_TABLE_TABS = new Set(["assets", "history", "alerts", "charts", "settings", "subjects", "categories", "asset_types", "payers"]);
 
 // "rates" (shared CNB exchange-rate history), "users" (user management) and
 // "subjects" (Subjekt management) apply app-wide and stay governed by
 // AppUser.allowed_agendas. Every other tab is scoped per-Subjekt instead -
-// see isTabVisible below. "owners" is a third kind of thing entirely - not
+// see isTabVisible below. "payers" is a third kind of thing entirely - not
 // governed by any grant at all, unconditionally visible like "settings" (see
 // isTabVisible's own special-case for it) - so it's excluded from both sets.
 const GLOBAL_AGENDAS = new Set(["rates", "users", "subjects"]);
-const PORTFOLIO_SCOPED_TABS = tabs.filter((tab) => !GLOBAL_AGENDAS.has(tab.id) && tab.id !== "settings" && tab.id !== "owners");
+const PORTFOLIO_SCOPED_TABS = tabs.filter((tab) => !GLOBAL_AGENDAS.has(tab.id) && tab.id !== "settings" && tab.id !== "payers");
 
 const columns: Record<string, string[]> = {
   portfolio: ["ticker", "name", "quantity", "currency", "market_value_czk", "invested_czk", "profit_czk", "profit_pct"],
@@ -373,7 +373,7 @@ const historyColumns = [
 // picklist an admin uses to decide which fields the asset create/edit form
 // shows as required for a given Typ majetku.
 const ASSET_REQUIRED_FIELD_CHOICES: [string, string][] = [
-  ["owner_id", "Vlastník"],
+  ["owner", "Vlastník"],
   ["total_value", "Hodnota"],
   ["own_funds", "Vlastní zdroje"],
   ["borrowed_amount", "Výše úvěru"],
@@ -1044,12 +1044,11 @@ export default function Page() {
   const [costStatus, setCostStatus] = useState<string | null>(null);
   const [costAttachmentBusy, setCostAttachmentBusy] = useState<string | null>(null);
   const [assetTypesList, setAssetTypesList] = useState<Row[]>([]);
-  const [ownersList, setOwnersList] = useState<Row[]>([]);
   const [editingAssetId, setEditingAssetId] = useState<string | null>(null);
   const [assetDraft, setAssetDraft] = useState({
     code: "",
     name: "",
-    owner_id: "",
+    owner: "",
     asset_type_id: "",
     linked_asset_id: "",
     total_value: "",
@@ -1071,9 +1070,9 @@ export default function Page() {
   const [editingAssetTypeId, setEditingAssetTypeId] = useState<string | null>(null);
   const [assetTypeBusy, setAssetTypeBusy] = useState(false);
   const [assetTypeStatus, setAssetTypeStatus] = useState<string | null>(null);
-  const [newOwnerName, setNewOwnerName] = useState("");
-  const [ownerBusy, setOwnerBusy] = useState(false);
-  const [ownerStatus, setOwnerStatus] = useState<string | null>(null);
+  const [newPayerName, setNewPayerName] = useState("");
+  const [payerBusy, setPayerBusy] = useState(false);
+  const [payerStatus, setPayerStatus] = useState<string | null>(null);
   const [loanSchedule, setLoanSchedule] = useState<{ forId: string; rows: Row[] } | null>(null);
   const [loanScheduleBusy, setLoanScheduleBusy] = useState<string | null>(null);
   const allowedAgendaSet = useMemo(
@@ -1101,7 +1100,7 @@ export default function Page() {
   // reconciliation effect below redirects away from the default tab before
   // the real Subjekt grants are even known.
   const isTabVisible = (tabId: string) =>
-    tabId === "settings" || tabId === "owners"
+    tabId === "settings" || tabId === "payers"
       ? true
       : GLOBAL_AGENDAS.has(tabId)
         ? allowedAgendaSet.has(tabId)
@@ -1248,10 +1247,10 @@ export default function Page() {
 
   async function loadAll() {
     if (!token) return;
-    // "rates"/"users"/"settings"/"owners" don't need a Subjekt at all -
+    // "rates"/"users"/"settings"/"payers" don't need a Subjekt at all -
     // every other tab does, and there's nothing to load yet if the user has
-    // none. ("owners" is global Party data, same reasoning as "rates".)
-    const tabNeedsPortfolio = !GLOBAL_AGENDAS.has(activeTab) && activeTab !== "settings" && activeTab !== "owners";
+    // none. ("payers" is global Party data, same reasoning as "rates".)
+    const tabNeedsPortfolio = !GLOBAL_AGENDAS.has(activeTab) && activeTab !== "settings" && activeTab !== "payers";
     if (tabNeedsPortfolio && !activePortfolioId) return;
     // Guards against an older, slower-to-resolve loadAll() (e.g. from the
     // previously active tab) overwriting rows/summary/etc. with stale data
@@ -1279,8 +1278,9 @@ export default function Page() {
       // populated from /assets/costs, not /assets or /assets/cost-categories.
       const needsCostExtras = activeTab === "costs";
       // The asset create/edit form needs the type dictionary (for the type
-      // picker) and the owner registry (for the owner picker) - neither is
-      // present in `rows` while on the "assets" tab.
+      // picker) - not present in `rows` while on the "assets" tab. Owner is
+      // free text (get-or-create), not a dictionary pick, so no extra fetch
+      // is needed for it - see "Plátci", which manages cost payers instead.
       const needsAssetExtras = activeTab === "assets";
       const needsLoanBalances = activeTab === "loans";
       const requests: Promise<unknown>[] = [activePortfolioId ? api(withPortfolio("/summary")) : Promise.resolve(null)];
@@ -1290,7 +1290,7 @@ export default function Page() {
       if (needsAlerts) requests.push(api(withPortfolio("/stocks/alerts")));
       if (needsPortfolioList) requests.push(api("/portfolios"));
       if (needsCostExtras) requests.push(api(withPortfolio("/assets")), api(withPortfolio("/assets/cost-categories")));
-      if (needsAssetExtras) requests.push(api(withPortfolio("/assets/asset-types")), api("/parties/owners"));
+      if (needsAssetExtras) requests.push(api(withPortfolio("/assets/asset-types")));
       if (needsLoanBalances) requests.push(api(withPortfolio("/loans/balances")));
       const [summaryData, ...rest] = await Promise.all(requests);
       if (latestLoadRequestRef.current !== requestId) return;
@@ -1307,7 +1307,6 @@ export default function Page() {
       }
       if (needsAssetExtras) {
         setAssetTypesList(rest[restIndex++] as Row[]);
-        setOwnersList(rest[restIndex++] as Row[]);
       }
       if (needsLoanBalances) setLoanBalances(rest[restIndex++] as LoanBalances);
     } catch (err) {
@@ -1927,7 +1926,7 @@ export default function Page() {
     setAssetDraft({
       code: "",
       name: "",
-      owner_id: "",
+      owner: "",
       asset_type_id: "",
       linked_asset_id: "",
       total_value: "",
@@ -1949,7 +1948,7 @@ export default function Page() {
     setAssetDraft({
       code: row.code ? String(row.code) : "",
       name: row.name ? String(row.name) : "",
-      owner_id: row.owner_id ? String(row.owner_id) : "",
+      owner: row.owner ? String(row.owner) : "",
       asset_type_id: row.asset_type_id ? String(row.asset_type_id) : "",
       linked_asset_id: row.linked_asset_id ? String(row.linked_asset_id) : "",
       total_value: row.total_value != null ? String(row.total_value) : "",
@@ -1979,7 +1978,7 @@ export default function Page() {
       const payload = {
         code: assetDraft.code.trim(),
         name: assetDraft.name.trim(),
-        owner_id: assetDraft.owner_id || null,
+        owner: assetDraft.owner.trim() || null,
         asset_type_id: assetDraft.asset_type_id || null,
         linked_asset_id: assetDraft.linked_asset_id || null,
         total_value: assetDraft.total_value.trim() ? Number(assetDraft.total_value) : null,
@@ -2104,31 +2103,31 @@ export default function Page() {
     }
   }
 
-  async function createOwner(event: React.FormEvent) {
+  async function createPayer(event: React.FormEvent) {
     event.preventDefault();
-    setOwnerStatus(null);
-    setOwnerBusy(true);
+    setPayerStatus(null);
+    setPayerBusy(true);
     try {
-      await api("/parties/owners", { method: "POST", body: JSON.stringify({ name: newOwnerName.trim() }) });
-      setNewOwnerName("");
+      await api("/parties/payers", { method: "POST", body: JSON.stringify({ name: newPayerName.trim() }) });
+      setNewPayerName("");
       await loadAll();
     } catch (err) {
-      setOwnerStatus(err instanceof Error ? err.message : "Vlastníka se nepodařilo vytvořit");
+      setPayerStatus(err instanceof Error ? err.message : "Plátce se nepodařilo vytvořit");
     } finally {
-      setOwnerBusy(false);
+      setPayerBusy(false);
     }
   }
 
-  async function deleteOwner(ownerId: string) {
-    setOwnerStatus(null);
-    setOwnerBusy(true);
+  async function deletePayer(payerId: string) {
+    setPayerStatus(null);
+    setPayerBusy(true);
     try {
-      await api(`/parties/owners/${ownerId}`, { method: "DELETE" });
+      await api(`/parties/payers/${payerId}`, { method: "DELETE" });
       await loadAll();
     } catch (err) {
-      setOwnerStatus(err instanceof Error ? err.message : "Vlastníka se nepodařilo smazat");
+      setPayerStatus(err instanceof Error ? err.message : "Plátce se nepodařilo smazat");
     } finally {
-      setOwnerBusy(false);
+      setPayerBusy(false);
     }
   }
 
@@ -2839,15 +2838,15 @@ export default function Page() {
           </section>
         )}
 
-        {activeTab === "owners" && (
+        {activeTab === "payers" && (
           <section className="work-panel">
             <div className="panel-header">
               <div>
-                <h2>Vlastníci</h2>
-                <p>Evidence vlastníků majetku, sdílená napříč všemi Subjekty. Přidávat a mazat může jen administrátor.</p>
+                <h2>Plátci</h2>
+                <p>Evidence plátců nákladů, sdílená napříč všemi Subjekty. Přidávat a mazat může jen administrátor.</p>
               </div>
             </div>
-            {ownerStatus && <div className="success-notice">{ownerStatus}</div>}
+            {payerStatus && <div className="success-notice">{payerStatus}</div>}
             <div className="portfolio-list">
               {rows
                 .filter((row) => typeof row.name === "string")
@@ -2855,23 +2854,23 @@ export default function Page() {
                   <div className="portfolio-row" key={String(row.id)}>
                     <span>{String(row.name)}</span>
                     {currentUser?.is_admin && (
-                      <button type="button" className="link-button" onClick={() => deleteOwner(String(row.id))} disabled={ownerBusy}>
+                      <button type="button" className="link-button" onClick={() => deletePayer(String(row.id))} disabled={payerBusy}>
                         Smazat
                       </button>
                     )}
                   </div>
                 ))}
-              {rows.length === 0 && <p className="alert-empty">Zatím žádní vlastníci.</p>}
+              {rows.length === 0 && <p className="alert-empty">Zatím žádní plátci.</p>}
             </div>
             {currentUser?.is_admin && (
-              <form className="rate-form" onSubmit={createOwner}>
+              <form className="rate-form" onSubmit={createPayer}>
                 <label>
-                  Nový vlastník
-                  <input value={newOwnerName} onChange={(event) => setNewOwnerName(event.target.value)} placeholder="Např. Martin" />
+                  Nový plátce
+                  <input value={newPayerName} onChange={(event) => setNewPayerName(event.target.value)} placeholder="Např. Martin" />
                 </label>
-                <button className="action-button" type="submit" disabled={ownerBusy || !newOwnerName.trim()}>
+                <button className="action-button" type="submit" disabled={payerBusy || !newPayerName.trim()}>
                   <Save size={16} />
-                  <span>Vytvořit vlastníka</span>
+                  <span>Vytvořit plátce</span>
                 </button>
               </form>
             )}
@@ -3691,14 +3690,7 @@ export default function Page() {
                   </label>
                   <label>
                     Vlastník
-                    <select value={assetDraft.owner_id} onChange={(event) => setAssetDraft((value) => ({ ...value, owner_id: event.target.value }))}>
-                      <option value="">Bez vlastníka</option>
-                      {ownersList.map((owner) => (
-                        <option value={String(owner.id)} key={String(owner.id)}>
-                          {String(owner.name)}
-                        </option>
-                      ))}
-                    </select>
+                    <input value={assetDraft.owner} onChange={(event) => setAssetDraft((value) => ({ ...value, owner: event.target.value }))} />
                   </label>
                   <label>
                     Typ majetku
