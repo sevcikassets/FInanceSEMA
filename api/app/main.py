@@ -148,6 +148,19 @@ class AssetCostInput(BaseModel):
     note: str | None = None
 
 
+class LoanMovementInput(BaseModel):
+    movement_date: date
+    lender: str
+    borrower: str
+    amount: Decimal
+    period_label: str | None = None
+    interest_rate: Decimal | None = None
+    interest_period: str | None = None
+    planned_end_date: date | None = None
+    completed_at: date | None = None
+    description: str | None = None
+
+
 # Kept in sync with the loan-related columns on Asset - used both to
 # validate AssetTypeInput.required_fields and to drive the create/edit
 # form's field checklist on the frontend.
@@ -1016,6 +1029,132 @@ def loan_movements(
         data["computed_interest_plan"] = loan_movement_interest_plan(row)
         result.append(data)
     return result
+
+
+def _loan_movement_dict(db: Session, row: LoanMovement) -> dict[str, Any]:
+    lender = db.get(Party, row.lender_id) if row.lender_id else None
+    borrower = db.get(Party, row.borrower_id) if row.borrower_id else None
+    return model_dict(row) | {
+        "lender": lender.name if lender else None,
+        "borrower": borrower.name if borrower else None,
+        "computed_interest_plan": loan_movement_interest_plan(row),
+    }
+
+
+@app.post("/loans/movements")
+def create_loan_movement(
+    payload: LoanMovementInput,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("loans")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    lender_name = payload.lender.strip()
+    borrower_name = payload.borrower.strip()
+    if not lender_name or not borrower_name:
+        raise HTTPException(status_code=400, detail="Věřitel a dlužník jsou povinní")
+    lender = get_or_create_party(db, lender_name, "lender")
+    borrower = get_or_create_party(db, borrower_name, "borrower")
+    row = LoanMovement(
+        portfolio_id=portfolio_id,
+        movement_date=payload.movement_date,
+        period_label=(payload.period_label or "").strip() or None,
+        lender_id=lender.id,
+        borrower_id=borrower.id,
+        amount=payload.amount,
+        interest_rate=payload.interest_rate,
+        interest_period=(payload.interest_period or "").strip() or None,
+        planned_end_date=payload.planned_end_date,
+        completed_at=payload.completed_at,
+        description=(payload.description or "").strip() or None,
+    )
+    db.add(row)
+    db.commit()
+    return _loan_movement_dict(db, row)
+
+
+@app.put("/loans/movements/{movement_id}")
+def update_loan_movement(
+    movement_id: uuid.UUID,
+    payload: LoanMovementInput,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("loans")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    row = db.scalar(select(LoanMovement).where(LoanMovement.id == movement_id, LoanMovement.portfolio_id == portfolio_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Pohyb nenalezen")
+    lender_name = payload.lender.strip()
+    borrower_name = payload.borrower.strip()
+    if not lender_name or not borrower_name:
+        raise HTTPException(status_code=400, detail="Věřitel a dlužník jsou povinní")
+    lender = get_or_create_party(db, lender_name, "lender")
+    borrower = get_or_create_party(db, borrower_name, "borrower")
+    row.movement_date = payload.movement_date
+    row.period_label = (payload.period_label or "").strip() or None
+    row.lender_id = lender.id
+    row.borrower_id = borrower.id
+    row.amount = payload.amount
+    row.interest_rate = payload.interest_rate
+    row.interest_period = (payload.interest_period or "").strip() or None
+    row.planned_end_date = payload.planned_end_date
+    row.completed_at = payload.completed_at
+    row.description = (payload.description or "").strip() or None
+    db.commit()
+    return _loan_movement_dict(db, row)
+
+
+@app.delete("/loans/movements/{movement_id}")
+def delete_loan_movement(
+    movement_id: uuid.UUID,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("loans")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    row = db.scalar(select(LoanMovement).where(LoanMovement.id == movement_id, LoanMovement.portfolio_id == portfolio_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Pohyb nenalezen")
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted"}
+
+
+@app.get("/loans/balances")
+def loan_balances(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("loans")), db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    """Current state of who owes whom: real data confirms a movement's
+    signed amount is positive when the lender gives the borrower money and
+    negative for a repayment/return (e.g. "Vrácení příplatku k vlastnímu
+    kapitálu") - so summing amount within a (lender, borrower) pair yields
+    the net principal still outstanding on that specific relationship.
+    Pairs with both directions between the same two parties (A lent to B
+    AND B separately lent to A) are kept as two separate rows rather than
+    netted together, since they represent separate movements/agreements.
+    """
+    rows = db.execute(
+        select(
+            LoanMovement.lender_id,
+            LoanMovement.borrower_id,
+            func.sum(LoanMovement.amount).label("net_amount"),
+            func.count().label("movement_count"),
+            func.max(LoanMovement.movement_date).label("latest_movement_date"),
+        )
+        .where(LoanMovement.portfolio_id == portfolio_id)
+        .group_by(LoanMovement.lender_id, LoanMovement.borrower_id)
+    ).all()
+    party_names = {p.id: p.name for p in db.scalars(select(Party)).all()}
+    balances = [
+        {
+            "lender_id": str(row.lender_id) if row.lender_id else None,
+            "lender": party_names.get(row.lender_id),
+            "borrower_id": str(row.borrower_id) if row.borrower_id else None,
+            "borrower": party_names.get(row.borrower_id),
+            "net_amount": json_value(row.net_amount),
+            "movement_count": row.movement_count,
+            "latest_movement_date": row.latest_movement_date.isoformat() if row.latest_movement_date else None,
+        }
+        for row in rows
+    ]
+    balances.sort(key=lambda b: abs(b["net_amount"] or 0), reverse=True)
+    total_outstanding = round(sum(b["net_amount"] for b in balances if b["net_amount"] and b["net_amount"] > 0), 2)
+    return {"balances": balances, "total_outstanding": total_outstanding}
 
 
 @app.get("/loans/movements/{movement_id}/interest-projection")

@@ -1036,6 +1036,26 @@ nav button:hover {
   margin: 0;
 }
 
+.loan-balances {
+  margin-top: 18px;
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+
+.loan-balances-total {
+  font-size: 13px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.loan-balances-total strong {
+  color: var(--ink);
+}
+
+.loan-balance-row span:first-child {
+  flex: 1;
+}
+
 .history-form {
   display: grid;
   grid-template-columns: minmax(120px, 160px) minmax(140px, 180px) minmax(140px, 180px) auto;

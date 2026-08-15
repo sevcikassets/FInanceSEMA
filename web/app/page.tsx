@@ -66,6 +66,11 @@ type Alerts = {
   daily_movers_as_of: string | null;
 };
 
+type LoanBalances = {
+  balances: Row[];
+  total_outstanding: number;
+};
+
 type TickerHistoryResult = {
   ticker: string;
   currency: string | null;
@@ -909,6 +914,23 @@ export default function Page() {
   const [expandedLoanMonths, setExpandedLoanMonths] = useState<Set<string>>(() => new Set());
   const [loanCleanupStatus, setLoanCleanupStatus] = useState<string | null>(null);
   const [loanCleanupBusy, setLoanCleanupBusy] = useState(false);
+  const [editingLoanId, setEditingLoanId] = useState<string | null>(null);
+  const [loanDraft, setLoanDraft] = useState({
+    movement_date: "",
+    lender: "",
+    borrower: "",
+    amount: "",
+    period_label: "",
+    interest_rate: "",
+    interest_period: "",
+    planned_end_date: "",
+    completed_at: "",
+    description: "",
+  });
+  const [loanBusy, setLoanBusy] = useState(false);
+  const [loanStatus, setLoanStatus] = useState<string | null>(null);
+  const [loanBalances, setLoanBalances] = useState<LoanBalances | null>(null);
+  const [showSettledLoans, setShowSettledLoans] = useState(false);
   const [showCostDetail, setShowCostDetail] = useState(true);
   const [costAssetFilter, setCostAssetFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -1218,6 +1240,7 @@ export default function Page() {
       // picker) and the owner registry (for the owner picker) - neither is
       // present in `rows` while on the "assets" tab.
       const needsAssetExtras = activeTab === "assets";
+      const needsLoanBalances = activeTab === "loans";
       const requests: Promise<unknown>[] = [activePortfolioId ? api(withPortfolio("/summary")) : Promise.resolve(null)];
       if (needsRows) requests.push(api(withPortfolio(active.endpoint)));
       if (activeTab === "rates") requests.push(api("/rates/latest"));
@@ -1226,6 +1249,7 @@ export default function Page() {
       if (needsPortfolioList) requests.push(api("/portfolios"));
       if (needsCostExtras) requests.push(api(withPortfolio("/assets")), api(withPortfolio("/assets/cost-categories")));
       if (needsAssetExtras) requests.push(api(withPortfolio("/assets/asset-types")), api("/parties/owners"));
+      if (needsLoanBalances) requests.push(api(withPortfolio("/loans/balances")));
       const [summaryData, ...rest] = await Promise.all(requests);
       if (latestLoadRequestRef.current !== requestId) return;
       setSummary(summaryData as Summary | null);
@@ -1243,6 +1267,7 @@ export default function Page() {
         setAssetTypesList(rest[restIndex++] as Row[]);
         setOwnersList(rest[restIndex++] as Row[]);
       }
+      if (needsLoanBalances) setLoanBalances(rest[restIndex++] as LoanBalances);
     } catch (err) {
       if (latestLoadRequestRef.current !== requestId) return;
       setError(err instanceof Error ? err.message : "Nepodařilo se načíst data");
@@ -1715,6 +1740,89 @@ export default function Page() {
       setError(err instanceof Error ? err.message : "Smazání nákladu se nezdařilo");
     } finally {
       setCostBusy(false);
+    }
+  }
+
+  function openNewLoanForm() {
+    setEditingLoanId("__new__");
+    setLoanDraft({
+      movement_date: "",
+      lender: "",
+      borrower: "",
+      amount: "",
+      period_label: "",
+      interest_rate: "",
+      interest_period: "",
+      planned_end_date: "",
+      completed_at: "",
+      description: "",
+    });
+    setLoanStatus(null);
+  }
+
+  function openLoanEditor(row: Row) {
+    setEditingLoanId(String(row.id));
+    setLoanDraft({
+      movement_date: row.movement_date ? String(row.movement_date) : "",
+      lender: row.lender ? String(row.lender) : "",
+      borrower: row.borrower ? String(row.borrower) : "",
+      amount: row.amount != null ? String(row.amount) : "",
+      period_label: row.period_label ? String(row.period_label) : "",
+      interest_rate: row.interest_rate != null ? String(row.interest_rate) : "",
+      interest_period: row.interest_period ? String(row.interest_period) : "",
+      planned_end_date: row.planned_end_date ? String(row.planned_end_date) : "",
+      completed_at: row.completed_at ? String(row.completed_at) : "",
+      description: row.description ? String(row.description) : "",
+    });
+    setLoanStatus(null);
+  }
+
+  function closeLoanEditor() {
+    setEditingLoanId(null);
+  }
+
+  async function saveLoanDraft(event: React.FormEvent) {
+    event.preventDefault();
+    if (!loanDraft.movement_date || !loanDraft.lender.trim() || !loanDraft.borrower.trim() || !loanDraft.amount.trim() || !editingLoanId) return;
+    setLoanBusy(true);
+    setLoanStatus(null);
+    try {
+      const payload = {
+        movement_date: loanDraft.movement_date,
+        lender: loanDraft.lender.trim(),
+        borrower: loanDraft.borrower.trim(),
+        amount: Number(loanDraft.amount),
+        period_label: loanDraft.period_label.trim() || null,
+        interest_rate: loanDraft.interest_rate.trim() ? Number(loanDraft.interest_rate) : null,
+        interest_period: loanDraft.interest_period.trim() || null,
+        planned_end_date: loanDraft.planned_end_date || null,
+        completed_at: loanDraft.completed_at || null,
+        description: loanDraft.description.trim() || null,
+      };
+      if (editingLoanId === "__new__") {
+        await api(withPortfolio("/loans/movements"), { method: "POST", body: JSON.stringify(payload) });
+      } else {
+        await api(withPortfolio(`/loans/movements/${editingLoanId}`), { method: "PUT", body: JSON.stringify(payload) });
+      }
+      setEditingLoanId(null);
+      await loadAll();
+    } catch (err) {
+      setLoanStatus(err instanceof Error ? err.message : "Uložení pohybu se nezdařilo");
+    } finally {
+      setLoanBusy(false);
+    }
+  }
+
+  async function deleteLoan(movementId: string) {
+    setLoanBusy(true);
+    setError(null);
+    try {
+      await api(withPortfolio(`/loans/movements/${movementId}`), { method: "DELETE" });
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Smazání pohybu se nezdařilo");
+    } finally {
+      setLoanBusy(false);
     }
   }
 
@@ -2318,10 +2426,153 @@ export default function Page() {
                   {loanCleanupStatus ? ` ${loanCleanupStatus}` : ""}
                 </p>
               </div>
-              <button className="action-button" onClick={cleanupLoanSubtotals} disabled={loanCleanupBusy}>
-                <span>{loanCleanupBusy ? "Čistím…" : "Vyčistit staré importované mezisoučty"}</span>
-              </button>
+              <div className="stock-actions">
+                <button className="action-button" onClick={cleanupLoanSubtotals} disabled={loanCleanupBusy}>
+                  <span>{loanCleanupBusy ? "Čistím…" : "Vyčistit staré importované mezisoučty"}</span>
+                </button>
+                <button className="action-button" onClick={openNewLoanForm}>
+                  <span>+ Přidat pohyb</span>
+                </button>
+              </div>
             </div>
+            {editingLoanId && (
+              <div className="access-editor">
+                <p>{editingLoanId === "__new__" ? "Nový pohyb:" : "Úprava pohybu:"}</p>
+                <form className="cost-form-grid" onSubmit={saveLoanDraft}>
+                  <label>
+                    Datum
+                    <input
+                      type="date"
+                      value={loanDraft.movement_date}
+                      onChange={(event) => setLoanDraft((value) => ({ ...value, movement_date: event.target.value }))}
+                      required
+                    />
+                  </label>
+                  <label>
+                    Věřitel
+                    <input
+                      value={loanDraft.lender}
+                      onChange={(event) => setLoanDraft((value) => ({ ...value, lender: event.target.value }))}
+                      required
+                    />
+                  </label>
+                  <label>
+                    Dlužník
+                    <input
+                      value={loanDraft.borrower}
+                      onChange={(event) => setLoanDraft((value) => ({ ...value, borrower: event.target.value }))}
+                      required
+                    />
+                  </label>
+                  <label>
+                    Částka
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={loanDraft.amount}
+                      onChange={(event) => setLoanDraft((value) => ({ ...value, amount: event.target.value }))}
+                      required
+                    />
+                  </label>
+                  <label>
+                    Úroková sazba
+                    <input
+                      type="number"
+                      step="0.0001"
+                      value={loanDraft.interest_rate}
+                      onChange={(event) => setLoanDraft((value) => ({ ...value, interest_rate: event.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Perioda úroku
+                    <input
+                      value={loanDraft.interest_period}
+                      onChange={(event) => setLoanDraft((value) => ({ ...value, interest_period: event.target.value }))}
+                      placeholder="Např. měsíčně"
+                    />
+                  </label>
+                  <label>
+                    Plánovaný konec
+                    <input
+                      type="date"
+                      value={loanDraft.planned_end_date}
+                      onChange={(event) => setLoanDraft((value) => ({ ...value, planned_end_date: event.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Splaceno k datu
+                    <input
+                      type="date"
+                      value={loanDraft.completed_at}
+                      onChange={(event) => setLoanDraft((value) => ({ ...value, completed_at: event.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Označení období
+                    <input
+                      value={loanDraft.period_label}
+                      onChange={(event) => setLoanDraft((value) => ({ ...value, period_label: event.target.value }))}
+                    />
+                  </label>
+                  <label className="cost-form-note">
+                    Poznámka
+                    <input
+                      value={loanDraft.description}
+                      onChange={(event) => setLoanDraft((value) => ({ ...value, description: event.target.value }))}
+                    />
+                  </label>
+                  {loanStatus && <div className="success-notice cost-form-note">{loanStatus}</div>}
+                  <div className="stock-actions cost-form-note">
+                    <button
+                      className="action-button"
+                      type="submit"
+                      disabled={loanBusy || !loanDraft.movement_date || !loanDraft.lender.trim() || !loanDraft.borrower.trim() || !loanDraft.amount.trim()}
+                    >
+                      <Save size={16} />
+                      <span>Uložit pohyb</span>
+                    </button>
+                    <button type="button" className="link-button" onClick={closeLoanEditor}>
+                      Zrušit
+                    </button>
+                  </div>
+                </form>
+              </div>
+            )}
+            {loanBalances && (
+              <div className="loan-balances">
+                <div className="panel-header">
+                  <div>
+                    <h3>Přehled dluhů</h3>
+                    <p>Aktuální stav podle součtu všech pohybů mezi věřitelem a dlužníkem - kdo komu kolik aktuálně dluží.</p>
+                  </div>
+                  <div className="stock-actions">
+                    <span className="loan-balances-total">
+                      Celkem dluženo: <strong>{money(loanBalances.total_outstanding)}</strong>
+                    </span>
+                    <button type="button" className="link-button" onClick={() => setShowSettledLoans((value) => !value)}>
+                      {showSettledLoans ? "Skrýt splacené" : "Zobrazit i splacené"}
+                    </button>
+                  </div>
+                </div>
+                <div className="portfolio-list">
+                  {loanBalances.balances
+                    .filter((balance) => showSettledLoans || numberValue(balance.net_amount) !== 0)
+                    .map((balance, index) => (
+                      <div className="portfolio-row loan-balance-row" key={`${String(balance.lender_id)}-${String(balance.borrower_id)}-${index}`}>
+                        <span>
+                          <strong>{String(balance.borrower || "?")}</strong> dluží <strong>{String(balance.lender || "?")}</strong>
+                        </span>
+                        <span className={numberValue(balance.net_amount) >= 0 ? "positive" : "negative"}>
+                          {money(numberValue(balance.net_amount))}
+                        </span>
+                      </div>
+                    ))}
+                  {loanBalances.balances.filter((balance) => showSettledLoans || numberValue(balance.net_amount) !== 0).length === 0 && (
+                    <p className="alert-empty">Žádné dluhy k zobrazení.</p>
+                  )}
+                </div>
+              </div>
+            )}
           </section>
         )}
 
@@ -3697,20 +3948,26 @@ export default function Page() {
                           ) : null
                         ) : col === "actions" && activeTab === "loans" ? (
                           row.row_kind === "detail" ? (
-                            <button
-                              type="button"
-                              className="link-button"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                viewLoanSchedule(String(row.id));
-                              }}
-                            >
-                              {loanScheduleBusy === String(row.id)
-                                ? "Načítám…"
-                                : loanSchedule?.forId === String(row.id)
-                                  ? "Skrýt splátkový kalendář"
-                                  : "Splátkový kalendář"}
-                            </button>
+                            <div className="cost-row-actions" onClick={(event) => event.stopPropagation()}>
+                              <button type="button" className="link-button" onClick={() => openLoanEditor(row)}>
+                                Upravit
+                              </button>
+                              <button
+                                type="button"
+                                className="link-button"
+                                onClick={() => deleteLoan(String(row.id))}
+                                disabled={loanBusy}
+                              >
+                                Smazat
+                              </button>
+                              <button type="button" className="link-button" onClick={() => viewLoanSchedule(String(row.id))}>
+                                {loanScheduleBusy === String(row.id)
+                                  ? "Načítám…"
+                                  : loanSchedule?.forId === String(row.id)
+                                    ? "Skrýt splátkový kalendář"
+                                    : "Splátkový kalendář"}
+                              </button>
+                            </div>
                           ) : null
                         ) : isClickableSummary && colIndex === 0 ? (
                           <span className={`stat-month-toggle${isLoanMonthSummary ? " nested-toggle" : ""}`}>

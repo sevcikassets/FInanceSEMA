@@ -1402,3 +1402,162 @@ def test_asset_cost_write_requires_costs_agenda_grant(client, db_session, portfo
 
     response = client.post("/assets/costs", headers=headers, params=params, json={"item": "Test"})
     assert response.status_code == 403
+
+
+@requires_db
+def test_loan_movement_crud_resolves_lender_and_borrower_and_is_portfolio_scoped(client, db_session, portfolio_id):
+    """POST/PUT resolve free-text lender/borrower via get-or-create (same
+    pattern as AssetCost's category/payer), and every read/write is 404'd
+    once scoped to a portfolio_id the movement doesn't belong to."""
+    from app.models import Party, Portfolio
+
+    other_portfolio = Portfolio(name="Jiny Subjekt")
+    db_session.add(other_portfolio)
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    created = client.post(
+        "/loans/movements",
+        headers=headers,
+        params=params,
+        json={"movement_date": "2025-01-15", "lender": "Martin", "borrower": "Delpsys, s.r.o.", "amount": "50000"},
+    )
+    assert created.status_code == 200
+    body = created.json()
+    movement_id = body["id"]
+    assert body["lender"] == "Martin"
+    assert body["borrower"] == "Delpsys, s.r.o."
+
+    # A second movement reusing the same lender/borrower text must resolve
+    # to the same Party rows, not create duplicates.
+    assert db_session.query(Party).filter_by(name="Martin").count() == 1
+    assert db_session.query(Party).filter_by(name="Delpsys, s.r.o.").count() == 1
+
+    listed = client.get("/loans/movements", headers=headers, params=params)
+    assert listed.status_code == 200
+    assert [row["lender"] for row in listed.json()] == ["Martin"]
+
+    updated = client.put(
+        f"/loans/movements/{movement_id}",
+        headers=headers,
+        params=params,
+        json={"movement_date": "2025-02-01", "lender": "Martin", "borrower": "Delpsys, s.r.o.", "amount": "-20000", "description": "Splátka"},
+    )
+    assert updated.status_code == 200
+    assert float(updated.json()["amount"]) == -20000
+    assert updated.json()["description"] == "Splátka"
+
+    # Scoped to the wrong Subjekt, the same movement is invisible.
+    other_params = {"portfolio_id": str(other_portfolio.id)}
+    wrong_scope_list = client.get("/loans/movements", headers=headers, params=other_params)
+    assert wrong_scope_list.json() == []
+    wrong_scope_update = client.put(
+        f"/loans/movements/{movement_id}",
+        headers=headers,
+        params=other_params,
+        json={"movement_date": "2025-01-01", "lender": "x", "borrower": "y", "amount": "1"},
+    )
+    assert wrong_scope_update.status_code == 404
+    wrong_scope_delete = client.delete(f"/loans/movements/{movement_id}", headers=headers, params=other_params)
+    assert wrong_scope_delete.status_code == 404
+
+    deleted = client.delete(f"/loans/movements/{movement_id}", headers=headers, params=params)
+    assert deleted.status_code == 200
+    listed_after = client.get("/loans/movements", headers=headers, params=params)
+    assert listed_after.json() == []
+
+
+@requires_db
+def test_loan_movement_create_rejects_missing_or_blank_required_fields(client, db_session, portfolio_id):
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    # Pydantic rejects a missing required field outright.
+    missing_field = client.post(
+        "/loans/movements", headers=headers, params=params, json={"lender": "A", "borrower": "B", "amount": "1"}
+    )
+    assert missing_field.status_code == 422
+
+    # A blank (whitespace-only) lender/borrower passes Pydantic's str type
+    # check but is meaningless - rejected explicitly by the endpoint.
+    blank_lender = client.post(
+        "/loans/movements",
+        headers=headers,
+        params=params,
+        json={"movement_date": "2025-01-01", "lender": "   ", "borrower": "B", "amount": "1"},
+    )
+    assert blank_lender.status_code == 400
+
+
+@requires_db
+def test_loan_balances_nets_signed_amounts_per_lender_borrower_pair(client, db_session, portfolio_id):
+    """Real data confirms a movement's signed amount is positive when money
+    flows lender->borrower and negative for a repayment - so summing amount
+    within a (lender, borrower) pair is the net principal still owed. Two
+    pairs going in opposite directions between the same two parties must
+    stay separate, not netted against each other."""
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    # Martin -> Delpsys: lent 100k, partially repaid 30k -> still owed 70k.
+    client.post(
+        "/loans/movements", headers=headers, params=params,
+        json={"movement_date": "2025-01-01", "lender": "Martin", "borrower": "Delpsys", "amount": "100000"},
+    )
+    client.post(
+        "/loans/movements", headers=headers, params=params,
+        json={"movement_date": "2025-02-01", "lender": "Martin", "borrower": "Delpsys", "amount": "-30000"},
+    )
+    # TANAKA -> ACE-TECH: lent 7M, fully repaid -> net 0 (settled).
+    client.post(
+        "/loans/movements", headers=headers, params=params,
+        json={"movement_date": "2025-01-01", "lender": "TANAKA", "borrower": "ACE-TECH", "amount": "7000000"},
+    )
+    client.post(
+        "/loans/movements", headers=headers, params=params,
+        json={"movement_date": "2025-03-01", "lender": "TANAKA", "borrower": "ACE-TECH", "amount": "-7000000"},
+    )
+    # Delpsys -> Martin: a separate, opposite-direction loan of 5k - must
+    # NOT be netted against the Martin->Delpsys pair above.
+    client.post(
+        "/loans/movements", headers=headers, params=params,
+        json={"movement_date": "2025-01-15", "lender": "Delpsys", "borrower": "Martin", "amount": "5000"},
+    )
+
+    response = client.get("/loans/balances", headers=headers, params=params)
+    assert response.status_code == 200
+    body = response.json()
+    balances = {(b["lender"], b["borrower"]): b["net_amount"] for b in body["balances"]}
+    assert balances[("Martin", "Delpsys")] == 70000
+    assert balances[("TANAKA", "ACE-TECH")] == 0
+    assert balances[("Delpsys", "Martin")] == 5000
+    # total_outstanding sums only positive balances - the settled TANAKA/
+    # ACE-TECH pair (net 0) contributes nothing.
+    assert body["total_outstanding"] == 75000
+
+
+@requires_db
+def test_loan_movement_write_requires_loans_agenda_grant(client, db_session, portfolio_id):
+    from app.auth import hash_password
+    from app.models import AppUser, PortfolioAccess
+
+    db_session.add(
+        AppUser(username="viewer2", password_hash=hash_password("s3cret!"), is_active=True, is_admin=False, allowed_agendas=[])
+    )
+    db_session.add(PortfolioAccess(username="viewer2", portfolio_id=portfolio_id, allowed_agendas=["assets"]))
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "viewer2", "password": "s3cret!"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    response = client.post(
+        "/loans/movements", headers=headers, params=params,
+        json={"movement_date": "2025-01-01", "lender": "A", "borrower": "B", "amount": "1"},
+    )
+    assert response.status_code == 403
