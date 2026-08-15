@@ -963,19 +963,26 @@ export default function Page() {
     try {
       const needsStockOverview = STOCK_OVERVIEW_TABS.includes(activeTab);
       const needsAlerts = activeTab === "alerts";
-      const requests: Promise<unknown>[] = [api("/summary"), api(active.endpoint)];
+      // "alerts" and "settings" render their own panel from dedicated state
+      // (alerts/currentUser) rather than the generic rows table, and their tab
+      // endpoint ("/stocks/alerts", "/auth/me") returns a single object, not an
+      // array - stuffing that into `rows` used to crash every unconditional
+      // `rows.map` elsewhere (e.g. costAssets) as soon as you opened the tab.
+      const needsRows = activeTab !== "alerts" && activeTab !== "settings";
+      const requests: Promise<unknown>[] = [api("/summary")];
+      if (needsRows) requests.push(api(active.endpoint));
       if (activeTab === "rates") requests.push(api("/rates/latest"));
       if (needsStockOverview) requests.push(api("/stocks/overview"));
       if (needsAlerts) requests.push(api("/stocks/alerts"));
       if (activeTab === "assets") requests.push(api("/assets/agendas"));
-      const [summaryData, rowsData, ...extra] = await Promise.all(requests);
+      const [summaryData, ...rest] = await Promise.all(requests);
       setSummary(summaryData as Summary);
-      setRows(rowsData as Row[]);
-      let extraIndex = 0;
-      if (activeTab === "rates") setLatestRates(extra[extraIndex++] as LatestRates);
-      if (needsStockOverview) setStockOverview(extra[extraIndex++] as StockOverview);
-      if (needsAlerts) setAlerts(extra[extraIndex++] as Alerts);
-      if (activeTab === "assets") setAssetAgendas(extra[extraIndex++] as AssetAgenda[]);
+      let restIndex = 0;
+      setRows(needsRows ? (rest[restIndex++] as Row[]) : []);
+      if (activeTab === "rates") setLatestRates(rest[restIndex++] as LatestRates);
+      if (needsStockOverview) setStockOverview(rest[restIndex++] as StockOverview);
+      if (needsAlerts) setAlerts(rest[restIndex++] as Alerts);
+      if (activeTab === "assets") setAssetAgendas(rest[restIndex++] as AssetAgenda[]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Nepodařilo se načíst data");
     }
