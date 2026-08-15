@@ -11,7 +11,20 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from .config import Settings, get_settings
 
 security = HTTPBearer(auto_error=False)
-ALL_AGENDAS = ["assets", "costs", "loans", "transactions", "watchlist", "stats", "portfolio", "history", "rates", "users"]
+ALL_AGENDAS = [
+    "assets",
+    "costs",
+    "loans",
+    "transactions",
+    "watchlist",
+    "stats",
+    "portfolio",
+    "history",
+    "alerts",
+    "charts",
+    "rates",
+    "users",
+]
 
 # Marks a token issued after username+password succeed but before the TOTP
 # code is verified. It can only be redeemed at /auth/2fa/login - require_user

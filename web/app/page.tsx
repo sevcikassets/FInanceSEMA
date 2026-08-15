@@ -1,6 +1,8 @@
 "use client";
 
 import {
+  AlertTriangle,
+  BarChart3,
   Building2,
   Calculator,
   CalendarDays,
@@ -18,6 +20,7 @@ import {
   PanelLeftOpen,
   RefreshCw,
   Save,
+  Settings as SettingsIcon,
   ShieldCheck,
   TrendingUp,
   WalletCards,
@@ -81,6 +84,8 @@ type CurrentUser = {
   is_admin: boolean;
   allowed_agendas: string[];
   totp_enabled: boolean;
+  alert_daily_change_pct: number | null;
+  alert_drop_pct: number | null;
 };
 
 type TwoFactorSetup = {
@@ -98,18 +103,34 @@ const tabs = [
   { id: "stats", label: "Denní statistika", icon: ShieldCheck, endpoint: "/stocks/statistics" },
   { id: "portfolio", label: "Portfolio", icon: LineChart, endpoint: "/stocks/portfolio" },
   { id: "history", label: "Sledování akcie", icon: TrendingUp, endpoint: "/stocks/transactions" },
+  { id: "alerts", label: "Upozornění", icon: AlertTriangle, endpoint: "/stocks/alerts" },
+  { id: "charts", label: "Grafy", icon: BarChart3, endpoint: "/stocks/statistics" },
   { id: "rates", label: "Denní kurzy", icon: CalendarDays, endpoint: "/rates/daily?limit=500" },
   { id: "users", label: "Uživatelé", icon: Lock, endpoint: "/users" },
+  { id: "settings", label: "Nastavení", icon: SettingsIcon, endpoint: "/auth/me" },
 ];
 
+// "settings" (personal notification preferences) is intentionally not listed
+// here - it's always visible to every logged-in user regardless of agenda
+// permissions, see visibleTabs/visibleNavGroups below.
 const navGroups = [
+  { label: "Přehled", items: ["alerts", "charts"] },
   { label: "Majetek", items: ["assets", "costs"] },
   { label: "Půjčky", items: ["loans"] },
   { label: "Akcie", items: ["transactions", "watchlist", "stats", "portfolio", "history"] },
-  { label: "Nastavení", items: ["rates", "users"] },
+  { label: "Nastavení", items: ["rates", "users", "settings"] },
 ];
 
 const tabsById = Object.fromEntries(tabs.map((tab) => [tab.id, tab]));
+
+// Tabs that show the "Akciový souhrn" (movements/currencies mini-grid + price
+// refresh/recalculate actions). "stats" is deliberately excluded - that tab
+// now shows only its own movements table (Upozorneni/Grafy moved to their
+// own tabs).
+const STOCK_OVERVIEW_TABS = ["transactions", "watchlist", "portfolio"];
+
+// Tabs that render their own custom panel instead of the generic data table.
+const NON_TABLE_TABS = new Set(["assets", "history", "alerts", "charts", "settings"]);
 
 const columns: Record<string, string[]> = {
   portfolio: ["ticker", "name", "quantity", "currency", "market_value_czk", "invested_czk", "profit_czk", "profit_pct"],
@@ -371,12 +392,14 @@ function PortfolioChart({
   mode,
   series,
   formatValue: formatY,
+  large = false,
 }: {
   title: string;
   data: ChartPoint[];
   mode: "lines" | "area" | "diverging-area";
   series: ChartSeriesDef[];
   formatValue: (value: number) => string;
+  large?: boolean;
 }) {
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
 
@@ -443,7 +466,7 @@ function PortfolioChart({
   const hoverPoint = hoverIndex !== null ? data[hoverIndex] : null;
 
   return (
-    <div className="portfolio-chart">
+    <div className={`portfolio-chart${large ? " portfolio-chart-large" : ""}`}>
       <div className="portfolio-chart-header">
         <h3>{title}</h3>
         {mode === "lines" && (
@@ -809,15 +832,22 @@ export default function Page() {
     is_admin: false,
     allowed_agendas: [] as string[],
   });
+  const [notifDailyChangePct, setNotifDailyChangePct] = useState("");
+  const [notifDropPct, setNotifDropPct] = useState("");
+  const [notifBusy, setNotifBusy] = useState(false);
+  const [notifStatus, setNotifStatus] = useState<string | null>(null);
   const allowedAgendaSet = useMemo(
     () => new Set(currentUser?.is_admin ? tabs.map((tab) => tab.id) : currentUser?.allowed_agendas || tabs.map((tab) => tab.id)),
     [currentUser],
   );
-  const visibleTabs = useMemo(() => tabs.filter((tab) => allowedAgendaSet.has(tab.id)), [allowedAgendaSet]);
+  // "settings" is personal preferences, not a data agenda - every logged-in
+  // user can reach it regardless of what allowed_agendas grants them.
+  const isTabVisible = (tabId: string) => tabId === "settings" || allowedAgendaSet.has(tabId);
+  const visibleTabs = useMemo(() => tabs.filter((tab) => isTabVisible(tab.id)), [allowedAgendaSet]);
   const visibleNavGroups = useMemo(
     () =>
       navGroups
-        .map((group) => ({ ...group, items: group.items.filter((item) => allowedAgendaSet.has(item)) }))
+        .map((group) => ({ ...group, items: group.items.filter((item) => isTabVisible(item)) }))
         .filter((group) => group.items.length > 0),
     [allowedAgendaSet],
   );
@@ -835,7 +865,7 @@ export default function Page() {
           ? buildLoanRows(rows, expandedLoanYears, expandedLoanMonths)
           : rows;
   const chartData = useMemo(() => {
-    if (activeTab !== "stats") return [];
+    if (activeTab !== "charts") return [];
     return [...rows]
       .filter((row) => row.stat_date)
       .sort((a, b) => String(a.stat_date).localeCompare(String(b.stat_date)))
@@ -904,7 +934,12 @@ export default function Page() {
   }, [token]);
 
   useEffect(() => {
-    if (visibleTabs.length > 0 && !allowedAgendaSet.has(activeTab)) {
+    setNotifDailyChangePct(currentUser?.alert_daily_change_pct != null ? String(currentUser.alert_daily_change_pct) : "");
+    setNotifDropPct(currentUser?.alert_drop_pct != null ? String(currentUser.alert_drop_pct) : "");
+  }, [currentUser]);
+
+  useEffect(() => {
+    if (visibleTabs.length > 0 && !isTabVisible(activeTab)) {
       setActiveTab(visibleTabs[0].id);
     }
   }, [allowedAgendaSet, activeTab, visibleTabs]);
@@ -926,20 +961,21 @@ export default function Page() {
     if (!token) return;
     setError(null);
     try {
-      const isStockTab = ["transactions", "watchlist", "portfolio", "stats"].includes(activeTab);
+      const needsStockOverview = STOCK_OVERVIEW_TABS.includes(activeTab);
+      const needsAlerts = activeTab === "alerts";
       const requests: Promise<unknown>[] = [api("/summary"), api(active.endpoint)];
       if (activeTab === "rates") requests.push(api("/rates/latest"));
-      if (isStockTab) requests.push(api("/stocks/overview"), api("/stocks/alerts"));
+      if (needsStockOverview) requests.push(api("/stocks/overview"));
+      if (needsAlerts) requests.push(api("/stocks/alerts"));
       if (activeTab === "assets") requests.push(api("/assets/agendas"));
       const [summaryData, rowsData, ...extra] = await Promise.all(requests);
       setSummary(summaryData as Summary);
       setRows(rowsData as Row[]);
-      if (activeTab === "rates") setLatestRates(extra[0] as LatestRates);
-      if (isStockTab) {
-        setStockOverview(extra[0] as StockOverview);
-        setAlerts(extra[1] as Alerts);
-      }
-      if (activeTab === "assets") setAssetAgendas(extra[0] as AssetAgenda[]);
+      let extraIndex = 0;
+      if (activeTab === "rates") setLatestRates(extra[extraIndex++] as LatestRates);
+      if (needsStockOverview) setStockOverview(extra[extraIndex++] as StockOverview);
+      if (needsAlerts) setAlerts(extra[extraIndex++] as Alerts);
+      if (activeTab === "assets") setAssetAgendas(extra[extraIndex++] as AssetAgenda[]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Nepodařilo se načíst data");
     }
@@ -1127,6 +1163,28 @@ export default function Page() {
       setError(err instanceof Error ? err.message : "Kurzovní lístek ČNB se nepodařilo stáhnout");
     } finally {
       setWorkingMessage(null);
+    }
+  }
+
+  async function saveNotificationSettings(event: React.FormEvent) {
+    event.preventDefault();
+    setNotifStatus(null);
+    setNotifBusy(true);
+    try {
+      const toNumberOrNull = (value: string) => (value.trim() === "" ? null : Number(value.replace(",", ".")));
+      const profile = (await api("/auth/me/notification-settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          alert_daily_change_pct: toNumberOrNull(notifDailyChangePct),
+          alert_drop_pct: toNumberOrNull(notifDropPct),
+        }),
+      })) as CurrentUser;
+      setCurrentUser(profile);
+      setNotifStatus("Uloženo.");
+    } catch (err) {
+      setNotifStatus(err instanceof Error ? err.message : "Nastavení se nepodařilo uložit");
+    } finally {
+      setNotifBusy(false);
     }
   }
 
@@ -1383,6 +1441,13 @@ export default function Page() {
             </div>
           ))}
         </nav>
+        <div className="sidebar-foot">
+          <span className="sidebar-user">{currentUser?.username || username}</span>
+          <button className="sidebar-logout-button" onClick={logout} title="Odhlásit se" aria-label="Odhlásit se">
+            <LogOut size={18} />
+            <span>Odhlásit se</span>
+          </button>
+        </div>
       </aside>
 
       <section className="workspace">
@@ -1399,10 +1464,6 @@ export default function Page() {
           <div className="topbar-actions">
             <button className="icon-button" onClick={loadAll} title="Obnovit data">
               <RefreshCw size={18} />
-            </button>
-            <span className="topbar-user">{currentUser?.username || username}</span>
-            <button className="icon-button" onClick={logout} title="Odhlásit se" aria-label="Odhlásit se">
-              <LogOut size={18} />
             </button>
           </div>
         </header>
@@ -1645,7 +1706,7 @@ export default function Page() {
                 </label>
                 {!newUser.is_admin && (
                   <div className="permissions-grid">
-                    {tabs.map((tab) => (
+                    {tabs.filter((tab) => tab.id !== "settings").map((tab) => (
                       <label className="checkbox-row" key={tab.id}>
                         <input
                           checked={newUser.allowed_agendas.includes(tab.id)}
@@ -1713,14 +1774,53 @@ export default function Page() {
           </section>
         )}
 
-        {["transactions", "watchlist", "portfolio", "stats"].includes(activeTab) && alerts && (
+        {activeTab === "settings" && (
+          <section className="work-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Nastavení upozornění</h2>
+                <p>
+                  Osobní prahy pro upozornění na záložce Upozornění a při přepočtu akcií. Prázdné pole = použije se
+                  výchozí hodnota (10 %).
+                </p>
+              </div>
+            </div>
+            <form className="rate-form" onSubmit={saveNotificationSettings}>
+              <label>
+                Denní změna (%) pro upozornění
+                <input
+                  value={notifDailyChangePct}
+                  onChange={(event) => setNotifDailyChangePct(event.target.value)}
+                  inputMode="decimal"
+                  placeholder="10"
+                />
+              </label>
+              <label>
+                Pokles portfolia (%) pro upozornění
+                <input
+                  value={notifDropPct}
+                  onChange={(event) => setNotifDropPct(event.target.value)}
+                  inputMode="decimal"
+                  placeholder="10"
+                />
+              </label>
+              <button className="action-button" type="submit" disabled={notifBusy}>
+                <Save size={16} />
+                <span>Uložit</span>
+              </button>
+            </form>
+            {notifStatus && <div className="success-notice">{notifStatus}</div>}
+          </section>
+        )}
+
+        {activeTab === "alerts" && alerts && (
           <section className="work-panel">
             <div className="panel-header">
               <div>
                 <h2>Upozornění</h2>
                 <p>
                   Denní pohyby{alerts.daily_movers_as_of ? ` (k ${alerts.daily_movers_as_of})` : ""}, sledované tituly pod
-                  limitní cenou a pozice s poklesem nad {alerts.threshold_pct} %.
+                  limitní cenou a pozice s poklesem nad {alerts.threshold_pct} %. Prahy pro upozornění nastavíte v záložce Nastavení.
                 </p>
               </div>
             </div>
@@ -1882,7 +1982,7 @@ export default function Page() {
           </section>
         )}
 
-        {["transactions", "watchlist", "portfolio", "stats"].includes(activeTab) && stockOverview && (
+        {STOCK_OVERVIEW_TABS.includes(activeTab) && stockOverview && (
           <section className="work-panel">
             <div className="panel-header">
               <div>
@@ -1956,40 +2056,47 @@ export default function Page() {
           </section>
         )}
 
-        {activeTab === "stats" && chartData.length > 0 && (
+        {activeTab === "charts" && (
           <section className="work-panel">
             <div className="panel-header">
               <div>
                 <h2>Grafy portfolia</h2>
-                <p>Z posledních {chartData.length} obchodních dnů.</p>
+                <p>{chartData.length > 0 ? `Z posledních ${chartData.length} obchodních dnů.` : "Zatím není dost dat pro graf."}</p>
               </div>
             </div>
-            <div className="portfolio-charts-grid">
-              <PortfolioChart
-                title="Hodnota portfolia vs Investice"
-                mode="lines"
-                data={chartData}
-                series={[
-                  { key: "invested_czk", label: "Investice CZK", color: "#2a78d6" },
-                  { key: "total_value_czk", label: "Hodnota CZK", color: "#eb6834" },
-                ]}
-                formatValue={money}
-              />
-              <PortfolioChart
-                title="Nerealizovaný zisk / ztráta (CZK)"
-                mode="diverging-area"
-                data={chartData}
-                series={[{ key: "unrealized_profit_czk", label: "Nereal. zisk", color: "var(--accent)" }]}
-                formatValue={money}
-              />
-              <PortfolioChart
-                title="Dividendy kumulativně"
-                mode="area"
-                data={chartData}
-                series={[{ key: "dividends_total", label: "Dividendy", color: "#1baf7a" }]}
-                formatValue={money}
-              />
-            </div>
+            {chartData.length === 0 ? (
+              <p className="alert-empty">Grafy se zobrazí po prvním přepočtu akciových dat (záložka Transakce).</p>
+            ) : (
+              <div className="portfolio-charts-grid portfolio-charts-grid-large">
+                <PortfolioChart
+                  title="Hodnota portfolia vs Investice"
+                  mode="lines"
+                  data={chartData}
+                  series={[
+                    { key: "invested_czk", label: "Investice CZK", color: "#2a78d6" },
+                    { key: "total_value_czk", label: "Hodnota CZK", color: "#eb6834" },
+                  ]}
+                  formatValue={money}
+                  large
+                />
+                <PortfolioChart
+                  title="Nerealizovaný zisk / ztráta (CZK)"
+                  mode="diverging-area"
+                  data={chartData}
+                  series={[{ key: "unrealized_profit_czk", label: "Nereal. zisk", color: "var(--accent)" }]}
+                  formatValue={money}
+                  large
+                />
+                <PortfolioChart
+                  title="Dividendy kumulativně"
+                  mode="area"
+                  data={chartData}
+                  series={[{ key: "dividends_total", label: "Dividendy", color: "#1baf7a" }]}
+                  formatValue={money}
+                  large
+                />
+              </div>
+            )}
           </section>
         )}
 
@@ -2078,7 +2185,7 @@ export default function Page() {
           </section>
         )}
 
-        {activeTab !== "assets" && activeTab !== "history" && (
+        {!NON_TABLE_TABS.has(activeTab) && (
         <section className={`table-wrap ${activeTab === "stats" ? "stats-table-wrap" : ""}`}>
           <table>
             <thead>

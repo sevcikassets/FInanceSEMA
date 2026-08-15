@@ -898,3 +898,55 @@ def test_admin_reset_2fa_endpoint_clears_lost_device_lockout(client, db_session)
     # A non-admin cannot reset anyone's 2FA.
     forbidden = client.post("/users/admin/2fa/reset", headers=analyst_headers)
     assert forbidden.status_code == 403
+
+
+@requires_db
+def test_notification_settings_are_saved_per_user_and_used_as_alert_default(client, db_session):
+    """Nastaveni tab: a user's own daily-change/drop thresholds persist via
+    /auth/me, and /stocks/alerts falls back to the saved drop threshold when
+    the caller doesn't pass an explicit threshold_pct."""
+    from app.models import PortfolioPosition
+
+    db_session.add(
+        PortfolioPosition(
+            ticker="TST",
+            name="Test Corp",
+            quantity=Decimal("10"),
+            current_price=Decimal("90"),
+            currency="CZK",
+            market_value_czk=Decimal("900"),
+            invested_czk=Decimal("1000"),
+            profit_czk=Decimal("-100"),
+            profit_pct=Decimal("-0.10"),
+        )
+    )
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+
+    me = client.get("/auth/me", headers=headers)
+    assert me.json()["alert_daily_change_pct"] is None
+    assert me.json()["alert_drop_pct"] is None
+
+    invalid = client.put("/auth/me/notification-settings", headers=headers, json={"alert_drop_pct": 150})
+    assert invalid.status_code == 400
+
+    saved = client.put(
+        "/auth/me/notification-settings",
+        headers=headers,
+        json={"alert_daily_change_pct": 5, "alert_drop_pct": 8},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["alert_daily_change_pct"] == 5
+    assert saved.json()["alert_drop_pct"] == 8
+
+    me_after = client.get("/auth/me", headers=headers)
+    assert me_after.json()["alert_drop_pct"] == 8
+
+    # -10% drawdown breaches an 8% saved threshold but not the 10% app default.
+    alerts_default = client.get("/stocks/alerts", headers=headers)
+    assert any(row["ticker"] == "TST" for row in alerts_default.json()["portfolio_drawdowns"])
+
+    alerts_explicit = client.get("/stocks/alerts", headers=headers, params={"threshold_pct": 50})
+    assert not any(row["ticker"] == "TST" for row in alerts_explicit.json()["portfolio_drawdowns"])

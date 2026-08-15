@@ -70,6 +70,11 @@ class TwoFactorDisableRequest(BaseModel):
     code: str
 
 
+class NotificationSettingsInput(BaseModel):
+    alert_daily_change_pct: Decimal | None = None
+    alert_drop_pct: Decimal | None = None
+
+
 class UserInput(BaseModel):
     username: str
     password: str
@@ -113,6 +118,9 @@ def computed_interest_plan(asset: Asset) -> dict[str, Any]:
     return {str(year): json_value(value) for year, value in sorted(projection.items())}
 
 
+DEFAULT_ALERT_THRESHOLD_PCT = Decimal("10")
+
+
 def user_dict(row: AppUser) -> dict[str, Any]:
     return {
         "username": row.username,
@@ -121,7 +129,21 @@ def user_dict(row: AppUser) -> dict[str, Any]:
         "is_admin": row.is_admin,
         "allowed_agendas": row.allowed_agendas or [],
         "totp_enabled": bool(row.totp_enabled),
+        "alert_daily_change_pct": json_value(row.alert_daily_change_pct),
+        "alert_drop_pct": json_value(row.alert_drop_pct),
     }
+
+
+def resolve_threshold(db: Session, username: str, explicit: Decimal | None, field: str) -> Decimal:
+    """Effective alert threshold (%) for the current user: an explicit query
+    param always wins, otherwise the user's own saved preference (Nastaveni
+    tab), otherwise the app-wide default. `field` is "alert_daily_change_pct"
+    or "alert_drop_pct" on AppUser."""
+    if explicit is not None:
+        return explicit
+    user = db.get(AppUser, username)
+    saved = getattr(user, field, None) if user is not None else None
+    return saved if saved is not None else DEFAULT_ALERT_THRESHOLD_PCT
 
 
 def ensure_admin_user() -> None:
@@ -280,6 +302,8 @@ def ensure_schema_upgrades() -> None:
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS totp_secret VARCHAR(64)"))
         conn.execute(text("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS alert_daily_change_pct NUMERIC(6, 3)"))
+        conn.execute(text("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS alert_drop_pct NUMERIC(6, 3)"))
 
 
 @app.on_event("startup")
@@ -393,7 +417,25 @@ def me(username: str = Depends(require_user), db: Session = Depends(get_db)) -> 
             "is_admin": username == settings.app_username,
             "allowed_agendas": ALL_AGENDAS,
             "totp_enabled": False,
+            "alert_daily_change_pct": None,
+            "alert_drop_pct": None,
         }
+    return user_dict(user)
+
+
+@app.put("/auth/me/notification-settings")
+def update_notification_settings(
+    payload: NotificationSettingsInput, username: str = Depends(require_user), db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    user = db.get(AppUser, username)
+    if user is None:
+        raise HTTPException(status_code=404, detail="Uživatel nenalezen")
+    for field, value in (("alert_daily_change_pct", payload.alert_daily_change_pct), ("alert_drop_pct", payload.alert_drop_pct)):
+        if value is not None and not (Decimal("0.1") <= value <= Decimal("90")):
+            raise HTTPException(status_code=400, detail="Práh musí být mezi 0,1 a 90 %")
+    user.alert_daily_change_pct = payload.alert_daily_change_pct
+    user.alert_drop_pct = payload.alert_drop_pct
+    db.commit()
     return user_dict(user)
 
 
@@ -635,11 +677,11 @@ def stock_overview(_: str = Depends(require_user), db: Session = Depends(get_db)
 
 @app.get("/stocks/alerts")
 def stock_alerts(
-    _: str = Depends(require_user),
+    username: str = Depends(require_user),
     db: Session = Depends(get_db),
-    threshold_pct: Decimal = Query(default=Decimal("10")),
+    threshold_pct: Decimal | None = Query(default=None),
 ) -> dict[str, Any]:
-    return compute_alerts(db, threshold_pct=threshold_pct)
+    return compute_alerts(db, threshold_pct=resolve_threshold(db, username, threshold_pct, "alert_drop_pct"))
 
 
 @app.get("/stocks/ticker-history")
@@ -662,20 +704,20 @@ def import_patria(payload: PatriaImportInput, _: str = Depends(require_user), db
 
 @app.post("/stocks/refresh-prices")
 def refresh_stock_prices(
-    _: str = Depends(require_user),
+    username: str = Depends(require_user),
     db: Session = Depends(get_db),
-    threshold_pct: Decimal = Query(default=Decimal("10")),
+    threshold_pct: Decimal | None = Query(default=None),
 ) -> dict[str, Any]:
-    return refresh_current_prices(db, threshold_pct=threshold_pct)
+    return refresh_current_prices(db, threshold_pct=resolve_threshold(db, username, threshold_pct, "alert_daily_change_pct"))
 
 
 @app.post("/stocks/recalculate")
 def recalculate_stock_data(
-    _: str = Depends(require_user),
+    username: str = Depends(require_user),
     db: Session = Depends(get_db),
     dry_run: bool = False,
     date_from: date | None = Query(default=None),
-    threshold_pct: Decimal = Query(default=Decimal("10")),
+    threshold_pct: Decimal | None = Query(default=None),
 ) -> dict[str, Any]:
     # An unhandled exception here used to reach the browser as a bare 500
     # with no CORS headers (Starlette's outermost error handler sits above
@@ -684,11 +726,12 @@ def recalculate_stock_data(
     # re-raise as a normal HTTPException instead, which *does* get CORS
     # headers and puts the actual error text in front of the user/logs.
     try:
+        effective_threshold = resolve_threshold(db, username, threshold_pct, "alert_daily_change_pct")
         # Auto-fetch missing CNB rates first, same as AktualizujStatistiku always
         # does before recomputing - but only for a real (non-preview) run, so
         # "Kontrola (náhled)" keeps its "nothing gets saved" promise.
         cnb_rates_added = ensure_cnb_rates_up_to_date(db) if not dry_run else 0
-        result = recalculate_stocks(db, dry_run=dry_run, date_from=date_from, threshold_pct=threshold_pct)
+        result = recalculate_stocks(db, dry_run=dry_run, date_from=date_from, threshold_pct=effective_threshold)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 - last-resort safety net, see above

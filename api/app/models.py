@@ -45,6 +45,13 @@ class AppUser(Base):
     # setup never lands in the database.
     totp_secret: Mapped[str | None] = mapped_column(String(64))
     totp_enabled: Mapped[bool] = mapped_column(default=False)
+    # Per-user notification thresholds (percent, e.g. 10 = 10%) - null means
+    # "use the app default" (see DEFAULT_ALERT_THRESHOLD_PCT in main.py).
+    # alert_daily_change_pct drives day-over-day price-move detection
+    # (recalculate/refresh-prices "movers"); alert_drop_pct drives the
+    # portfolio-drawdown-vs-purchase-cost alert shown on the Upozorneni tab.
+    alert_daily_change_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
+    alert_drop_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
