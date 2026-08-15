@@ -4,11 +4,10 @@ from decimal import Decimal, InvalidOperation
 import io
 import json
 import logging
-import unicodedata
 import uuid
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -43,12 +42,20 @@ from .auth import (
 )
 from .config import get_settings
 from .db import Base, engine, get_db
-from .excel_import import get_or_create_cost_category, get_or_create_party, import_workbooks
-from .loan_calc import project_annual_interest
+from .excel_import import (
+    get_or_create_asset_type,
+    get_or_create_cost_category,
+    get_or_create_party,
+    import_workbooks,
+    move_zapujcka_assets_to_loans,
+    split_debt_assets_into_linked_liability,
+)
+from .loan_calc import amortization_schedule, project_annual_interest
 from .models import (
     AppUser,
     Asset,
     AssetCost,
+    AssetType,
     CostCategory,
     DailyStatistic,
     ExchangeRate,
@@ -141,6 +148,52 @@ class AssetCostInput(BaseModel):
     note: str | None = None
 
 
+# Kept in sync with the loan-related columns on Asset - used both to
+# validate AssetTypeInput.required_fields and to drive the create/edit
+# form's field checklist on the frontend.
+ASSET_REQUIRED_FIELD_CHOICES = [
+    "owner_id",
+    "total_value",
+    "own_funds",
+    "borrowed_amount",
+    "lender_name",
+    "borrowed_from",
+    "borrowed_to",
+    "interest_rate",
+    "loan_years",
+    "fixed_until",
+    "payment",
+]
+
+
+class AssetTypeInput(BaseModel):
+    name: str
+    calculation_mode: Literal["none", "debt_interest"] = "none"
+    required_fields: list[str] = []
+
+
+class OwnerInput(BaseModel):
+    name: str
+
+
+class AssetInput(BaseModel):
+    code: str
+    name: str
+    owner_id: uuid.UUID | None = None
+    asset_type_id: uuid.UUID | None = None
+    linked_asset_id: uuid.UUID | None = None
+    total_value: Decimal | None = None
+    own_funds: Decimal | None = None
+    borrowed_amount: Decimal | None = None
+    lender_name: str | None = None
+    borrowed_from: date | None = None
+    borrowed_to: date | None = None
+    interest_rate: Decimal | None = None
+    loan_years: Decimal | None = None
+    fixed_until: date | None = None
+    payment: Decimal | None = None
+
+
 class PortfolioAccessGrant(BaseModel):
     portfolio_id: uuid.UUID
     allowed_agendas: list[str] = []
@@ -164,13 +217,43 @@ def model_dict(row: Any) -> dict[str, Any]:
     return data
 
 
-def computed_interest_plan(asset: Asset) -> dict[str, Any]:
+def computed_interest_plan(asset: Asset, calculation_mode: str | None) -> dict[str, Any]:
+    """Annual interest projection - only meaningful for a "debt_interest"
+    typed asset (a Hypotéka: borrowed_amount is money OWED, interest is an
+    expense). calculation_mode is passed in explicitly (not lazy-loaded via
+    a relationship) so callers can prefetch it once per request instead of
+    N+1-querying AssetType per row."""
+    if calculation_mode != "debt_interest":
+        return {}
     projection = project_annual_interest(
         borrowed_amount=asset.borrowed_amount,
         interest_rate=asset.interest_rate,
         borrowed_from=asset.borrowed_from,
         loan_years=asset.loan_years,
         borrowed_to=asset.borrowed_to,
+    )
+    return {str(year): json_value(value) for year, value in sorted(projection.items())}
+
+
+def asset_net_worth_contribution(asset: Asset, calculation_mode: str | None) -> Decimal:
+    """How much this asset counts toward /summary's assets_total: a
+    debt_interest asset (Hypotéka) is money OWED, so its borrowed_amount
+    reduces net worth; everything else counts its total_value as-is."""
+    if calculation_mode == "debt_interest":
+        return -(asset.borrowed_amount or Decimal("0"))
+    return asset.total_value or Decimal("0")
+
+
+def loan_movement_interest_plan(movement: LoanMovement) -> dict[str, Any]:
+    """Same amortization projection as computed_interest_plan, applied to a
+    LoanMovement instead of an Asset - every movement with amount/
+    interest_rate/movement_date filled is eligible (no per-movement "type"
+    concept exists, unlike Asset/AssetType)."""
+    projection = project_annual_interest(
+        borrowed_amount=movement.amount,
+        interest_rate=movement.interest_rate,
+        borrowed_from=movement.movement_date,
+        borrowed_to=movement.planned_end_date,
     )
     return {str(year): json_value(value) for year, value in sorted(projection.items())}
 
@@ -291,19 +374,6 @@ def require_portfolio_access(agenda: str | tuple[str, ...] | None):
         return portfolio_id
 
     return _dependency
-
-
-def normalize_match_text(value: str | None) -> str:
-    if not value:
-        return ""
-    text = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
-    return " ".join(part for part in text.lower().replace("-", " ").split() if part not in {"byt"})
-
-
-def source_sheet_matches_asset(source_sheet: str | None, asset_name: str | None) -> bool:
-    tokens = normalize_match_text(source_sheet).split()
-    asset_text = normalize_match_text(asset_name)
-    return bool(tokens) and all(token in asset_text for token in tokens)
 
 
 def upsert_rate(db: Session, rate_date: date, currency: str, rate_to_czk: Decimal) -> ExchangeRate:
@@ -552,6 +622,70 @@ def ensure_schema_upgrades() -> None:
                 ),
                 {"cid": existing_category_id, "p": cat_portfolio_id, "n": category_name},
             )
+
+        # --- Asset types / linked liabilities (Hypotéka) / Zápůjčka->Půjčky.
+        # asset_types itself needs no manual DDL (brand-new table, create_all
+        # handles it). Only the two new columns on the pre-existing `assets`
+        # table need it.
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS asset_type_id UUID"))
+        asset_type_fk_name = "fk_assets_asset_type_id"
+        if not _constraint_exists(conn, "assets", asset_type_fk_name):
+            conn.execute(
+                text(f"ALTER TABLE assets ADD CONSTRAINT {asset_type_fk_name} FOREIGN KEY (asset_type_id) REFERENCES asset_types (id)")
+            )
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS linked_asset_id UUID"))
+        linked_asset_fk_name = "fk_assets_linked_asset_id"
+        if not _constraint_exists(conn, "assets", linked_asset_fk_name):
+            conn.execute(
+                text(f"ALTER TABLE assets ADD CONSTRAINT {linked_asset_fk_name} FOREIGN KEY (linked_asset_id) REFERENCES assets (id)")
+            )
+
+    # The data-shape migration below (moving rows, splitting one row into
+    # two, copying several fields) is simpler and far less error-prone as
+    # ORM object manipulation than hand-written INSERT/UPDATE/DELETE SQL -
+    # unlike the raw-SQL blocks above, which are simple enough that SQL is
+    # actually the more direct tool. Runs after the DDL above has committed
+    # (the `with engine.begin()` block above just closed).
+    with Session(bind=engine) as session:
+        portfolio_ids = session.scalars(select(Portfolio.id)).all()
+
+        # Order matters: "Zápůjčka" (money lent OUT) must move to Půjčky
+        # BEFORE the type-dictionary backfill below, so no orphaned
+        # "Zápůjčka" AssetType ever gets created - see
+        # move_zapujcka_assets_to_loans's docstring in excel_import.py.
+        for pid in portfolio_ids:
+            move_zapujcka_assets_to_loans(session, pid)
+
+        # Backfill AssetType from whatever asset_type text values remain
+        # (Zápůjčka already gone via the step above) - same idempotent
+        # get-or-create-then-link pattern as the cost-categories backfill.
+        for pid in portfolio_ids:
+            distinct_type_names = session.scalars(
+                select(Asset.asset_type)
+                .where(
+                    Asset.portfolio_id == pid,
+                    Asset.asset_type.isnot(None),
+                    Asset.asset_type != "",
+                    Asset.asset_type_id.is_(None),
+                )
+                .distinct()
+            ).all()
+            for type_name in distinct_type_names:
+                asset_type = get_or_create_asset_type(session, pid, type_name)
+                for asset in session.scalars(
+                    select(Asset).where(
+                        Asset.portfolio_id == pid, Asset.asset_type == type_name, Asset.asset_type_id.is_(None)
+                    )
+                ).all():
+                    asset.asset_type_id = asset_type.id
+
+        # Split any remaining Byt+loan combined row into Byt + linked
+        # Hypotéka - see split_debt_assets_into_linked_liability's
+        # docstring in excel_import.py for the exact candidate criteria.
+        for pid in portfolio_ids:
+            split_debt_assets_into_linked_liability(session, pid)
+
+        session.commit()
 
 
 @app.on_event("startup")
@@ -818,7 +952,16 @@ def summary(
         .limit(1)
     )
     loan_total = db.scalar(select(func.coalesce(func.sum(LoanMovement.amount), 0)).where(LoanMovement.portfolio_id == portfolio_id))
-    asset_total = db.scalar(select(func.coalesce(func.sum(Asset.total_value), 0)).where(Asset.portfolio_id == portfolio_id))
+    # A debt_interest-typed asset (Hypotéka) is money OWED, so its
+    # borrowed_amount must reduce net worth rather than add to it - see
+    # asset_net_worth_contribution. Portfolios here have a handful of assets,
+    # so a Python loop is simpler (and keeps the branching logic in one
+    # place) than duplicating the mode-dependent CASE in SQL.
+    asset_types_by_id = {t.id: t.calculation_mode for t in db.scalars(select(AssetType).where(AssetType.portfolio_id == portfolio_id)).all()}
+    asset_rows = db.scalars(select(Asset).where(Asset.portfolio_id == portfolio_id)).all()
+    asset_total = sum(
+        (asset_net_worth_contribution(row, asset_types_by_id.get(row.asset_type_id)) for row in asset_rows), Decimal("0")
+    )
     cost_total = db.scalar(select(func.coalesce(func.sum(AssetCost.amount), 0)).where(AssetCost.portfolio_id == portfolio_id))
     portfolio_value = db.scalar(
         select(func.coalesce(func.sum(PortfolioPosition.market_value_czk), 0)).where(PortfolioPosition.portfolio_id == portfolio_id)
@@ -870,8 +1013,54 @@ def loan_movements(
         data = model_dict(row)
         data["lender"] = party_names.get(row.lender_id)
         data["borrower"] = party_names.get(row.borrower_id)
+        data["computed_interest_plan"] = loan_movement_interest_plan(row)
         result.append(data)
     return result
+
+
+@app.get("/loans/movements/{movement_id}/interest-projection")
+def loan_movement_interest_projection(
+    movement_id: uuid.UUID,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("loans")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    movement = db.scalar(select(LoanMovement).where(LoanMovement.id == movement_id, LoanMovement.portfolio_id == portfolio_id))
+    if movement is None:
+        raise HTTPException(status_code=404, detail="Pohyb nenalezen")
+    projection = loan_movement_interest_plan(movement)
+    return {
+        "movement_id": str(movement.id),
+        "computed_plan": projection,
+        "total_computed": round(sum(projection.values()), 2) if projection else 0,
+    }
+
+
+@app.get("/loans/movements/{movement_id}/payment-schedule")
+def loan_movement_payment_schedule(
+    movement_id: uuid.UUID,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("loans")),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    movement = db.scalar(select(LoanMovement).where(LoanMovement.id == movement_id, LoanMovement.portfolio_id == portfolio_id))
+    if movement is None:
+        raise HTTPException(status_code=404, detail="Pohyb nenalezen")
+    schedule = amortization_schedule(
+        pv=movement.amount,
+        interest_rate=movement.interest_rate,
+        start_date=movement.movement_date,
+        end_date=movement.planned_end_date,
+    )
+    return [
+        {
+            "period": period["period"],
+            "date": period["date"].isoformat(),
+            "payment": json_value(period["payment"]),
+            "principal": json_value(period["principal"]),
+            "interest": json_value(period["interest"]),
+            "balance": json_value(period["balance"]),
+        }
+        for period in schedule
+    ]
 
 
 @app.post("/loans/cleanup-imported-subtotals")
@@ -894,16 +1083,171 @@ def cleanup_loan_subtotals(
     return {"deleted": deleted}
 
 
+def _asset_dict(db: Session, row: Asset) -> dict[str, Any]:
+    owner = db.get(Party, row.owner_id) if row.owner_id else None
+    asset_type = db.get(AssetType, row.asset_type_id) if row.asset_type_id else None
+    linked = db.get(Asset, row.linked_asset_id) if row.linked_asset_id else None
+    calculation_mode = asset_type.calculation_mode if asset_type else None
+    return model_dict(row) | {
+        "owner": owner.name if owner else None,
+        "asset_type": asset_type.name if asset_type else row.asset_type,
+        "calculation_mode": calculation_mode,
+        "computed_interest_plan": computed_interest_plan(row, calculation_mode),
+        "net_worth_contribution": json_value(asset_net_worth_contribution(row, calculation_mode)),
+        "linked_asset": linked.name if linked else None,
+        "linked_asset_code": linked.code if linked else None,
+    }
+
+
+def _validate_asset_owner(db: Session, owner_id: uuid.UUID | None) -> None:
+    if owner_id is not None and db.get(Party, owner_id) is None:
+        raise HTTPException(status_code=404, detail="Vlastník nenalezen")
+
+
+def _validate_asset_type_id(db: Session, portfolio_id: uuid.UUID, asset_type_id: uuid.UUID | None) -> AssetType | None:
+    if asset_type_id is None:
+        return None
+    row = db.scalar(select(AssetType).where(AssetType.id == asset_type_id, AssetType.portfolio_id == portfolio_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Typ majetku nenalezen")
+    return row
+
+
+def _validate_linked_asset_id(
+    db: Session, portfolio_id: uuid.UUID, linked_asset_id: uuid.UUID | None, exclude_id: uuid.UUID | None
+) -> None:
+    if linked_asset_id is None:
+        return
+    if linked_asset_id == exclude_id:
+        raise HTTPException(status_code=400, detail="Majetek nemůže být navázán sám na sebe")
+    if db.scalar(select(Asset).where(Asset.id == linked_asset_id, Asset.portfolio_id == portfolio_id)) is None:
+        raise HTTPException(status_code=404, detail="Navázaný majetek nenalezen")
+
+
 @app.get("/assets")
 def assets(
     portfolio_id: uuid.UUID = Depends(require_portfolio_access("assets")), db: Session = Depends(get_db)
 ) -> list[dict[str, Any]]:
     owners = {p.id: p.name for p in db.scalars(select(Party)).all()}
+    asset_types = {t.id: t for t in db.scalars(select(AssetType).where(AssetType.portfolio_id == portfolio_id)).all()}
     rows = db.scalars(select(Asset).where(Asset.portfolio_id == portfolio_id).order_by(Asset.code)).all()
-    return [
-        model_dict(row) | {"owner": owners.get(row.owner_id), "computed_interest_plan": computed_interest_plan(row)}
-        for row in rows
-    ]
+    assets_by_id = {row.id: row for row in rows}
+    result = []
+    for row in rows:
+        asset_type = asset_types.get(row.asset_type_id)
+        calculation_mode = asset_type.calculation_mode if asset_type else None
+        linked = assets_by_id.get(row.linked_asset_id) if row.linked_asset_id else None
+        result.append(
+            model_dict(row)
+            | {
+                "owner": owners.get(row.owner_id),
+                "asset_type": asset_type.name if asset_type else row.asset_type,
+                "calculation_mode": calculation_mode,
+                "computed_interest_plan": computed_interest_plan(row, calculation_mode),
+                "net_worth_contribution": json_value(asset_net_worth_contribution(row, calculation_mode)),
+                "linked_asset": linked.name if linked else None,
+                "linked_asset_code": linked.code if linked else None,
+            }
+        )
+    return result
+
+
+@app.post("/assets")
+def create_asset(
+    payload: AssetInput,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("assets")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    code = payload.code.strip()
+    name = payload.name.strip()
+    if not code or not name:
+        raise HTTPException(status_code=400, detail="Kód a název jsou povinné")
+    if db.scalar(select(Asset).where(Asset.portfolio_id == portfolio_id, Asset.code == code)) is not None:
+        raise HTTPException(status_code=409, detail="Majetek s tímto kódem už existuje")
+    _validate_asset_owner(db, payload.owner_id)
+    _validate_asset_type_id(db, portfolio_id, payload.asset_type_id)
+    _validate_linked_asset_id(db, portfolio_id, payload.linked_asset_id, None)
+    row = Asset(
+        portfolio_id=portfolio_id,
+        code=code,
+        name=name,
+        owner_id=payload.owner_id,
+        asset_type_id=payload.asset_type_id,
+        linked_asset_id=payload.linked_asset_id,
+        total_value=payload.total_value,
+        own_funds=payload.own_funds,
+        borrowed_amount=payload.borrowed_amount,
+        lender_name=payload.lender_name,
+        borrowed_from=payload.borrowed_from,
+        borrowed_to=payload.borrowed_to,
+        interest_rate=payload.interest_rate,
+        loan_years=payload.loan_years,
+        fixed_until=payload.fixed_until,
+        payment=payload.payment,
+    )
+    db.add(row)
+    db.commit()
+    return _asset_dict(db, row)
+
+
+@app.put("/assets/{asset_id}")
+def update_asset(
+    asset_id: uuid.UUID,
+    payload: AssetInput,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("assets")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    row = db.scalar(select(Asset).where(Asset.id == asset_id, Asset.portfolio_id == portfolio_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Majetek nenalezen")
+    code = payload.code.strip()
+    name = payload.name.strip()
+    if not code or not name:
+        raise HTTPException(status_code=400, detail="Kód a název jsou povinné")
+    if db.scalar(
+        select(Asset).where(Asset.portfolio_id == portfolio_id, Asset.code == code, Asset.id != asset_id)
+    ) is not None:
+        raise HTTPException(status_code=409, detail="Majetek s tímto kódem už existuje")
+    _validate_asset_owner(db, payload.owner_id)
+    _validate_asset_type_id(db, portfolio_id, payload.asset_type_id)
+    _validate_linked_asset_id(db, portfolio_id, payload.linked_asset_id, asset_id)
+    row.code = code
+    row.name = name
+    row.owner_id = payload.owner_id
+    row.asset_type_id = payload.asset_type_id
+    row.linked_asset_id = payload.linked_asset_id
+    row.total_value = payload.total_value
+    row.own_funds = payload.own_funds
+    row.borrowed_amount = payload.borrowed_amount
+    row.lender_name = payload.lender_name
+    row.borrowed_from = payload.borrowed_from
+    row.borrowed_to = payload.borrowed_to
+    row.interest_rate = payload.interest_rate
+    row.loan_years = payload.loan_years
+    row.fixed_until = payload.fixed_until
+    row.payment = payload.payment
+    db.commit()
+    return _asset_dict(db, row)
+
+
+@app.delete("/assets/{asset_id}")
+def delete_asset(
+    asset_id: uuid.UUID,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("assets")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    row = db.scalar(select(Asset).where(Asset.id == asset_id, Asset.portfolio_id == portfolio_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Majetek nenalezen")
+    if db.scalar(select(func.count()).select_from(AssetCost).where(AssetCost.asset_id == asset_id)) > 0:
+        raise HTTPException(status_code=409, detail="Nelze smazat majetek, ke kterému jsou navázány náklady")
+    if db.scalar(select(func.count()).select_from(Asset).where(Asset.linked_asset_id == asset_id)) > 0:
+        raise HTTPException(
+            status_code=409, detail="Nelze smazat majetek, na který je navázaná hypotéka - nejprve ji smažte nebo odpojte"
+        )
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted"}
 
 
 @app.get("/assets/{asset_id}/interest-projection")
@@ -915,7 +1259,8 @@ def asset_interest_projection(
     asset = db.scalar(select(Asset).where(Asset.id == asset_id, Asset.portfolio_id == portfolio_id))
     if asset is None:
         raise HTTPException(status_code=404, detail="Majetek nenalezen")
-    projection = computed_interest_plan(asset)
+    asset_type = db.get(AssetType, asset.asset_type_id) if asset.asset_type_id else None
+    projection = computed_interest_plan(asset, asset_type.calculation_mode if asset_type else None)
     return {
         "asset_id": str(asset.id),
         "asset_code": asset.code,
@@ -925,57 +1270,145 @@ def asset_interest_projection(
     }
 
 
-@app.get("/assets/agendas")
-def asset_agendas(
-    portfolio_id: uuid.UUID = Depends(require_portfolio_access("assets")), db: Session = Depends(get_db)
+@app.get("/assets/{asset_id}/payment-schedule")
+def asset_payment_schedule(
+    asset_id: str,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("assets")),
+    db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
-    owners = {p.id: p.name for p in db.scalars(select(Party)).all()}
-    payers = {p.id: p.name for p in db.scalars(select(Party)).all()}
-    assets = db.scalars(select(Asset).where(Asset.portfolio_id == portfolio_id).order_by(Asset.code)).all()
-    result = []
-    for asset in assets:
-        linked_costs = db.scalars(
-            select(AssetCost)
-            .where(AssetCost.asset_id == asset.id)
-            .order_by(desc(AssetCost.cost_date).nullslast(), AssetCost.source_row)
-        ).all()
-        unlinked_costs = [
-            cost
-            for cost in db.scalars(
-                select(AssetCost).where(AssetCost.portfolio_id == portfolio_id, AssetCost.asset_id.is_(None))
-            ).all()
-            if source_sheet_matches_asset(cost.source_sheet, asset.name)
-        ]
-        costs = sorted(
-            [*linked_costs, *unlinked_costs],
-            key=lambda cost: (cost.cost_date is None, cost.cost_date or date.min, cost.source_row or 0),
-            reverse=True,
-        )
-        cost_total = sum((cost.amount or Decimal("0")) for cost in costs)
-        categories: dict[str, Decimal] = {}
-        for cost in costs:
-            key = cost.category or "Bez kategorie"
-            categories[key] = categories.get(key, Decimal("0")) + (cost.amount or Decimal("0"))
-        asset_data = model_dict(asset)
-        asset_data["owner"] = owners.get(asset.owner_id)
-        asset_data["computed_interest_plan"] = computed_interest_plan(asset)
-        result.append(
-            {
-                "asset": asset_data,
-                "cost_total": json_value(cost_total),
-                "cost_count": len(costs),
-                "costs": [
-                    model_dict(cost)
-                    | {
-                        "asset": asset.name,
-                        "payer": payers.get(cost.payer_id),
-                    }
-                    for cost in costs
-                ],
-                "categories": [{"category": key, "amount": json_value(value)} for key, value in sorted(categories.items())],
-            }
-        )
-    return result
+    asset = db.scalar(select(Asset).where(Asset.id == asset_id, Asset.portfolio_id == portfolio_id))
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Majetek nenalezen")
+    schedule = amortization_schedule(
+        pv=asset.borrowed_amount,
+        interest_rate=asset.interest_rate,
+        start_date=asset.borrowed_from,
+        loan_years=asset.loan_years,
+        end_date=asset.borrowed_to,
+    )
+    return [
+        {
+            "period": period["period"],
+            "date": period["date"].isoformat(),
+            "payment": json_value(period["payment"]),
+            "principal": json_value(period["principal"]),
+            "interest": json_value(period["interest"]),
+            "balance": json_value(period["balance"]),
+        }
+        for period in schedule
+    ]
+
+
+@app.get("/assets/asset-types")
+def list_asset_types(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("asset_types")), db: Session = Depends(get_db)
+) -> list[dict[str, Any]]:
+    rows = db.scalars(select(AssetType).where(AssetType.portfolio_id == portfolio_id).order_by(AssetType.name)).all()
+    return [
+        {"id": str(row.id), "name": row.name, "calculation_mode": row.calculation_mode, "required_fields": row.required_fields or []}
+        for row in rows
+    ]
+
+
+@app.post("/assets/asset-types")
+def create_asset_type(
+    payload: AssetTypeInput,
+    portfolio_id: uuid.UUID = Query(...),
+    _: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if db.get(Portfolio, portfolio_id) is None:
+        raise HTTPException(status_code=404, detail="Subjekt nenalezen")
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Název typu je povinný")
+    if db.scalar(select(AssetType).where(AssetType.portfolio_id == portfolio_id, AssetType.name == name)) is not None:
+        raise HTTPException(status_code=409, detail="Typ s tímto názvem už existuje")
+    invalid_fields = set(payload.required_fields) - set(ASSET_REQUIRED_FIELD_CHOICES)
+    if invalid_fields:
+        raise HTTPException(status_code=400, detail=f"Neznámá pole: {', '.join(sorted(invalid_fields))}")
+    row = AssetType(portfolio_id=portfolio_id, name=name, calculation_mode=payload.calculation_mode, required_fields=payload.required_fields)
+    db.add(row)
+    db.commit()
+    return {"id": str(row.id), "name": row.name, "calculation_mode": row.calculation_mode, "required_fields": row.required_fields or []}
+
+
+@app.put("/assets/asset-types/{type_id}")
+def update_asset_type(
+    type_id: uuid.UUID,
+    payload: AssetTypeInput,
+    portfolio_id: uuid.UUID = Query(...),
+    _: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    row = db.scalar(select(AssetType).where(AssetType.id == type_id, AssetType.portfolio_id == portfolio_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Typ majetku nenalezen")
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Název typu je povinný")
+    if db.scalar(
+        select(AssetType).where(AssetType.portfolio_id == portfolio_id, AssetType.name == name, AssetType.id != type_id)
+    ) is not None:
+        raise HTTPException(status_code=409, detail="Typ s tímto názvem už existuje")
+    invalid_fields = set(payload.required_fields) - set(ASSET_REQUIRED_FIELD_CHOICES)
+    if invalid_fields:
+        raise HTTPException(status_code=400, detail=f"Neznámá pole: {', '.join(sorted(invalid_fields))}")
+    row.name = name
+    row.calculation_mode = payload.calculation_mode
+    row.required_fields = payload.required_fields
+    db.commit()
+    return {"id": str(row.id), "name": row.name, "calculation_mode": row.calculation_mode, "required_fields": row.required_fields or []}
+
+
+@app.delete("/assets/asset-types/{type_id}")
+def delete_asset_type(type_id: uuid.UUID, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    row = db.get(AssetType, type_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Typ majetku nenalezen")
+    if db.scalar(select(func.count()).select_from(Asset).where(Asset.asset_type_id == type_id)) > 0:
+        raise HTTPException(status_code=409, detail="Typ je použit u majetku, nelze jej smazat")
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted"}
+
+
+@app.get("/parties/owners")
+def list_owners(_: str = Depends(require_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    rows = db.scalars(select(Party).where(Party.kind == "owner").order_by(Party.name)).all()
+    return [{"id": str(row.id), "name": row.name} for row in rows]
+
+
+@app.post("/parties/owners")
+def create_owner(payload: OwnerInput, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Jméno vlastníka je povinné")
+    existing = db.scalar(select(Party).where(Party.name == name))
+    if existing is not None:
+        if existing.kind == "owner":
+            raise HTTPException(status_code=409, detail="Vlastník s tímto jménem už existuje")
+        if existing.kind != "unknown":
+            raise HTTPException(status_code=409, detail=f"Jméno „{name}“ už existuje jako jiný typ záznamu, nelze jej použít pro vlastníka")
+        existing.kind = "owner"
+        db.commit()
+        return {"id": str(existing.id), "name": existing.name}
+    row = Party(name=name, kind="owner")
+    db.add(row)
+    db.commit()
+    return {"id": str(row.id), "name": row.name}
+
+
+@app.delete("/parties/owners/{owner_id}")
+def delete_owner(owner_id: uuid.UUID, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    row = db.get(Party, owner_id)
+    if row is None or row.kind != "owner":
+        raise HTTPException(status_code=404, detail="Vlastník nenalezen")
+    if db.scalar(select(func.count()).select_from(Asset).where(Asset.owner_id == owner_id)) > 0:
+        raise HTTPException(status_code=409, detail="Vlastník je použit u majetku, nelze jej smazat")
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted"}
 
 
 @app.get("/assets/costs")

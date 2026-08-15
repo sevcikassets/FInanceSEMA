@@ -13,6 +13,7 @@ from .config import Settings, get_settings
 security = HTTPBearer(auto_error=False)
 ALL_AGENDAS = [
     "assets",
+    "asset_types",
     "costs",
     "categories",
     "loans",

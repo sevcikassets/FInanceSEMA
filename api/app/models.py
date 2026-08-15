@@ -95,6 +95,30 @@ class LoanMovement(Base):
     borrower: Mapped[Party | None] = relationship(foreign_keys=[borrower_id])
 
 
+class AssetType(Base):
+    """Admin-managed dictionary of asset types per Subjekt (mirrors
+    CostCategory). calculation_mode drives which interest-projection/net-worth
+    logic applies to an Asset of this type (see computed_interest_plan/
+    asset_net_worth_contribution in main.py):
+      - "none": no loan math, Asset.total_value counts toward net worth as-is
+        (a plain property, e.g. "Byt").
+      - "debt_interest": Asset.borrowed_amount is money OWED - reduces net
+        worth, gets an amortization projection (e.g. "Hypotéka").
+    required_fields is a UI-only hint (a subset of a fixed column whitelist)
+    for which fields the asset create/edit form shows as required for this
+    type - never enforced server-side, since historical/imported rows are
+    often incomplete."""
+
+    __tablename__ = "asset_types"
+    __table_args__ = (UniqueConstraint("portfolio_id", "name", name="uq_asset_types_portfolio_name"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    calculation_mode: Mapped[str] = mapped_column(String(32), default="none")
+    required_fields: Mapped[list] = mapped_column(JSONB, default=list)
+
+
 class Asset(Base):
     __tablename__ = "assets"
     __table_args__ = (UniqueConstraint("portfolio_id", "code", name="uq_assets_portfolio_code"),)
@@ -117,6 +141,14 @@ class Asset(Base):
     payment: Mapped[Decimal | None] = mapped_column(Numeric(16, 2))
     annual_interest_plan: Mapped[dict] = mapped_column(JSONB, default=dict)
     source_row: Mapped[int | None]
+    # asset_type (above) is legacy free text, kept read-only forever (never
+    # written to by new code) - asset_type_id is the dictionary-backed
+    # replacement, see AssetType. linked_asset_id is self-referential: e.g. a
+    # "Hypotéka"-typed row points at the property Asset it finances, so a
+    # mortgage is modeled as its own linked liability rather than fields
+    # bolted onto the property row.
+    asset_type_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("asset_types.id"), index=True)
+    linked_asset_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("assets.id"), index=True)
 
     owner: Mapped[Party | None] = relationship()
 

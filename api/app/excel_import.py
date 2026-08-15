@@ -11,13 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from .db import Base, SessionLocal, engine
 from .models import (
     Asset,
     AssetCost,
+    AssetType,
     CostCategory,
     DailyStatistic,
     ExchangeRate,
@@ -97,6 +98,24 @@ def get_or_create_cost_category(db: Session, portfolio_id: uuid.UUID, name: str 
     return category
 
 
+def get_or_create_asset_type(
+    db: Session, portfolio_id: uuid.UUID, name: str | None, calculation_mode: str = "none"
+) -> AssetType | None:
+    """Same get-or-create pattern as get_or_create_cost_category. calculation_mode
+    only applies when the type doesn't exist yet - an existing type's mode is
+    never overwritten by import/migration, since an admin may have deliberately
+    customized it via the "Typy majetku" agenda."""
+    if not name:
+        return None
+    existing = db.scalar(select(AssetType).where(AssetType.portfolio_id == portfolio_id, AssetType.name == name))
+    if existing:
+        return existing
+    asset_type = AssetType(portfolio_id=portfolio_id, name=name, calculation_mode=calculation_mode, required_fields=[])
+    db.add(asset_type)
+    db.flush()
+    return asset_type
+
+
 def normalize_match_text(value: str | None) -> str:
     if not value:
         return ""
@@ -110,6 +129,10 @@ def reset_imported_tables(db: Session, portfolio_id: uuid.UUID) -> None:
     # one Subjekt's property. Wiping them on every import would delete another
     # Subjekt's contributed rate/ticker history (see import_exchange_rates,
     # which upserts instead of blind-inserting for the same reason).
+    # Asset.linked_asset_id is self-referential (a Hypotéka points at the
+    # property it finances) - null it out first so the bulk delete below
+    # isn't deleting rows that still reference each other.
+    db.execute(update(Asset).where(Asset.portfolio_id == portfolio_id).values(linked_asset_id=None))
     for model in [
         DailyStatistic,
         PortfolioPosition,
@@ -176,11 +199,13 @@ def import_assets(db: Session, wb, portfolio_id: uuid.UUID) -> int:
             for c, year in year_cols
             if (value := as_decimal(ws.cell(r, c).value)) is not None
         }
+        asset_type_name = as_text(ws.cell(r, 4).value)
         asset = Asset(
             portfolio_id=portfolio_id,
             code=code,
             owner=get_or_create_party(db, as_text(ws.cell(r, 3).value), "owner"),
-            asset_type=as_text(ws.cell(r, 4).value),
+            asset_type=asset_type_name,
+            asset_type_id=get_or_create_asset_type(db, portfolio_id, asset_type_name).id if asset_type_name else None,
             name=name,
             total_value=as_decimal(ws.cell(r, 6).value),
             own_funds=as_decimal(ws.cell(r, 7).value),
@@ -196,6 +221,89 @@ def import_assets(db: Session, wb, portfolio_id: uuid.UUID) -> int:
             source_row=r,
         )
         db.add(asset)
+        count += 1
+    return count
+
+
+def move_zapujcka_assets_to_loans(db: Session, portfolio_id: uuid.UUID) -> int:
+    """"Zápůjčka" (money lent OUT, earning interest) belongs in Půjčky
+    (LoanMovement already has lender_id/borrower_id/interest_rate/
+    planned_end_date) - not in Majetek as an asset type. Moves every asset
+    still carrying the legacy free-text asset_type == "Zápůjčka" into a real
+    LoanMovement record and deletes the Asset row. Operates on the legacy
+    text column, before any asset_type_id backfill, so no orphaned
+    "Zápůjčka" AssetType ever gets created. Self-idempotent: once moved, no
+    matching Asset rows remain for a rerun to find. Also called at the end
+    of import_workbooks() so a future Excel re-import doesn't reintroduce
+    these rows until the next app restart."""
+    candidates = db.scalars(select(Asset).where(Asset.portfolio_id == portfolio_id, Asset.asset_type == "Zápůjčka")).all()
+    count = 0
+    for asset in candidates:
+        db.add(
+            LoanMovement(
+                portfolio_id=portfolio_id,
+                movement_date=asset.borrowed_from,
+                lender_id=asset.owner_id,
+                borrower=get_or_create_party(db, asset.name, "borrower"),
+                amount=asset.own_funds,
+                interest_rate=asset.interest_rate,
+                planned_end_date=asset.borrowed_to,
+                description=f"Zápůjčka (převedeno z majetku {asset.code})",
+            )
+        )
+        db.delete(asset)
+        count += 1
+    return count
+
+
+def split_debt_assets_into_linked_liability(db: Session, portfolio_id: uuid.UUID) -> int:
+    """A mortgage is a debt on a property, not a property attribute - splits
+    an Asset row that has both valuation fields (total_value/own_funds) AND
+    full loan terms into two rows: the original keeps just the valuation,
+    and a new linked "Hypotéka" Asset (calculation_mode="debt_interest")
+    carries the loan fields, pointing back via linked_asset_id.
+
+    Candidate rows must have borrowed_amount set and nonzero (excludes a
+    zero-debt property with no real loan) AND interest_rate/borrowed_from set
+    (excludes a mortgage whose terms were never filled in - same "missing
+    inputs" gate project_annual_interest already uses, and it must stay
+    calculation_mode="none" since there's nothing to project) AND
+    source_row set (only ever splits Excel-imported rows - a manually
+    created Asset via the CRUD form that deliberately keeps loan fields
+    inline must never get silently split apart on the next restart).
+
+    Self-idempotent: once split, the original's borrowed_amount becomes
+    NULL, so it no longer matches the candidate query on a rerun. Also
+    called at the end of import_workbooks() for the same reason as
+    move_zapujcka_assets_to_loans above.
+    """
+    loan_fields = ("borrowed_amount", "lender_name", "borrowed_from", "borrowed_to", "interest_rate", "loan_years", "fixed_until", "payment")
+    candidates = db.scalars(
+        select(Asset).where(
+            Asset.portfolio_id == portfolio_id,
+            Asset.borrowed_amount.isnot(None),
+            Asset.borrowed_amount != 0,
+            Asset.interest_rate.isnot(None),
+            Asset.borrowed_from.isnot(None),
+            Asset.source_row.isnot(None),
+        )
+    ).all()
+    count = 0
+    for original in candidates:
+        hypoteka_type = get_or_create_asset_type(db, portfolio_id, "Hypotéka", calculation_mode="debt_interest")
+        linked = Asset(
+            portfolio_id=portfolio_id,
+            code=f"{original.code}-HYP",
+            name=f"Hypotéka {original.name}",
+            owner_id=original.owner_id,
+            asset_type=hypoteka_type.name,
+            asset_type_id=hypoteka_type.id,
+            linked_asset_id=original.id,
+            **{field: getattr(original, field) for field in loan_fields},
+        )
+        db.add(linked)
+        for field in loan_fields:
+            setattr(original, field, None)
         count += 1
     return count
 
@@ -271,7 +379,14 @@ def import_property_costs(db: Session, path: Path, portfolio_id: uuid.UUID) -> i
         return 0
     asset = db.scalar(select(Asset).where(Asset.portfolio_id == portfolio_id, Asset.code == "RD-KVASICE"))
     if asset is None:
-        asset = Asset(portfolio_id=portfolio_id, code="RD-KVASICE", name="RD Kvasice", asset_type="Nemovitost")
+        nemovitost_type = get_or_create_asset_type(db, portfolio_id, "Nemovitost")
+        asset = Asset(
+            portfolio_id=portfolio_id,
+            code="RD-KVASICE",
+            name="RD Kvasice",
+            asset_type=nemovitost_type.name,
+            asset_type_id=nemovitost_type.id,
+        )
         db.add(asset)
         db.flush()
     ws = wb["Finance"]
@@ -513,6 +628,12 @@ def import_workbooks(finance_path: Path, property_costs_path: Path | None = None
             wb = load_workbook(finance_path, data_only=True, read_only=False, keep_vba=True)
             counts["loans"] = import_loans(db, wb, portfolio_id)
             counts["assets"] = import_assets(db, wb, portfolio_id)
+            # SessionLocal is autoflush=False (see db.py) - the two functions
+            # below query Asset via `select(...)`, which would not otherwise
+            # see import_assets()'s just-added rows yet.
+            db.flush()
+            counts["loans"] += move_zapujcka_assets_to_loans(db, portfolio_id)
+            counts["assets_split"] = split_debt_assets_into_linked_liability(db, portfolio_id)
             counts["asset_costs"] += import_asset_cost_sheets(db, wb, portfolio_id)
             counts["stock_transactions"] = import_stocks(db, wb, portfolio_id)
             counts["watchlist_stocks"] = import_watchlist_stocks(db, wb, portfolio_id)

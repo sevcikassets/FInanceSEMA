@@ -25,9 +25,10 @@ the source workbook, were never actually populated.
 
 from __future__ import annotations
 
+import calendar
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Iterable
+from typing import Iterable, TypedDict
 
 TWO_PLACES = Decimal("0.01")
 
@@ -114,3 +115,67 @@ def project_annual_interest(
         interest = cumulative_interest(pv, rate, nper, start_period, end_period)
         result[year] = Decimal(str(round(interest, 2))).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
     return result
+
+
+class SchedulePeriod(TypedDict):
+    period: int
+    date: date
+    payment: Decimal
+    principal: Decimal
+    interest: Decimal
+    balance: Decimal
+
+
+def add_months(start: date, months: int) -> date:
+    """Add whole calendar months to a date, clamping the day to the target
+    month's length (e.g. Jan 31 + 1 month -> Feb 28/29)."""
+    month_index = start.month - 1 + months
+    year = start.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(start.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def amortization_schedule(
+    pv: Decimal | float | None,
+    interest_rate: Decimal | float | None,
+    start_date: date | None,
+    loan_years: Decimal | float | None = None,
+    end_date: date | None = None,
+) -> list[SchedulePeriod]:
+    """Full monthly payment schedule for a fixed-payment loan: one row per
+    payment period with the payment split into principal/interest and the
+    remaining balance after that payment.
+
+    Same amortization model as project_annual_interest/cumulative_interest
+    (a standard fixed-payment ordinary annuity), just returned period-by-
+    period instead of summed per calendar year. Missing inputs return an
+    empty list, matching project_annual_interest's contract.
+    """
+    if not pv or not interest_rate or not start_date:
+        return []
+    nper = number_of_periods(loan_years, start_date, end_date)
+    if not nper or nper <= 0:
+        return []
+
+    principal_value = float(pv)
+    rate = monthly_rate(float(interest_rate))
+    payment = principal_value / nper if rate == 0 else principal_value * rate / (1 - (1 + rate) ** -nper)
+
+    schedule: list[SchedulePeriod] = []
+    balance = principal_value
+    for period in range(1, nper + 1):
+        interest = balance * rate if rate else 0.0
+        principal = payment - interest
+        balance -= principal
+        schedule.append(
+            {
+                "period": period,
+                "date": add_months(start_date, period),
+                "payment": Decimal(str(round(payment, 2))).quantize(TWO_PLACES, rounding=ROUND_HALF_UP),
+                "principal": Decimal(str(round(principal, 2))).quantize(TWO_PLACES, rounding=ROUND_HALF_UP),
+                "interest": Decimal(str(round(interest, 2))).quantize(TWO_PLACES, rounding=ROUND_HALF_UP),
+                "balance": Decimal(str(round(max(balance, 0.0), 2))).quantize(TWO_PLACES, rounding=ROUND_HALF_UP),
+            }
+        )
+    return schedule

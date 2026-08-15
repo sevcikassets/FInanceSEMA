@@ -24,7 +24,9 @@ import {
   Settings as SettingsIcon,
   ShieldCheck,
   Tag,
+  Tags,
   TrendingUp,
+  Users,
   WalletCards,
   X,
 } from "lucide-react";
@@ -101,6 +103,8 @@ type TwoFactorSetup = {
 
 const tabs = [
   { id: "assets", label: "Majetek", icon: Building2, endpoint: "/assets" },
+  { id: "asset_types", label: "Typy majetku", icon: Tags, endpoint: "/assets/asset-types" },
+  { id: "owners", label: "Vlastníci", icon: Users, endpoint: "/parties/owners" },
   { id: "costs", label: "Náklady", icon: WalletCards, endpoint: "/assets/costs" },
   { id: "categories", label: "Kategorie nákladů", icon: Tag, endpoint: "/assets/cost-categories" },
   { id: "loans", label: "Půjčky", icon: Coins, endpoint: "/loans/movements" },
@@ -121,7 +125,7 @@ const tabs = [
 // here - it's always visible to every logged-in user regardless of agenda
 // permissions, see visibleTabs/visibleNavGroups below.
 const navGroups = [
-  { label: "Majetek", items: ["assets", "costs", "categories"] },
+  { label: "Majetek", items: ["assets", "asset_types", "owners", "costs", "categories"] },
   { label: "Půjčky", items: ["loans"] },
   { label: "Akcie", items: ["transactions", "watchlist", "stats", "portfolio", "history", "alerts", "charts"] },
   { label: "Nastavení", items: ["rates", "subjects", "users", "settings"] },
@@ -136,20 +140,22 @@ const tabsById = Object.fromEntries(tabs.map((tab) => [tab.id, tab]));
 const STOCK_OVERVIEW_TABS = ["transactions", "watchlist", "portfolio"];
 
 // Tabs that render their own custom panel instead of the generic data table.
-const NON_TABLE_TABS = new Set(["assets", "history", "alerts", "charts", "settings", "subjects", "categories"]);
+const NON_TABLE_TABS = new Set(["assets", "history", "alerts", "charts", "settings", "subjects", "categories", "asset_types", "owners"]);
 
 // "rates" (shared CNB exchange-rate history), "users" (user management) and
 // "subjects" (Subjekt management) apply app-wide and stay governed by
 // AppUser.allowed_agendas. Every other tab is scoped per-Subjekt instead -
-// see isTabVisible below.
+// see isTabVisible below. "owners" is a third kind of thing entirely - not
+// governed by any grant at all, unconditionally visible like "settings" (see
+// isTabVisible's own special-case for it) - so it's excluded from both sets.
 const GLOBAL_AGENDAS = new Set(["rates", "users", "subjects"]);
-const PORTFOLIO_SCOPED_TABS = tabs.filter((tab) => !GLOBAL_AGENDAS.has(tab.id) && tab.id !== "settings");
+const PORTFOLIO_SCOPED_TABS = tabs.filter((tab) => !GLOBAL_AGENDAS.has(tab.id) && tab.id !== "settings" && tab.id !== "owners");
 
 const columns: Record<string, string[]> = {
   portfolio: ["ticker", "name", "quantity", "currency", "market_value_czk", "invested_czk", "profit_czk", "profit_pct"],
   assets: ["code", "owner", "asset_type", "name", "total_value", "own_funds", "borrowed_amount", "interest_rate"],
   costs: ["cost_date", "asset", "payer", "supplier", "category", "item", "amount", "actions"],
-  loans: ["period_label", "lender", "borrower", "amount", "interest_rate", "planned_end_date", "description"],
+  loans: ["period_label", "lender", "borrower", "amount", "interest_rate", "planned_end_date", "description", "actions"],
   transactions: [
     "traded_on",
     "instrument_type",
@@ -358,6 +364,23 @@ const historyColumns = [
   "profit_czk",
 ];
 
+// Kept in sync with ASSET_REQUIRED_FIELD_CHOICES in api/app/main.py - the
+// picklist an admin uses to decide which fields the asset create/edit form
+// shows as required for a given Typ majetku.
+const ASSET_REQUIRED_FIELD_CHOICES: [string, string][] = [
+  ["owner_id", "Vlastník"],
+  ["total_value", "Hodnota"],
+  ["own_funds", "Vlastní zdroje"],
+  ["borrowed_amount", "Výše úvěru"],
+  ["lender_name", "Věřitel"],
+  ["borrowed_from", "Datum čerpání"],
+  ["borrowed_to", "Datum splacení"],
+  ["interest_rate", "Úroková sazba"],
+  ["loan_years", "Délka úvěru"],
+  ["fixed_until", "Fixace do"],
+  ["payment", "Splátka"],
+];
+
 function RecalcFromField({ value, onChange }: { value: string; onChange: (value: string) => void }) {
   return (
     <div className="recalc-from">
@@ -390,6 +413,48 @@ function interestPlanEntries(asset: Row): [string, number][] {
   return Object.entries(plan as Record<string, unknown>)
     .filter((entry): entry is [string, number] => typeof entry[1] === "number")
     .sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+function assetTypeById(typeId: string, types: Row[]): Row | undefined {
+  return types.find((type) => String(type.id) === typeId);
+}
+
+// Full monthly amortization schedule (splátkový kalendář) - shared between a
+// Hypotéka-typed asset and a Půjčky movement, both fetched on demand via
+// /assets/{id}/payment-schedule or /loans/movements/{id}/payment-schedule
+// (a 30-year loan is 360 rows, too much to eagerly load with every list).
+function PaymentScheduleTable({ rows }: { rows: Row[] }) {
+  if (rows.length === 0) {
+    return <p className="alert-empty">Pro splátkový kalendář chybí potřebné údaje (částka, úrok, datum).</p>;
+  }
+  return (
+    <div className="table-wrap payment-schedule-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Měsíc</th>
+            <th>Datum</th>
+            <th>Splátka</th>
+            <th>Úrok</th>
+            <th>Jistina</th>
+            <th>Zůstatek</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={String(row.period)}>
+              <td className="numeric-cell">{String(row.period)}</td>
+              <td>{formatValue("date", row.date)}</td>
+              <td className="numeric-cell">{formatValue("payment", row.payment)}</td>
+              <td className="numeric-cell">{formatValue("interest", row.interest)}</td>
+              <td className="numeric-cell">{formatValue("principal", row.principal)}</td>
+              <td className="numeric-cell">{formatValue("balance", row.balance)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 type ChartPoint = { date: string; [key: string]: number | string };
@@ -914,6 +979,39 @@ export default function Page() {
   const [costBusy, setCostBusy] = useState(false);
   const [costStatus, setCostStatus] = useState<string | null>(null);
   const [costAttachmentBusy, setCostAttachmentBusy] = useState<string | null>(null);
+  const [assetTypesList, setAssetTypesList] = useState<Row[]>([]);
+  const [ownersList, setOwnersList] = useState<Row[]>([]);
+  const [editingAssetId, setEditingAssetId] = useState<string | null>(null);
+  const [assetDraft, setAssetDraft] = useState({
+    code: "",
+    name: "",
+    owner_id: "",
+    asset_type_id: "",
+    linked_asset_id: "",
+    total_value: "",
+    own_funds: "",
+    borrowed_amount: "",
+    lender_name: "",
+    borrowed_from: "",
+    borrowed_to: "",
+    interest_rate: "",
+    loan_years: "",
+    fixed_until: "",
+    payment: "",
+  });
+  const [assetBusy, setAssetBusy] = useState(false);
+  const [assetStatus, setAssetStatus] = useState<string | null>(null);
+  const [assetSchedule, setAssetSchedule] = useState<{ forId: string; rows: Row[] } | null>(null);
+  const [assetScheduleBusy, setAssetScheduleBusy] = useState<string | null>(null);
+  const [newAssetTypeDraft, setNewAssetTypeDraft] = useState({ name: "", calculation_mode: "none", required_fields: [] as string[] });
+  const [editingAssetTypeId, setEditingAssetTypeId] = useState<string | null>(null);
+  const [assetTypeBusy, setAssetTypeBusy] = useState(false);
+  const [assetTypeStatus, setAssetTypeStatus] = useState<string | null>(null);
+  const [newOwnerName, setNewOwnerName] = useState("");
+  const [ownerBusy, setOwnerBusy] = useState(false);
+  const [ownerStatus, setOwnerStatus] = useState<string | null>(null);
+  const [loanSchedule, setLoanSchedule] = useState<{ forId: string; rows: Row[] } | null>(null);
+  const [loanScheduleBusy, setLoanScheduleBusy] = useState<string | null>(null);
   const allowedAgendaSet = useMemo(
     () => new Set(currentUser?.is_admin ? tabs.map((tab) => tab.id) : currentUser?.allowed_agendas || tabs.map((tab) => tab.id)),
     [currentUser],
@@ -939,7 +1037,7 @@ export default function Page() {
   // reconciliation effect below redirects away from the default tab before
   // the real Subjekt grants are even known.
   const isTabVisible = (tabId: string) =>
-    tabId === "settings"
+    tabId === "settings" || tabId === "owners"
       ? true
       : GLOBAL_AGENDAS.has(tabId)
         ? allowedAgendaSet.has(tabId)
@@ -1086,9 +1184,10 @@ export default function Page() {
 
   async function loadAll() {
     if (!token) return;
-    // "rates"/"users"/"settings" don't need a Subjekt at all - every other
-    // tab does, and there's nothing to load yet if the user has none.
-    const tabNeedsPortfolio = !GLOBAL_AGENDAS.has(activeTab) && activeTab !== "settings";
+    // "rates"/"users"/"settings"/"owners" don't need a Subjekt at all -
+    // every other tab does, and there's nothing to load yet if the user has
+    // none. ("owners" is global Party data, same reasoning as "rates".)
+    const tabNeedsPortfolio = !GLOBAL_AGENDAS.has(activeTab) && activeTab !== "settings" && activeTab !== "owners";
     if (tabNeedsPortfolio && !activePortfolioId) return;
     // Guards against an older, slower-to-resolve loadAll() (e.g. from the
     // previously active tab) overwriting rows/summary/etc. with stale data
@@ -1115,6 +1214,10 @@ export default function Page() {
       // neither is present in `rows` while on the "costs" tab, since that's
       // populated from /assets/costs, not /assets or /assets/cost-categories.
       const needsCostExtras = activeTab === "costs";
+      // The asset create/edit form needs the type dictionary (for the type
+      // picker) and the owner registry (for the owner picker) - neither is
+      // present in `rows` while on the "assets" tab.
+      const needsAssetExtras = activeTab === "assets";
       const requests: Promise<unknown>[] = [activePortfolioId ? api(withPortfolio("/summary")) : Promise.resolve(null)];
       if (needsRows) requests.push(api(withPortfolio(active.endpoint)));
       if (activeTab === "rates") requests.push(api("/rates/latest"));
@@ -1122,6 +1225,7 @@ export default function Page() {
       if (needsAlerts) requests.push(api(withPortfolio("/stocks/alerts")));
       if (needsPortfolioList) requests.push(api("/portfolios"));
       if (needsCostExtras) requests.push(api(withPortfolio("/assets")), api(withPortfolio("/assets/cost-categories")));
+      if (needsAssetExtras) requests.push(api(withPortfolio("/assets/asset-types")), api("/parties/owners"));
       const [summaryData, ...rest] = await Promise.all(requests);
       if (latestLoadRequestRef.current !== requestId) return;
       setSummary(summaryData as Summary | null);
@@ -1134,6 +1238,10 @@ export default function Page() {
       if (needsCostExtras) {
         setCostAssetsList(rest[restIndex++] as Row[]);
         setCostCategoriesList(rest[restIndex++] as Row[]);
+      }
+      if (needsAssetExtras) {
+        setAssetTypesList(rest[restIndex++] as Row[]);
+        setOwnersList(rest[restIndex++] as Row[]);
       }
     } catch (err) {
       if (latestLoadRequestRef.current !== requestId) return;
@@ -1664,6 +1772,233 @@ export default function Page() {
     }
   }
 
+  function openNewAssetForm() {
+    setEditingAssetId("__new__");
+    setAssetDraft({
+      code: "",
+      name: "",
+      owner_id: "",
+      asset_type_id: "",
+      linked_asset_id: "",
+      total_value: "",
+      own_funds: "",
+      borrowed_amount: "",
+      lender_name: "",
+      borrowed_from: "",
+      borrowed_to: "",
+      interest_rate: "",
+      loan_years: "",
+      fixed_until: "",
+      payment: "",
+    });
+    setAssetStatus(null);
+  }
+
+  function openAssetEditor(row: Row) {
+    setEditingAssetId(String(row.id));
+    setAssetDraft({
+      code: row.code ? String(row.code) : "",
+      name: row.name ? String(row.name) : "",
+      owner_id: row.owner_id ? String(row.owner_id) : "",
+      asset_type_id: row.asset_type_id ? String(row.asset_type_id) : "",
+      linked_asset_id: row.linked_asset_id ? String(row.linked_asset_id) : "",
+      total_value: row.total_value != null ? String(row.total_value) : "",
+      own_funds: row.own_funds != null ? String(row.own_funds) : "",
+      borrowed_amount: row.borrowed_amount != null ? String(row.borrowed_amount) : "",
+      lender_name: row.lender_name ? String(row.lender_name) : "",
+      borrowed_from: row.borrowed_from ? String(row.borrowed_from) : "",
+      borrowed_to: row.borrowed_to ? String(row.borrowed_to) : "",
+      interest_rate: row.interest_rate != null ? String(row.interest_rate) : "",
+      loan_years: row.loan_years != null ? String(row.loan_years) : "",
+      fixed_until: row.fixed_until ? String(row.fixed_until) : "",
+      payment: row.payment != null ? String(row.payment) : "",
+    });
+    setAssetStatus(null);
+  }
+
+  function closeAssetEditor() {
+    setEditingAssetId(null);
+  }
+
+  async function saveAssetDraft(event: React.FormEvent) {
+    event.preventDefault();
+    if (!assetDraft.code.trim() || !assetDraft.name.trim() || !editingAssetId) return;
+    setAssetBusy(true);
+    setAssetStatus(null);
+    try {
+      const payload = {
+        code: assetDraft.code.trim(),
+        name: assetDraft.name.trim(),
+        owner_id: assetDraft.owner_id || null,
+        asset_type_id: assetDraft.asset_type_id || null,
+        linked_asset_id: assetDraft.linked_asset_id || null,
+        total_value: assetDraft.total_value.trim() ? Number(assetDraft.total_value) : null,
+        own_funds: assetDraft.own_funds.trim() ? Number(assetDraft.own_funds) : null,
+        borrowed_amount: assetDraft.borrowed_amount.trim() ? Number(assetDraft.borrowed_amount) : null,
+        lender_name: assetDraft.lender_name.trim() || null,
+        borrowed_from: assetDraft.borrowed_from || null,
+        borrowed_to: assetDraft.borrowed_to || null,
+        interest_rate: assetDraft.interest_rate.trim() ? Number(assetDraft.interest_rate) : null,
+        loan_years: assetDraft.loan_years.trim() ? Number(assetDraft.loan_years) : null,
+        fixed_until: assetDraft.fixed_until || null,
+        payment: assetDraft.payment.trim() ? Number(assetDraft.payment) : null,
+      };
+      if (editingAssetId === "__new__") {
+        await api(withPortfolio("/assets"), { method: "POST", body: JSON.stringify(payload) });
+      } else {
+        await api(withPortfolio(`/assets/${editingAssetId}`), { method: "PUT", body: JSON.stringify(payload) });
+      }
+      setEditingAssetId(null);
+      await loadAll();
+    } catch (err) {
+      setAssetStatus(err instanceof Error ? err.message : "Uložení majetku se nezdařilo");
+    } finally {
+      setAssetBusy(false);
+    }
+  }
+
+  async function deleteAsset(assetId: string) {
+    setAssetBusy(true);
+    setError(null);
+    try {
+      await api(withPortfolio(`/assets/${assetId}`), { method: "DELETE" });
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Smazání majetku se nezdařilo");
+    } finally {
+      setAssetBusy(false);
+    }
+  }
+
+  async function viewAssetSchedule(assetId: string) {
+    if (assetSchedule?.forId === assetId) {
+      setAssetSchedule(null);
+      return;
+    }
+    setAssetScheduleBusy(assetId);
+    setError(null);
+    try {
+      const result = (await api(withPortfolio(`/assets/${assetId}/payment-schedule`))) as Row[];
+      setAssetSchedule({ forId: assetId, rows: result });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Načtení splátkového kalendáře se nezdařilo");
+    } finally {
+      setAssetScheduleBusy(null);
+    }
+  }
+
+  function openNewAssetTypeForm() {
+    setEditingAssetTypeId("__new__");
+    setNewAssetTypeDraft({ name: "", calculation_mode: "none", required_fields: [] });
+    setAssetTypeStatus(null);
+  }
+
+  function openAssetTypeEditor(row: Row) {
+    setEditingAssetTypeId(String(row.id));
+    setNewAssetTypeDraft({
+      name: row.name ? String(row.name) : "",
+      calculation_mode: row.calculation_mode ? String(row.calculation_mode) : "none",
+      required_fields: Array.isArray(row.required_fields) ? (row.required_fields as string[]) : [],
+    });
+    setAssetTypeStatus(null);
+  }
+
+  function closeAssetTypeEditor() {
+    setEditingAssetTypeId(null);
+  }
+
+  function toggleAssetTypeRequiredField(field: string) {
+    setNewAssetTypeDraft((value) => ({
+      ...value,
+      required_fields: value.required_fields.includes(field)
+        ? value.required_fields.filter((f) => f !== field)
+        : [...value.required_fields, field],
+    }));
+  }
+
+  async function saveAssetTypeDraft(event: React.FormEvent) {
+    event.preventDefault();
+    if (!newAssetTypeDraft.name.trim() || !editingAssetTypeId) return;
+    setAssetTypeBusy(true);
+    setAssetTypeStatus(null);
+    try {
+      const payload = {
+        name: newAssetTypeDraft.name.trim(),
+        calculation_mode: newAssetTypeDraft.calculation_mode,
+        required_fields: newAssetTypeDraft.required_fields,
+      };
+      if (editingAssetTypeId === "__new__") {
+        await api(withPortfolio("/assets/asset-types"), { method: "POST", body: JSON.stringify(payload) });
+      } else {
+        await api(withPortfolio(`/assets/asset-types/${editingAssetTypeId}`), { method: "PUT", body: JSON.stringify(payload) });
+      }
+      setEditingAssetTypeId(null);
+      await loadAll();
+    } catch (err) {
+      setAssetTypeStatus(err instanceof Error ? err.message : "Uložení typu se nezdařilo");
+    } finally {
+      setAssetTypeBusy(false);
+    }
+  }
+
+  async function deleteAssetType(typeId: string) {
+    setAssetTypeBusy(true);
+    setAssetTypeStatus(null);
+    try {
+      await api(`/assets/asset-types/${typeId}`, { method: "DELETE" });
+      await loadAll();
+    } catch (err) {
+      setAssetTypeStatus(err instanceof Error ? err.message : "Smazání typu se nezdařilo");
+    } finally {
+      setAssetTypeBusy(false);
+    }
+  }
+
+  async function createOwner(event: React.FormEvent) {
+    event.preventDefault();
+    setOwnerStatus(null);
+    setOwnerBusy(true);
+    try {
+      await api("/parties/owners", { method: "POST", body: JSON.stringify({ name: newOwnerName.trim() }) });
+      setNewOwnerName("");
+      await loadAll();
+    } catch (err) {
+      setOwnerStatus(err instanceof Error ? err.message : "Vlastníka se nepodařilo vytvořit");
+    } finally {
+      setOwnerBusy(false);
+    }
+  }
+
+  async function deleteOwner(ownerId: string) {
+    setOwnerStatus(null);
+    setOwnerBusy(true);
+    try {
+      await api(`/parties/owners/${ownerId}`, { method: "DELETE" });
+      await loadAll();
+    } catch (err) {
+      setOwnerStatus(err instanceof Error ? err.message : "Vlastníka se nepodařilo smazat");
+    } finally {
+      setOwnerBusy(false);
+    }
+  }
+
+  async function viewLoanSchedule(movementId: string) {
+    if (loanSchedule?.forId === movementId) {
+      setLoanSchedule(null);
+      return;
+    }
+    setLoanScheduleBusy(movementId);
+    setError(null);
+    try {
+      const result = (await api(withPortfolio(`/loans/movements/${movementId}/payment-schedule`))) as Row[];
+      setLoanSchedule({ forId: movementId, rows: result });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Načtení splátkového kalendáře se nezdařilo");
+    } finally {
+      setLoanScheduleBusy(null);
+    }
+  }
+
   async function cleanupLoanSubtotals() {
     setError(null);
     setLoanCleanupStatus(null);
@@ -1951,6 +2286,10 @@ export default function Page() {
               <span>Náklady</span>
               <strong>{money(summary.asset_costs_total)}</strong>
             </div>
+            <div>
+              <span>Půjčky</span>
+              <strong>{money(summary.loans_total)}</strong>
+            </div>
           </section>
         )}
 
@@ -2105,6 +2444,143 @@ export default function Page() {
                   </div>
                 </form>
               </div>
+            )}
+          </section>
+        )}
+
+        {activeTab === "asset_types" && (
+          <section className="work-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Typy majetku</h2>
+                <p>
+                  Číselník typů majetku (Byt, Hypotéka, Zápůjčka, …). Každý typ určuje, jestli se počítá úroková
+                  projekce (a z jakého pole) a která pole formulář majetku zobrazí jako povinná. Přidávat, upravovat a
+                  mazat může jen administrátor.
+                </p>
+              </div>
+              {currentUser?.is_admin && (
+                <button className="action-button" onClick={openNewAssetTypeForm}>
+                  <span>+ Přidat typ</span>
+                </button>
+              )}
+            </div>
+            {assetTypeStatus && <div className="success-notice">{assetTypeStatus}</div>}
+            <div className="portfolio-list">
+              {rows
+                .filter((row) => typeof row.name === "string")
+                .map((row) => (
+                  <div className="portfolio-row" key={String(row.id)}>
+                    <span>
+                      {String(row.name)}
+                      {row.calculation_mode === "debt_interest" && <span className="type-badge"> úrok z dluhu</span>}
+                    </span>
+                    {currentUser?.is_admin && (
+                      <>
+                        <button type="button" className="link-button" onClick={() => openAssetTypeEditor(row)}>
+                          Upravit
+                        </button>
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={() => deleteAssetType(String(row.id))}
+                          disabled={assetTypeBusy}
+                        >
+                          Smazat
+                        </button>
+                      </>
+                    )}
+                  </div>
+                ))}
+              {rows.length === 0 && <p className="alert-empty">Zatím žádné typy.</p>}
+            </div>
+            {editingAssetTypeId && currentUser?.is_admin && (
+              <div className="access-editor">
+                <p>{editingAssetTypeId === "__new__" ? "Nový typ majetku:" : "Úprava typu majetku:"}</p>
+                <form className="cost-form-grid" onSubmit={saveAssetTypeDraft}>
+                  <label>
+                    Název
+                    <input
+                      value={newAssetTypeDraft.name}
+                      onChange={(event) => setNewAssetTypeDraft((value) => ({ ...value, name: event.target.value }))}
+                      required
+                    />
+                  </label>
+                  <label>
+                    Jak se počítá
+                    <select
+                      value={newAssetTypeDraft.calculation_mode}
+                      onChange={(event) => setNewAssetTypeDraft((value) => ({ ...value, calculation_mode: event.target.value }))}
+                    >
+                      <option value="none">Žádný výpočet</option>
+                      <option value="debt_interest">Úrok z dluhu (majetek platí úrok, snižuje jmění)</option>
+                    </select>
+                  </label>
+                  <div className="cost-form-note">
+                    <span className="field-hint">Povinná pole formuláře majetku pro tento typ:</span>
+                    <div className="permissions-grid">
+                      {ASSET_REQUIRED_FIELD_CHOICES.map(([field, label]) => (
+                        <label className="checkbox-row" key={field}>
+                          <input
+                            type="checkbox"
+                            checked={newAssetTypeDraft.required_fields.includes(field)}
+                            onChange={() => toggleAssetTypeRequiredField(field)}
+                          />
+                          {label}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="stock-actions cost-form-note">
+                    <button className="action-button" type="submit" disabled={assetTypeBusy || !newAssetTypeDraft.name.trim()}>
+                      <Save size={16} />
+                      <span>Uložit typ</span>
+                    </button>
+                    <button type="button" className="link-button" onClick={closeAssetTypeEditor}>
+                      Zrušit
+                    </button>
+                  </div>
+                </form>
+              </div>
+            )}
+          </section>
+        )}
+
+        {activeTab === "owners" && (
+          <section className="work-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Vlastníci</h2>
+                <p>Evidence vlastníků majetku, sdílená napříč všemi Subjekty. Přidávat a mazat může jen administrátor.</p>
+              </div>
+            </div>
+            {ownerStatus && <div className="success-notice">{ownerStatus}</div>}
+            <div className="portfolio-list">
+              {rows
+                .filter((row) => typeof row.name === "string")
+                .map((row) => (
+                  <div className="portfolio-row" key={String(row.id)}>
+                    <span>{String(row.name)}</span>
+                    {currentUser?.is_admin && (
+                      <button type="button" className="link-button" onClick={() => deleteOwner(String(row.id))} disabled={ownerBusy}>
+                        Smazat
+                      </button>
+                    )}
+                  </div>
+                ))}
+              {rows.length === 0 && <p className="alert-empty">Zatím žádní vlastníci.</p>}
+            </div>
+            {currentUser?.is_admin && (
+              <form className="rate-form" onSubmit={createOwner}>
+                <label>
+                  Nový vlastník
+                  <input value={newOwnerName} onChange={(event) => setNewOwnerName(event.target.value)} placeholder="Např. Martin" />
+                </label>
+                <button className="action-button" type="submit" disabled={ownerBusy || !newOwnerName.trim()}>
+                  <Save size={16} />
+                  <span>Vytvořit vlastníka</span>
+                </button>
+              </form>
             )}
           </section>
         )}
@@ -2897,12 +3373,175 @@ export default function Page() {
           </section>
         )}
 
-        {activeTab === "assets" && rows.length > 0 && (
+        {activeTab === "assets" && (
           <section className="asset-agendas">
             <div className="section-heading">
-              <h2>Evidence majetku</h2>
-              <p>Přehled majetku s celkovou rekapitulací hodnot u každé položky. Náklady jsou v samostatné záložce Náklady.</p>
+              <div>
+                <h2>Evidence majetku</h2>
+                <p>Přehled majetku s celkovou rekapitulací hodnot u každé položky. Náklady jsou v samostatné záložce Náklady.</p>
+              </div>
+              <button className="action-button" onClick={openNewAssetForm}>
+                <span>+ Přidat majetek</span>
+              </button>
             </div>
+            {editingAssetId && (
+              <div className="access-editor">
+                <p>{editingAssetId === "__new__" ? "Nový majetek:" : "Úprava majetku:"}</p>
+                <form className="cost-form-grid" onSubmit={saveAssetDraft}>
+                  <label>
+                    Kód
+                    <input value={assetDraft.code} onChange={(event) => setAssetDraft((value) => ({ ...value, code: event.target.value }))} required />
+                  </label>
+                  <label>
+                    Název
+                    <input value={assetDraft.name} onChange={(event) => setAssetDraft((value) => ({ ...value, name: event.target.value }))} required />
+                  </label>
+                  <label>
+                    Vlastník
+                    <select value={assetDraft.owner_id} onChange={(event) => setAssetDraft((value) => ({ ...value, owner_id: event.target.value }))}>
+                      <option value="">Bez vlastníka</option>
+                      {ownersList.map((owner) => (
+                        <option value={String(owner.id)} key={String(owner.id)}>
+                          {String(owner.name)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Typ majetku
+                    <select
+                      value={assetDraft.asset_type_id}
+                      onChange={(event) => setAssetDraft((value) => ({ ...value, asset_type_id: event.target.value }))}
+                    >
+                      <option value="">Bez typu</option>
+                      {assetTypesList.map((type) => (
+                        <option value={String(type.id)} key={String(type.id)}>
+                          {String(type.name)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Hodnota
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={assetDraft.total_value}
+                      onChange={(event) => setAssetDraft((value) => ({ ...value, total_value: event.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Vlastní zdroje
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={assetDraft.own_funds}
+                      onChange={(event) => setAssetDraft((value) => ({ ...value, own_funds: event.target.value }))}
+                    />
+                  </label>
+                  {(assetTypeById(assetDraft.asset_type_id, assetTypesList)?.calculation_mode === "debt_interest" ||
+                    assetDraft.linked_asset_id ||
+                    assetDraft.borrowed_amount ||
+                    assetDraft.interest_rate) && (
+                    <>
+                      <label>
+                        Navázaný majetek (financuje)
+                        <select
+                          value={assetDraft.linked_asset_id}
+                          onChange={(event) => setAssetDraft((value) => ({ ...value, linked_asset_id: event.target.value }))}
+                        >
+                          <option value="">Bez vazby</option>
+                          {rows
+                            .filter((row) => String(row.id) !== editingAssetId)
+                            .map((row) => (
+                              <option value={String(row.id)} key={String(row.id)}>
+                                {String(row.code)} — {String(row.name)}
+                              </option>
+                            ))}
+                        </select>
+                      </label>
+                      <label>
+                        Výše úvěru
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={assetDraft.borrowed_amount}
+                          onChange={(event) => setAssetDraft((value) => ({ ...value, borrowed_amount: event.target.value }))}
+                        />
+                      </label>
+                      <label>
+                        Úroková sazba
+                        <input
+                          type="number"
+                          step="0.0001"
+                          value={assetDraft.interest_rate}
+                          onChange={(event) => setAssetDraft((value) => ({ ...value, interest_rate: event.target.value }))}
+                        />
+                      </label>
+                      <label>
+                        Délka úvěru (roky)
+                        <input
+                          type="number"
+                          step="0.5"
+                          value={assetDraft.loan_years}
+                          onChange={(event) => setAssetDraft((value) => ({ ...value, loan_years: event.target.value }))}
+                        />
+                      </label>
+                      <label>
+                        Datum čerpání
+                        <input
+                          type="date"
+                          value={assetDraft.borrowed_from}
+                          onChange={(event) => setAssetDraft((value) => ({ ...value, borrowed_from: event.target.value }))}
+                        />
+                      </label>
+                      <label>
+                        Datum splacení
+                        <input
+                          type="date"
+                          value={assetDraft.borrowed_to}
+                          onChange={(event) => setAssetDraft((value) => ({ ...value, borrowed_to: event.target.value }))}
+                        />
+                      </label>
+                      <label>
+                        Věřitel
+                        <input
+                          value={assetDraft.lender_name}
+                          onChange={(event) => setAssetDraft((value) => ({ ...value, lender_name: event.target.value }))}
+                        />
+                      </label>
+                      <label>
+                        Fixace do
+                        <input
+                          type="date"
+                          value={assetDraft.fixed_until}
+                          onChange={(event) => setAssetDraft((value) => ({ ...value, fixed_until: event.target.value }))}
+                        />
+                      </label>
+                      <label>
+                        Splátka
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={assetDraft.payment}
+                          onChange={(event) => setAssetDraft((value) => ({ ...value, payment: event.target.value }))}
+                        />
+                      </label>
+                    </>
+                  )}
+                  {assetStatus && <div className="success-notice cost-form-note">{assetStatus}</div>}
+                  <div className="stock-actions cost-form-note">
+                    <button className="action-button" type="submit" disabled={assetBusy || !assetDraft.code.trim() || !assetDraft.name.trim()}>
+                      <Save size={16} />
+                      <span>Uložit majetek</span>
+                    </button>
+                    <button type="button" className="link-button" onClick={closeAssetEditor}>
+                      Zrušit
+                    </button>
+                  </div>
+                </form>
+              </div>
+            )}
             {rows.map((asset) => (
               <article className="asset-agenda" key={String(asset.id || asset.code)}>
                 <header>
@@ -2911,6 +3550,9 @@ export default function Page() {
                     <p>
                       {String(asset.code || "")} · {String(asset.owner || "Bez vlastníka")} · {String(asset.asset_type || "Bez typu")}
                     </p>
+                    {asset.linked_asset && (
+                      <p className="field-hint">Financuje: {String(asset.linked_asset_code || "")} — {String(asset.linked_asset)}</p>
+                    )}
                   </div>
                   <div className="agenda-metrics">
                     <div>
@@ -2925,8 +3567,31 @@ export default function Page() {
                       <span>Úvěr</span>
                       <strong>{formatValue("borrowed_amount", asset.borrowed_amount)}</strong>
                     </div>
+                    <div>
+                      <span>Čistý dopad na jmění</span>
+                      <strong className={numberValue(asset.net_worth_contribution) >= 0 ? "positive" : "negative"}>
+                        {formatValue("net_worth_contribution", asset.net_worth_contribution)}
+                      </strong>
+                    </div>
                   </div>
                 </header>
+                <div className="cost-row-actions asset-agenda-actions">
+                  <button type="button" className="link-button" onClick={() => openAssetEditor(asset)}>
+                    Upravit
+                  </button>
+                  <button type="button" className="link-button" onClick={() => deleteAsset(String(asset.id))} disabled={assetBusy}>
+                    Smazat
+                  </button>
+                  {asset.calculation_mode === "debt_interest" && (
+                    <button type="button" className="link-button" onClick={() => viewAssetSchedule(String(asset.id))}>
+                      {assetScheduleBusy === String(asset.id)
+                        ? "Načítám…"
+                        : assetSchedule?.forId === String(asset.id)
+                          ? "Skrýt splátkový kalendář"
+                          : "Zobrazit splátkový kalendář"}
+                    </button>
+                  )}
+                </div>
                 {interestPlanEntries(asset).length > 0 && (
                   <div className="interest-plan">
                     <h3>Dopočtená projekce úroku (2026–2055)</h3>
@@ -2940,6 +3605,7 @@ export default function Page() {
                     </div>
                   </div>
                 )}
+                {assetSchedule?.forId === String(asset.id) && <PaymentScheduleTable rows={assetSchedule.rows} />}
               </article>
             ))}
           </section>
@@ -2980,7 +3646,7 @@ export default function Page() {
                 return (
                   <tr
                     className={`${String(row.row_kind || "")}${isClickableSummary ? " clickable-row" : ""}`}
-                    key={String(row.id || row.ticker || row.stat_date || row.year_key || row.month_key || row.period_label || index)}
+                    key={String(row.id || row.ticker || row.stat_date || row.month_key || row.year_key || row.period_label || index)}
                     onClick={handleRowClick}
                   >
                     {(columns[activeTab] || []).map((col, colIndex) => (
@@ -3029,6 +3695,23 @@ export default function Page() {
                               )}
                             </div>
                           ) : null
+                        ) : col === "actions" && activeTab === "loans" ? (
+                          row.row_kind === "detail" ? (
+                            <button
+                              type="button"
+                              className="link-button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                viewLoanSchedule(String(row.id));
+                              }}
+                            >
+                              {loanScheduleBusy === String(row.id)
+                                ? "Načítám…"
+                                : loanSchedule?.forId === String(row.id)
+                                  ? "Skrýt splátkový kalendář"
+                                  : "Splátkový kalendář"}
+                            </button>
+                          ) : null
                         ) : isClickableSummary && colIndex === 0 ? (
                           <span className={`stat-month-toggle${isLoanMonthSummary ? " nested-toggle" : ""}`}>
                             {summaryExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
@@ -3051,6 +3734,42 @@ export default function Page() {
             </tbody>
           </table>
         </section>
+        )}
+
+        {activeTab === "loans" && loanSchedule && (
+          <section className="work-panel compact-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Splátkový kalendář pohybu</h2>
+                <p>Měsíční rozpis splátky na úrok a jistinu.</p>
+              </div>
+              <button type="button" className="link-button" onClick={() => setLoanSchedule(null)}>
+                Zavřít
+              </button>
+            </div>
+            {(() => {
+              const movement = rows.find((row) => String(row.id) === loanSchedule.forId);
+              const planEntries = movement ? interestPlanEntries(movement) : [];
+              return (
+                <>
+                  {planEntries.length > 0 && (
+                    <div className="interest-plan">
+                      <h3>Dopočtená projekce úroku (2026–2055)</h3>
+                      <div className="interest-plan-grid">
+                        {planEntries.map(([year, amount]) => (
+                          <div key={year}>
+                            <span>{year}</span>
+                            <strong>{formatValue("amount", amount)}</strong>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  <PaymentScheduleTable rows={loanSchedule.rows} />
+                </>
+              );
+            })()}
+          </section>
         )}
       </section>
     </main>

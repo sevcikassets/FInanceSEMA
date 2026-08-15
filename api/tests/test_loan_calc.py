@@ -4,6 +4,8 @@ from datetime import date
 from decimal import Decimal
 
 from app.loan_calc import (
+    add_months,
+    amortization_schedule,
     cumulative_interest,
     monthly_rate,
     number_of_periods,
@@ -89,3 +91,49 @@ def test_project_annual_interest_sums_to_full_term_interest():
     assert projection[2026] > 0
     # Years past the loan term must not appear.
     assert 2044 not in projection
+
+
+def test_add_months_clamps_day_to_target_month_length():
+    assert add_months(date(2024, 1, 31), 1) == date(2024, 2, 29)  # 2024 is a leap year
+    assert add_months(date(2023, 1, 31), 1) == date(2023, 2, 28)
+    assert add_months(date(2024, 1, 15), 12) == date(2025, 1, 15)
+    assert add_months(date(2024, 10, 1), 3) == date(2025, 1, 1)
+
+
+def test_amortization_schedule_empty_without_loan_params():
+    assert amortization_schedule(None, None, None) == []
+    assert amortization_schedule(Decimal("100000"), None, date(2024, 1, 1)) == []
+
+
+def test_amortization_schedule_matches_real_mortgage_shape():
+    # Same figures as the real "004/26-HYP" Hypotéka row this feature was
+    # built around - a good end-to-end sanity check for the whole formula,
+    # not just an isolated edge case.
+    schedule = amortization_schedule(
+        pv=Decimal("4506000"),
+        interest_rate=Decimal("0.0489"),
+        start_date=date(2026, 7, 1),
+        loan_years=Decimal("15"),
+    )
+    assert len(schedule) == 180  # 15 years * 12
+    assert schedule[0]["date"] == date(2026, 8, 1)
+    assert schedule[-1]["balance"] == Decimal("0.00")
+    # Every payment should be identical (fixed-payment annuity).
+    assert len({row["payment"] for row in schedule}) == 1
+    # Sum of principal across every period must equal the original principal
+    # (within a few cents of rounding drift across 180 periods).
+    total_principal = sum(row["principal"] for row in schedule)
+    assert abs(total_principal - Decimal("4506000")) < Decimal("1.00")
+    # Interest paid should decrease and principal paid should increase over
+    # time, as the outstanding balance amortizes down.
+    assert schedule[0]["interest"] > schedule[-1]["interest"]
+    assert schedule[0]["principal"] < schedule[-1]["principal"]
+
+
+def test_amortization_schedule_zero_interest_rate_returns_empty():
+    # Same "falsy input -> []" contract as project_annual_interest - a
+    # Decimal("0") interest_rate is falsy, so this short-circuits before any
+    # computation (matching the existing project_annual_interest guard this
+    # function was deliberately written to mirror), not a flat 0%-interest
+    # schedule.
+    assert amortization_schedule(pv=Decimal("120000"), interest_rate=Decimal("0"), start_date=date(2024, 1, 1), loan_years=1) == []

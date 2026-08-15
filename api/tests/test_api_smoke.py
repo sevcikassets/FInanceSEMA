@@ -147,16 +147,25 @@ def test_build_ticker_history_accumulates_purchases(db_session, portfolio_id, mo
 
 @requires_db
 def test_asset_endpoints_expose_computed_interest_plan(client, portfolio_id):
-    from app.models import Asset
+    from app.models import Asset, AssetType
     from app.db import SessionLocal
 
     session = SessionLocal()
     try:
+        # computed_interest_plan only runs for a "debt_interest"-typed asset
+        # (see asset_net_worth_contribution/computed_interest_plan in
+        # main.py) - a "none"-mode asset with the same loan fields filled
+        # must NOT get a projection (test_computed_interest_plan_requires_debt_interest_mode
+        # below covers that regression explicitly).
+        asset_type = AssetType(portfolio_id=portfolio_id, name="Hypotéka", calculation_mode="debt_interest")
+        session.add(asset_type)
+        session.flush()
         asset = Asset(
             portfolio_id=portfolio_id,
             code="TEST-01",
             name="Testovaci byt",
             asset_type="Byt",
+            asset_type_id=asset_type.id,
             total_value=Decimal("5000000"),
             own_funds=Decimal("1000000"),
             borrowed_amount=Decimal("4000000"),
