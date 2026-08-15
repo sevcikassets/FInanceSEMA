@@ -58,9 +58,18 @@ Pro lokalni import je potreba soubory zkopirovat nebo namountovat do kontejneru.
 
 ## Testy
 
+Testovaci sada pred/po kazdem testu **smaze a znovu vytvori vsechny tabulky**
+(`api/tests/conftest.py`), takze musi bezet proti samostatne testovaci
+databazi, nikdy proti sdilene dev/produkcni. `docker compose exec api` dedi
+`DATABASE_URL` primo z `api` sluzby (viz `docker-compose.yml`), takze bez
+explicitniho `TEST_DATABASE_URL` by testy smazaly realna importovana data -
+presne to se pri vyvoji stalo. `conftest.py` proto pred kazdym DB testem
+overuje, ze nazev databaze obsahuje "test", a jinak rovnou selze.
+
 ```powershell
+docker compose exec db createdb -U finance finance_sema_test  # jen poprve
 docker compose exec api pip install -r requirements-dev.txt
-docker compose exec api pytest
+docker compose exec -e TEST_DATABASE_URL=postgresql+psycopg://finance:finance@db:5432/finance_sema_test api pytest
 ```
 
 Testy pracujici s databazi (`api/tests/test_api_smoke.py`) se automaticky preskoci,

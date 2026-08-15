@@ -120,7 +120,18 @@ textarea {
   transition: width 160ms ease, transform 160ms ease;
   display: flex;
   flex-direction: column;
+  /* .app-shell is a single-row grid, so by default .sidebar stretches to
+     match whatever height .workspace's content needs (default align-items:
+     stretch) - on a long tab (many asset cards, long tables) that pushed
+     .sidebar (and, via its stretched nav, every nav button) to thousands of
+     pixels tall instead of staying pinned to the viewport. Sticky + a fixed
+     viewport height keeps it exactly one screen tall regardless of the
+     workspace's content length, with its own scroll if it's ever needed. */
+  position: sticky;
+  top: 0;
+  height: 100vh;
   min-height: 100vh;
+  overflow-y: auto;
 }
 
 .sidebar nav {
@@ -276,11 +287,17 @@ textarea {
 nav {
   display: grid;
   gap: 12px;
+  /* Grid rows default to align-content:normal, which computes to stretch
+     for grid containers - without this, a nav with room to spare (e.g. only
+     a couple of groups visible for a restricted Subjekt) stretches each
+     .nav-group row to fill it instead of packing them at the top. */
+  align-content: start;
 }
 
 .nav-group {
   display: grid;
   gap: 5px;
+  align-content: start;
 }
 
 .nav-group-label {

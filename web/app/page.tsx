@@ -26,7 +26,7 @@ import {
   WalletCards,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8010";
 
@@ -878,6 +878,7 @@ export default function Page() {
   const [notifBusy, setNotifBusy] = useState(false);
   const [notifStatus, setNotifStatus] = useState<string | null>(null);
   const [activePortfolioId, setActivePortfolioId] = useState<string | null>(null);
+  const latestLoadRequestRef = useRef(0);
   const [portfolios, setPortfolios] = useState<{ id: string; name: string }[]>([]);
   const [newPortfolioName, setNewPortfolioName] = useState("");
   const [portfolioBusy, setPortfolioBusy] = useState(false);
@@ -1064,6 +1065,12 @@ export default function Page() {
     // tab does, and there's nothing to load yet if the user has none.
     const tabNeedsPortfolio = !GLOBAL_AGENDAS.has(activeTab) && activeTab !== "settings";
     if (tabNeedsPortfolio && !activePortfolioId) return;
+    // Guards against an older, slower-to-resolve loadAll() (e.g. from the
+    // previously active tab) overwriting rows/summary/etc. with stale data
+    // after the user has already switched tabs/Subjekty - fetches have no
+    // cancellation, so without this the LAST FETCH TO FINISH wins, not the
+    // last one STARTED.
+    const requestId = ++latestLoadRequestRef.current;
     setError(null);
     try {
       const needsStockOverview = STOCK_OVERVIEW_TABS.includes(activeTab);
@@ -1083,6 +1090,7 @@ export default function Page() {
       if (activeTab === "assets") requests.push(api(withPortfolio("/assets/agendas")));
       if (needsPortfolioList) requests.push(api("/portfolios"));
       const [summaryData, ...rest] = await Promise.all(requests);
+      if (latestLoadRequestRef.current !== requestId) return;
       setSummary(summaryData as Summary | null);
       let restIndex = 0;
       setRows(needsRows ? (rest[restIndex++] as Row[]) : []);
@@ -1092,6 +1100,7 @@ export default function Page() {
       if (activeTab === "assets") setAssetAgendas(rest[restIndex++] as AssetAgenda[]);
       if (needsPortfolioList) setPortfolios(rest[restIndex++] as { id: string; name: string }[]);
     } catch (err) {
+      if (latestLoadRequestRef.current !== requestId) return;
       setError(err instanceof Error ? err.message : "Nepodařilo se načíst data");
     }
   }
@@ -2006,7 +2015,13 @@ export default function Page() {
                 </div>
                 <div className="portfolio-list">
                   {rows
-                    .filter((row) => !row.is_admin)
+                    // `rows` briefly holds the previous tab's data while a
+                    // freshly triggered loadAll() for "users" is still in
+                    // flight (activeTab updates synchronously, the fetch
+                    // doesn't) - typeof-guard so that transitional window
+                    // renders nothing here instead of bogus placeholder rows
+                    // for whatever shape the previous tab's rows had.
+                    .filter((row) => typeof row.username === "string" && !row.is_admin)
                     .map((row) => (
                       <div className="portfolio-row" key={String(row.username)}>
                         <span>{String(row.username)}</span>
@@ -2310,12 +2325,12 @@ export default function Page() {
           </section>
         )}
 
-        {STOCK_OVERVIEW_TABS.includes(activeTab) && stockOverview && (
-          <section className="work-panel">
+        {(STOCK_OVERVIEW_TABS.includes(activeTab) || activeTab === "stats") && (
+          <section className="work-panel compact-panel">
             <div className="panel-header">
               <div>
-                <h2>Akciový souhrn</h2>
-                <p>Přehled je zatím počítaný z importovaných excelových dat.</p>
+                <h2>Přepočet portfolia</h2>
+                <p>Přepočítá portfolio a denní statistiku ze všech akciových transakcí.</p>
               </div>
               <div className="stock-actions">
                 <button className="action-button" onClick={refreshStockPrices} disabled={stockBusy}>
@@ -2338,6 +2353,18 @@ export default function Page() {
                 </button>
               </div>
             </div>
+            {stockActionStatus && <div className="success-notice">{stockActionStatus}</div>}
+          </section>
+        )}
+
+        {STOCK_OVERVIEW_TABS.includes(activeTab) && stockOverview && (
+          <section className="work-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Akciový souhrn</h2>
+                <p>Přehled je zatím počítaný z importovaných excelových dat.</p>
+              </div>
+            </div>
             {activeTab === "transactions" && (
               <div className="patria-import">
                 <label>
@@ -2354,7 +2381,6 @@ export default function Page() {
                 </button>
               </div>
             )}
-            {stockActionStatus && <div className="success-notice">{stockActionStatus}</div>}
             <div className="mini-grids">
               <div>
                 <h3>Pohyby</h3>
