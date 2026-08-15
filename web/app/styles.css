@@ -1295,12 +1295,19 @@ nav button:hover {
   stroke-dasharray: 3 3;
 }
 
-.portfolio-chart-axis {
-  display: flex;
-  justify-content: space-between;
+.portfolio-chart-xaxis {
+  position: relative;
+  height: 14px;
+  margin-top: 4px;
+  margin-left: 62px;
+}
+
+.portfolio-chart-xaxis span {
+  position: absolute;
+  transform: translateX(-50%);
   font-size: 10px;
   color: var(--muted);
-  margin-top: 2px;
+  white-space: nowrap;
 }
 
 .portfolio-chart-tooltip {

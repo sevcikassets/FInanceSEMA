@@ -525,6 +525,23 @@ function PortfolioChart({
   const yTickCount = 4;
   const yTicks = Array.from({ length: yTickCount }, (_, i) => min + ((max - min) * i) / (yTickCount - 1));
 
+  // One tick per calendar month present in the data, thinned down to at
+  // most maxXTicks labels - keeps the axis readable whether the chart
+  // spans a few weeks or several years, without needing exact dates.
+  const maxXTicks = large ? 8 : 5;
+  const monthBoundaries: { index: number; label: string }[] = [];
+  let lastMonthKey = "";
+  data.forEach((point, index) => {
+    const dateText = String(point.date || "");
+    const monthKey = dateText.slice(0, 7);
+    if (monthKey && monthKey !== lastMonthKey) {
+      monthBoundaries.push({ index, label: monthYearShortLabel(dateText) });
+      lastMonthKey = monthKey;
+    }
+  });
+  const xTickStep = Math.max(1, Math.ceil(monthBoundaries.length / maxXTicks));
+  const xTicks = monthBoundaries.filter((_, i) => i % xTickStep === 0);
+
   function linePath(key: string) {
     return data.map((point, index) => `${index === 0 ? "M" : "L"} ${xAt(index).toFixed(1)} ${yAt(numberValue(point[key])).toFixed(1)}`).join(" ");
   }
@@ -608,6 +625,16 @@ function PortfolioChart({
               className="portfolio-chart-gridline"
             />
           ))}
+          {xTicks.map((tick) => (
+            <line
+              key={tick.index}
+              x1={xAt(tick.index)}
+              x2={xAt(tick.index)}
+              y1={marginTop}
+              y2={marginTop + plotHeight}
+              className="portfolio-chart-gridline"
+            />
+          ))}
           {mode !== "lines" && (
             <line x1={marginLeft} x2={width - marginRight} y1={zeroY} y2={zeroY} className="portfolio-chart-baseline" />
           )}
@@ -634,9 +661,12 @@ function PortfolioChart({
           )}
         </svg>
       </div>
-      <div className="portfolio-chart-axis">
-        <span>{formatDateWithWeekday(String(data[0].date))}</span>
-        <span>{formatDateWithWeekday(String(data[data.length - 1].date))}</span>
+      <div className="portfolio-chart-xaxis">
+        {xTicks.map((tick) => (
+          <span key={tick.index} style={{ left: `${((xAt(tick.index) / width) * 100).toFixed(2)}%` }}>
+            {tick.label}
+          </span>
+        ))}
       </div>
       {hoverPoint && (
         <div className="portfolio-chart-tooltip">
@@ -708,6 +738,18 @@ function numberValue(value: Row[string]) {
 function monthLabel(dateText: string) {
   const date = new Date(`${dateText}T00:00:00`);
   return new Intl.DateTimeFormat("cs-CZ", { month: "long", year: "numeric" }).format(date);
+}
+
+// Compact "MM/RRRR" label for chart x-axis ticks - exact dates aren't
+// needed there, just enough to see how the data progresses over time.
+// cs-CZ's Intl "short" month format falls back to full month names (no
+// abbreviated form in the locale data), which crowds the axis once a
+// chart has more than a couple of ticks - a fixed numeric format avoids
+// that regardless of how many ticks are shown.
+function monthYearShortLabel(dateText: string) {
+  const date = new Date(`${dateText}T00:00:00`);
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  return `${month}/${date.getFullYear()}`;
 }
 
 const CZ_WEEKDAYS = ["Ne", "Po", "Út", "St", "Čt", "Pá", "So"]; // indexed by Date#getDay()
