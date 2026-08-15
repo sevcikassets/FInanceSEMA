@@ -30,6 +30,25 @@ class Party(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class Portfolio(Base):
+    __tablename__ = "portfolios"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(255), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PortfolioAccess(Base):
+    __tablename__ = "portfolio_access"
+
+    username: Mapped[str] = mapped_column(String(128), ForeignKey("app_users.username"), primary_key=True)
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), primary_key=True)
+    # Subset of PORTFOLIO_SCOPED_AGENDAS (see auth.py) this user may see
+    # within this one Subjekt - independent from AppUser.allowed_agendas,
+    # which now only governs the two global agendas ("rates", "users").
+    allowed_agendas: Mapped[list] = mapped_column(JSONB, default=list)
+
+
 class AppUser(Base):
     __tablename__ = "app_users"
 
@@ -59,6 +78,7 @@ class LoanMovement(Base):
     __tablename__ = "loan_movements"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), index=True)
     movement_date: Mapped[date | None] = mapped_column(Date)
     period_label: Mapped[str | None] = mapped_column(String(64))
     lender_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("parties.id"))
@@ -77,9 +97,11 @@ class LoanMovement(Base):
 
 class Asset(Base):
     __tablename__ = "assets"
+    __table_args__ = (UniqueConstraint("portfolio_id", "code", name="uq_assets_portfolio_code"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    code: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), index=True)
+    code: Mapped[str] = mapped_column(String(64), index=True)
     owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("parties.id"))
     asset_type: Mapped[str | None] = mapped_column(String(64))
     name: Mapped[str] = mapped_column(String(255))
@@ -103,6 +125,10 @@ class AssetCost(Base):
     __tablename__ = "asset_costs"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Direct column, not join-only via asset_id: import_asset_cost_sheets can
+    # legitimately insert a cost row with asset_id=None (no fuzzy sheet-name
+    # match found), and that row still needs a Subjekt.
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), index=True)
     asset_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("assets.id"))
     cost_date: Mapped[date | None] = mapped_column(Date)
     payer_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("parties.id"))
@@ -122,6 +148,7 @@ class StockTransaction(Base):
     __tablename__ = "stock_transactions"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), index=True)
     traded_on: Mapped[date | None] = mapped_column(Date)
     instrument_type: Mapped[str | None] = mapped_column(String(64))
     movement_type: Mapped[str | None] = mapped_column(String(64))
@@ -149,6 +176,7 @@ class WatchlistStock(Base):
     __tablename__ = "watchlist_stocks"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), index=True)
     watched_on: Mapped[date | None] = mapped_column(Date)
     reason: Mapped[str | None] = mapped_column(String(64))
     quantity: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
@@ -190,6 +218,10 @@ class TickerDescription(Base):
 class PortfolioPosition(Base):
     __tablename__ = "portfolio_positions"
 
+    # Disposable computed cache - fully wiped and rebuilt by
+    # stock_services.recalculate_stocks on every run - so (portfolio_id,
+    # ticker) is safe as a compound PK with no backfill story needed.
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), primary_key=True)
     ticker: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str | None] = mapped_column(String(255))
     quantity: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
@@ -207,6 +239,8 @@ class PortfolioPosition(Base):
 class DailyStatistic(Base):
     __tablename__ = "daily_statistics"
 
+    # Disposable computed cache, same reasoning as PortfolioPosition above.
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), primary_key=True)
     stat_date: Mapped[date] = mapped_column(Date, primary_key=True)
     bought_eur: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
     total_eur: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))

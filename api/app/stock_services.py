@@ -4,6 +4,7 @@ import bisect
 import json
 import re
 import time
+import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -202,7 +203,7 @@ def parse_patria_text(text: str) -> list[PatriaTrade]:
     return trades
 
 
-def import_patria_trades(db: Session, text: str) -> dict[str, Any]:
+def import_patria_trades(db: Session, portfolio_id: uuid.UUID, text: str) -> dict[str, Any]:
     trades = parse_patria_text(text)
     inserted = 0
     skipped = 0
@@ -210,6 +211,7 @@ def import_patria_trades(db: Session, text: str) -> dict[str, Any]:
         duplicate = db.scalar(
             select(StockTransaction)
             .where(
+                StockTransaction.portfolio_id == portfolio_id,
                 StockTransaction.traded_on == trade.traded_on,
                 StockTransaction.instrument_name == trade.instrument_name,
                 StockTransaction.quantity == trade.quantity,
@@ -226,6 +228,7 @@ def import_patria_trades(db: Session, text: str) -> dict[str, Any]:
         ticker = ticker_from_existing_data(db, trade.isin, trade.instrument_name, trade.market)
         db.add(
             StockTransaction(
+                portfolio_id=portfolio_id,
                 traded_on=trade.traded_on,
                 instrument_type="Akcie",
                 movement_type=trade.movement_type,
@@ -330,10 +333,16 @@ def fetch_yahoo_price(ticker: str) -> dict[str, Decimal | str | None]:
     return {"price": None, "currency": None}
 
 
-def refresh_current_prices(db: Session, threshold_pct: Decimal | float = Decimal("10")) -> dict[str, Any]:
+def refresh_current_prices(
+    db: Session, portfolio_id: uuid.UUID, threshold_pct: Decimal | float = Decimal("10")
+) -> dict[str, Any]:
     threshold = float(threshold_pct)
-    positions = db.scalars(select(PortfolioPosition).where(PortfolioPosition.ticker.is_not(None))).all()
-    watchlist = db.scalars(select(WatchlistStock).where(WatchlistStock.ticker.is_not(None))).all()
+    positions = db.scalars(
+        select(PortfolioPosition).where(PortfolioPosition.portfolio_id == portfolio_id, PortfolioPosition.ticker.is_not(None))
+    ).all()
+    watchlist = db.scalars(
+        select(WatchlistStock).where(WatchlistStock.portfolio_id == portfolio_id, WatchlistStock.ticker.is_not(None))
+    ).all()
     tickers = sorted(
         {
             *{normalize_ticker(position.ticker, None) for position in positions if position.ticker},
@@ -351,14 +360,18 @@ def refresh_current_prices(db: Session, threshold_pct: Decimal | float = Decimal
         if not isinstance(price, Decimal):
             errors.append({"ticker": ticker, "error": "Cena nebyla dostupná"})
             continue
-        position = db.get(PortfolioPosition, ticker)
+        position = db.get(PortfolioPosition, (portfolio_id, ticker))
         previous_price = position.current_price if position is not None else None
         rate_currency = str(quote_data["currency"]).upper() if quote_data.get("currency") else None
         currency_for_rate = rate_currency or (position.currency if position is not None else None)
         if not currency_for_rate:
             latest_transaction = db.scalar(
                 select(StockTransaction)
-                .where(StockTransaction.ticker == ticker, StockTransaction.currency.is_not(None))
+                .where(
+                    StockTransaction.portfolio_id == portfolio_id,
+                    StockTransaction.ticker == ticker,
+                    StockTransaction.currency.is_not(None),
+                )
                 .order_by(desc(StockTransaction.traded_on).nullslast())
                 .limit(1)
             )
@@ -386,7 +399,9 @@ def refresh_current_prices(db: Session, threshold_pct: Decimal | float = Decimal
                     }
                 )
 
-        transactions = db.scalars(select(StockTransaction).where(StockTransaction.ticker == ticker)).all()
+        transactions = db.scalars(
+            select(StockTransaction).where(StockTransaction.portfolio_id == portfolio_id, StockTransaction.ticker == ticker)
+        ).all()
         for transaction in transactions:
             if (transaction.movement_type or "").lower() in {"dividenda", "prodej"}:
                 continue
@@ -395,7 +410,9 @@ def refresh_current_prices(db: Session, threshold_pct: Decimal | float = Decimal
             current_value = decimal_or_zero(transaction.quantity) * price * rate
             transaction.difference_czk = current_value - amount_czk
             transaction.difference_pct = transaction.difference_czk / amount_czk if amount_czk else None
-        watched_rows = db.scalars(select(WatchlistStock).where(WatchlistStock.ticker == ticker)).all()
+        watched_rows = db.scalars(
+            select(WatchlistStock).where(WatchlistStock.portfolio_id == portfolio_id, WatchlistStock.ticker == ticker)
+        ).all()
         for watched in watched_rows:
             watched.current_price = price
             if rate_currency:
@@ -410,7 +427,7 @@ def refresh_current_prices(db: Session, threshold_pct: Decimal | float = Decimal
 DAILY_MOVER_RE = re.compile(r"(\S+) \(D:([+-][\d.]+)%\)")
 
 
-def compute_alerts(db: Session, threshold_pct: Decimal | float = Decimal("10")) -> dict[str, Any]:
+def compute_alerts(db: Session, portfolio_id: uuid.UUID, threshold_pct: Decimal | float = Decimal("10")) -> dict[str, Any]:
     """The three "Upozorneni" categories AkcieStatistika.bas/AktualizujHodnotu.bas
     surface: tickers whose price has reached the watchlist limit, portfolio
     positions down more than ``threshold_pct`` versus their average purchase
@@ -422,7 +439,9 @@ def compute_alerts(db: Session, threshold_pct: Decimal | float = Decimal("10")) 
     """
     threshold = Decimal(str(threshold_pct))
     watchlist_alerts: list[dict[str, Any]] = []
-    for row in db.scalars(select(WatchlistStock).where(WatchlistStock.ticker.is_not(None))).all():
+    for row in db.scalars(
+        select(WatchlistStock).where(WatchlistStock.portfolio_id == portfolio_id, WatchlistStock.ticker.is_not(None))
+    ).all():
         if row.current_price is None or row.limit_price is None:
             continue
         if row.current_price <= row.limit_price:
@@ -437,7 +456,7 @@ def compute_alerts(db: Session, threshold_pct: Decimal | float = Decimal("10")) 
             )
 
     drawdown_alerts: list[dict[str, Any]] = []
-    for row in db.scalars(select(PortfolioPosition)).all():
+    for row in db.scalars(select(PortfolioPosition).where(PortfolioPosition.portfolio_id == portfolio_id)).all():
         if row.profit_pct is None:
             continue
         if row.profit_pct <= -(threshold / 100):
@@ -451,7 +470,12 @@ def compute_alerts(db: Session, threshold_pct: Decimal | float = Decimal("10")) 
                 }
             )
 
-    latest_stat = db.scalar(select(DailyStatistic).order_by(desc(DailyStatistic.stat_date)).limit(1))
+    latest_stat = db.scalar(
+        select(DailyStatistic)
+        .where(DailyStatistic.portfolio_id == portfolio_id)
+        .order_by(desc(DailyStatistic.stat_date))
+        .limit(1)
+    )
     daily_movers: list[dict[str, Any]] = []
     if latest_stat is not None and latest_stat.alerts:
         for ticker, pct_text in DAILY_MOVER_RE.findall(latest_stat.alerts):
@@ -488,7 +512,11 @@ def movement_is_dividend(value: str | None) -> bool:
 
 
 def recalculate_stocks(
-    db: Session, dry_run: bool = False, date_from: date | None = None, threshold_pct: Decimal | float = Decimal("10")
+    db: Session,
+    portfolio_id: uuid.UUID,
+    dry_run: bool = False,
+    date_from: date | None = None,
+    threshold_pct: Decimal | float = Decimal("10"),
 ) -> dict[str, Any]:
     """Recompute portfolio positions and daily statistics from `stock_transactions`.
 
@@ -510,9 +538,15 @@ def recalculate_stocks(
     drift, never a real stock-price gain or loss).
     """
     existing_prices = {
-        row.ticker: row.current_price for row in db.scalars(select(PortfolioPosition)).all() if row.ticker and row.current_price is not None
+        row.ticker: row.current_price
+        for row in db.scalars(select(PortfolioPosition).where(PortfolioPosition.portfolio_id == portfolio_id)).all()
+        if row.ticker and row.current_price is not None
     }
-    transactions = db.scalars(select(StockTransaction).order_by(StockTransaction.traded_on.nullslast(), StockTransaction.id)).all()
+    transactions = db.scalars(
+        select(StockTransaction)
+        .where(StockTransaction.portfolio_id == portfolio_id)
+        .order_by(StockTransaction.traded_on.nullslast(), StockTransaction.id)
+    ).all()
 
     positions: dict[str, dict[str, Any]] = {}
     buy_dates: set[date] = set()
@@ -594,6 +628,7 @@ def recalculate_stocks(
         total_market_value += market_value
         computed_positions.append(
             PortfolioPosition(
+                portfolio_id=portfolio_id,
                 ticker=data["ticker"],
                 name=data["name"],
                 quantity=quantity,
@@ -778,6 +813,7 @@ def recalculate_stocks(
             continue
         computed_stats.append(
             DailyStatistic(
+                portfolio_id=portfolio_id,
                 stat_date=stat_date,
                 bought_eur=bought_eur,
                 total_eur=total_eur,
@@ -806,13 +842,14 @@ def recalculate_stocks(
         )
 
     if not dry_run:
-        db.query(PortfolioPosition).delete()
+        db.query(PortfolioPosition).filter(PortfolioPosition.portfolio_id == portfolio_id).delete()
         for position in computed_positions:
             db.add(position)
+        stats_query = db.query(DailyStatistic).filter(DailyStatistic.portfolio_id == portfolio_id)
         if date_from is not None:
-            db.query(DailyStatistic).filter(DailyStatistic.stat_date >= date_from).delete()
+            stats_query.filter(DailyStatistic.stat_date >= date_from).delete()
         else:
-            db.query(DailyStatistic).delete()
+            stats_query.delete()
         for statistic in computed_stats:
             db.add(statistic)
         db.commit()
@@ -863,7 +900,7 @@ def fetch_yahoo_history(ticker: str, date_from: date, date_to: date) -> dict[str
     return {"currency": None, "points": []}
 
 
-def build_ticker_history(db: Session, ticker: str, date_from: date, date_to: date) -> dict[str, Any]:
+def build_ticker_history(db: Session, portfolio_id: uuid.UUID, ticker: str, date_from: date, date_to: date) -> dict[str, Any]:
     """Port of TickerHistory.bas: daily price history for a ticker combined with
     the cumulative purchases from `stock_transactions`, showing quantity held,
     market value and profit/loss in both the trading currency (CCY) and CZK for
@@ -878,7 +915,11 @@ def build_ticker_history(db: Session, ticker: str, date_from: date, date_to: dat
 
     buy_transactions = db.scalars(
         select(StockTransaction)
-        .where(StockTransaction.ticker == normalized, StockTransaction.traded_on.is_not(None))
+        .where(
+            StockTransaction.portfolio_id == portfolio_id,
+            StockTransaction.ticker == normalized,
+            StockTransaction.traded_on.is_not(None),
+        )
         .order_by(StockTransaction.traded_on)
     ).all()
     daily_buy_qty: dict[date, Decimal] = defaultdict(Decimal)

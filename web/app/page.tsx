@@ -77,6 +77,16 @@ type AssetAgenda = {
   categories: Row[];
 };
 
+// A "Subjekt" in the UI (kept as "Portfolio"/portfolio_id internally/in the
+// API - "Subjekt" is only the user-facing Czech label, chosen to avoid
+// colliding with the pre-existing "portfolio" tab, which is the stock
+// portfolio and unrelated to this grouping entity).
+type PortfolioGrant = {
+  id: string;
+  name: string;
+  allowed_agendas: string[];
+};
+
 type CurrentUser = {
   username: string;
   full_name: string | null;
@@ -86,6 +96,7 @@ type CurrentUser = {
   totp_enabled: boolean;
   alert_daily_change_pct: number | null;
   alert_drop_pct: number | null;
+  portfolios: PortfolioGrant[];
 };
 
 type TwoFactorSetup = {
@@ -130,6 +141,12 @@ const STOCK_OVERVIEW_TABS = ["transactions", "watchlist", "portfolio"];
 
 // Tabs that render their own custom panel instead of the generic data table.
 const NON_TABLE_TABS = new Set(["assets", "history", "alerts", "charts", "settings"]);
+
+// "rates" (shared CNB exchange-rate history) and "users" (user management)
+// apply app-wide and stay governed by AppUser.allowed_agendas. Every other
+// tab is scoped per-Subjekt instead - see isTabVisible below.
+const GLOBAL_AGENDAS = new Set(["rates", "users"]);
+const PORTFOLIO_SCOPED_TABS = tabs.filter((tab) => !GLOBAL_AGENDAS.has(tab.id) && tab.id !== "settings");
 
 const columns: Record<string, string[]> = {
   portfolio: ["ticker", "name", "quantity", "currency", "market_value_czk", "invested_czk", "profit_czk", "profit_pct"],
@@ -860,20 +877,56 @@ export default function Page() {
   const [notifDropPct, setNotifDropPct] = useState("");
   const [notifBusy, setNotifBusy] = useState(false);
   const [notifStatus, setNotifStatus] = useState<string | null>(null);
+  const [activePortfolioId, setActivePortfolioId] = useState<string | null>(null);
+  const [portfolios, setPortfolios] = useState<{ id: string; name: string }[]>([]);
+  const [newPortfolioName, setNewPortfolioName] = useState("");
+  const [portfolioBusy, setPortfolioBusy] = useState(false);
+  const [portfolioStatus, setPortfolioStatus] = useState<string | null>(null);
+  const [renamingPortfolioId, setRenamingPortfolioId] = useState<string | null>(null);
+  const [renamePortfolioName, setRenamePortfolioName] = useState("");
+  const [editingAccessUsername, setEditingAccessUsername] = useState<string | null>(null);
+  const [accessDraft, setAccessDraft] = useState<Record<string, string[]>>({});
+  const [accessBusy, setAccessBusy] = useState(false);
+  const [accessStatus, setAccessStatus] = useState<string | null>(null);
   const allowedAgendaSet = useMemo(
     () => new Set(currentUser?.is_admin ? tabs.map((tab) => tab.id) : currentUser?.allowed_agendas || tabs.map((tab) => tab.id)),
     [currentUser],
   );
+  // Falls back to the first accessible Subjekt even before the
+  // activePortfolioId-reconciliation effect below has had a chance to run
+  // (e.g. right after login, in the same render currentUser first becomes
+  // available) - otherwise isTabVisible would briefly see no active
+  // Subjekt and redirect away from the default tab to whatever global tab
+  // happens to be visible.
+  const activePortfolio = useMemo(
+    () => currentUser?.portfolios.find((portfolio) => portfolio.id === activePortfolioId) ?? currentUser?.portfolios[0] ?? null,
+    [currentUser, activePortfolioId],
+  );
   // "settings" is personal preferences, not a data agenda - every logged-in
   // user can reach it regardless of what allowed_agendas grants them.
-  const isTabVisible = (tabId: string) => tabId === "settings" || allowedAgendaSet.has(tabId);
-  const visibleTabs = useMemo(() => tabs.filter((tab) => isTabVisible(tab.id)), [allowedAgendaSet]);
+  // "rates"/"users" are the two agendas that stay app-wide (AppUser.allowed_
+  // agendas); every other tab is scoped to the currently active Subjekt.
+  // While currentUser hasn't loaded yet (token set, /auth/me still in
+  // flight), allowedAgendaSet already optimistically defaults to "every tab"
+  // (see above) rather than hiding everything - portfolio-scoped tabs must
+  // match that during the same loading window, or the tab-visibility
+  // reconciliation effect below redirects away from the default tab before
+  // the real Subjekt grants are even known.
+  const isTabVisible = (tabId: string) =>
+    tabId === "settings"
+      ? true
+      : GLOBAL_AGENDAS.has(tabId)
+        ? allowedAgendaSet.has(tabId)
+        : currentUser
+          ? Boolean(activePortfolio?.allowed_agendas.includes(tabId))
+          : true;
+  const visibleTabs = useMemo(() => tabs.filter((tab) => isTabVisible(tab.id)), [allowedAgendaSet, activePortfolio]);
   const visibleNavGroups = useMemo(
     () =>
       navGroups
         .map((group) => ({ ...group, items: group.items.filter((item) => isTabVisible(item)) }))
         .filter((group) => group.items.length > 0),
-    [allowedAgendaSet],
+    [allowedAgendaSet, activePortfolio],
   );
   const active = useMemo(() => tabs.find((tab) => tab.id === activeTab) || visibleTabs[0] || tabs[0], [activeTab, visibleTabs]);
   const costAssets = useMemo(
@@ -941,6 +994,8 @@ export default function Page() {
   useEffect(() => {
     const saved = localStorage.getItem("finance-token");
     if (saved) setToken(saved);
+    const savedPortfolio = localStorage.getItem("finance-portfolio-id");
+    if (savedPortfolio) setActivePortfolioId(savedPortfolio);
   }, []);
 
   useEffect(() => {
@@ -956,6 +1011,20 @@ export default function Page() {
     }
     loadProfile();
   }, [token]);
+
+  // Keeps the active Subjekt valid whenever the user's grants change (login,
+  // an admin editing access, …): falls back to the first accessible Subjekt
+  // if none is selected yet or the saved one is no longer valid.
+  useEffect(() => {
+    if (!currentUser) return;
+    if (activePortfolioId && currentUser.portfolios.some((portfolio) => portfolio.id === activePortfolioId)) return;
+    setActivePortfolioId(currentUser.portfolios[0]?.id ?? null);
+  }, [currentUser, activePortfolioId]);
+
+  useEffect(() => {
+    if (activePortfolioId) localStorage.setItem("finance-portfolio-id", activePortfolioId);
+    else localStorage.removeItem("finance-portfolio-id");
+  }, [activePortfolioId]);
 
   useEffect(() => {
     setNotifDailyChangePct(currentUser?.alert_daily_change_pct != null ? String(currentUser.alert_daily_change_pct) : "");
@@ -981,8 +1050,20 @@ export default function Page() {
     return response.json();
   }
 
+  // Appends the active Subjekt to a portfolio-scoped endpoint's query string.
+  // Harmless (and skipped) for endpoints that ignore/don't need it - the API
+  // silently ignores unknown query params, so this is safe to apply broadly.
+  function withPortfolio(path: string): string {
+    if (!activePortfolioId) return path;
+    return `${path}${path.includes("?") ? "&" : "?"}portfolio_id=${activePortfolioId}`;
+  }
+
   async function loadAll() {
     if (!token) return;
+    // "rates"/"users"/"settings" don't need a Subjekt at all - every other
+    // tab does, and there's nothing to load yet if the user has none.
+    const tabNeedsPortfolio = !GLOBAL_AGENDAS.has(activeTab) && activeTab !== "settings";
+    if (tabNeedsPortfolio && !activePortfolioId) return;
     setError(null);
     try {
       const needsStockOverview = STOCK_OVERVIEW_TABS.includes(activeTab);
@@ -993,20 +1074,23 @@ export default function Page() {
       // array - stuffing that into `rows` used to crash every unconditional
       // `rows.map` elsewhere (e.g. costAssets) as soon as you opened the tab.
       const needsRows = activeTab !== "alerts" && activeTab !== "settings";
-      const requests: Promise<unknown>[] = [api("/summary")];
-      if (needsRows) requests.push(api(active.endpoint));
+      const needsPortfolioList = activeTab === "users" && Boolean(currentUser?.is_admin);
+      const requests: Promise<unknown>[] = [activePortfolioId ? api(withPortfolio("/summary")) : Promise.resolve(null)];
+      if (needsRows) requests.push(api(withPortfolio(active.endpoint)));
       if (activeTab === "rates") requests.push(api("/rates/latest"));
-      if (needsStockOverview) requests.push(api("/stocks/overview"));
-      if (needsAlerts) requests.push(api("/stocks/alerts"));
-      if (activeTab === "assets") requests.push(api("/assets/agendas"));
+      if (needsStockOverview) requests.push(api(withPortfolio("/stocks/overview")));
+      if (needsAlerts) requests.push(api(withPortfolio("/stocks/alerts")));
+      if (activeTab === "assets") requests.push(api(withPortfolio("/assets/agendas")));
+      if (needsPortfolioList) requests.push(api("/portfolios"));
       const [summaryData, ...rest] = await Promise.all(requests);
-      setSummary(summaryData as Summary);
+      setSummary(summaryData as Summary | null);
       let restIndex = 0;
       setRows(needsRows ? (rest[restIndex++] as Row[]) : []);
       if (activeTab === "rates") setLatestRates(rest[restIndex++] as LatestRates);
       if (needsStockOverview) setStockOverview(rest[restIndex++] as StockOverview);
       if (needsAlerts) setAlerts(rest[restIndex++] as Alerts);
       if (activeTab === "assets") setAssetAgendas(rest[restIndex++] as AssetAgenda[]);
+      if (needsPortfolioList) setPortfolios(rest[restIndex++] as { id: string; name: string }[]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Nepodařilo se načíst data");
     }
@@ -1014,7 +1098,7 @@ export default function Page() {
 
   useEffect(() => {
     loadAll();
-  }, [token, activeTab]);
+  }, [token, activeTab, activePortfolioId]);
 
   function logout() {
     localStorage.removeItem("finance-token");
@@ -1246,12 +1330,103 @@ export default function Page() {
     }
   }
 
+  // Refetches /auth/me so currentUser.portfolios (the sidebar switcher's
+  // source of truth) picks up a Subjekt an admin just created/renamed -
+  // loadAll() alone only refreshes the "users" tab's own /portfolios list,
+  // not the caller's own profile.
+  async function refreshCurrentUser() {
+    try {
+      const profile = (await api("/auth/me")) as CurrentUser;
+      setCurrentUser(profile);
+    } catch {
+      // Non-fatal - the switcher just stays stale until the next reload/login.
+    }
+  }
+
+  async function createPortfolio(event: React.FormEvent) {
+    event.preventDefault();
+    setPortfolioStatus(null);
+    setPortfolioBusy(true);
+    try {
+      await api("/portfolios", { method: "POST", body: JSON.stringify({ name: newPortfolioName.trim() }) });
+      setNewPortfolioName("");
+      await Promise.all([loadAll(), refreshCurrentUser()]);
+    } catch (err) {
+      setPortfolioStatus(err instanceof Error ? err.message : "Subjekt se nepodařilo vytvořit");
+    } finally {
+      setPortfolioBusy(false);
+    }
+  }
+
+  function startRenamingPortfolio(portfolio: { id: string; name: string }) {
+    setRenamingPortfolioId(portfolio.id);
+    setRenamePortfolioName(portfolio.name);
+    setPortfolioStatus(null);
+  }
+
+  async function saveRenamedPortfolio(event: React.FormEvent) {
+    event.preventDefault();
+    if (!renamingPortfolioId) return;
+    setPortfolioStatus(null);
+    setPortfolioBusy(true);
+    try {
+      await api(`/portfolios/${renamingPortfolioId}`, { method: "PUT", body: JSON.stringify({ name: renamePortfolioName.trim() }) });
+      setRenamingPortfolioId(null);
+      setRenamePortfolioName("");
+      await Promise.all([loadAll(), refreshCurrentUser()]);
+    } catch (err) {
+      setPortfolioStatus(err instanceof Error ? err.message : "Subjekt se nepodařilo přejmenovat");
+    } finally {
+      setPortfolioBusy(false);
+    }
+  }
+
+  function openAccessEditor(row: Row) {
+    const username = String(row.username);
+    const existing = Array.isArray(row.portfolios) ? (row.portfolios as unknown as PortfolioGrant[]) : [];
+    const draft: Record<string, string[]> = {};
+    for (const grant of existing) draft[grant.id] = grant.allowed_agendas;
+    setAccessDraft(draft);
+    setEditingAccessUsername(username);
+    setAccessStatus(null);
+  }
+
+  function toggleAccessAgenda(portfolioId: string, agendaId: string) {
+    setAccessDraft((current) => {
+      const selected = new Set(current[portfolioId] || []);
+      if (selected.has(agendaId)) selected.delete(agendaId);
+      else selected.add(agendaId);
+      return { ...current, [portfolioId]: [...selected] };
+    });
+  }
+
+  async function saveAccessDraft() {
+    if (!editingAccessUsername) return;
+    setAccessBusy(true);
+    setAccessStatus(null);
+    try {
+      const grants = Object.entries(accessDraft)
+        .filter(([, agendas]) => agendas.length > 0)
+        .map(([portfolio_id, allowed_agendas]) => ({ portfolio_id, allowed_agendas }));
+      await api(`/users/${encodeURIComponent(editingAccessUsername)}/portfolio-access`, {
+        method: "PUT",
+        body: JSON.stringify({ grants }),
+      });
+      setEditingAccessUsername(null);
+      await loadAll();
+    } catch (err) {
+      setAccessStatus(err instanceof Error ? err.message : "Přístup se nepodařilo uložit");
+    } finally {
+      setAccessBusy(false);
+    }
+  }
+
   async function cleanupLoanSubtotals() {
     setError(null);
     setLoanCleanupStatus(null);
     setLoanCleanupBusy(true);
     try {
-      const result = await api("/loans/cleanup-imported-subtotals", { method: "POST" });
+      const result = await api(withPortfolio("/loans/cleanup-imported-subtotals"), { method: "POST" });
       setLoanCleanupStatus(
         result.deleted > 0
           ? `Odstraněno ${result.deleted} importovaných mezisoučtových řádků.`
@@ -1271,7 +1446,7 @@ export default function Page() {
     setStockBusy(true);
     setWorkingMessage("Zpracovávám zkopírované obchody z Patrie");
     try {
-      const result = await api("/stocks/import-patria", {
+      const result = await api(withPortfolio("/stocks/import-patria"), {
         method: "POST",
         body: JSON.stringify({ text: patriaText }),
       });
@@ -1294,7 +1469,7 @@ export default function Page() {
     setStockBusy(true);
     setWorkingMessage("Zjišťuji aktuální ceny titulů přes Yahoo Finance");
     try {
-      const result = await api("/stocks/refresh-prices", { method: "POST" });
+      const result = await api(withPortfolio("/stocks/refresh-prices"), { method: "POST" });
       const errorCount = Array.isArray(result.errors) ? result.errors.length : 0;
       const moverCount = Array.isArray(result.movers) ? result.movers.length : 0;
       setStockActionStatus(
@@ -1327,7 +1502,7 @@ export default function Page() {
     try {
       const params = new URLSearchParams({ dry_run: dryRun ? "true" : "false" });
       if (fromDate) params.set("date_from", fromDate);
-      const result = await api(`/stocks/recalculate?${params.toString()}`, { method: "POST" });
+      const result = await api(withPortfolio(`/stocks/recalculate?${params.toString()}`), { method: "POST" });
       const zeroStatsHint =
         result.daily_statistics === 0 && result.date_from
           ? result.computed_range_from && result.computed_range_to
@@ -1360,7 +1535,7 @@ export default function Page() {
         date_from: historyFrom,
         date_to: historyTo,
       });
-      const result = await api(`/stocks/ticker-history?${params.toString()}`);
+      const result = await api(withPortfolio(`/stocks/ticker-history?${params.toString()}`));
       setHistoryResult(result as TickerHistoryResult);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Historii tickeru se nepodařilo načíst");
@@ -1446,6 +1621,22 @@ export default function Page() {
             <X size={18} />
           </button>
         </div>
+        {currentUser && currentUser.portfolios.length > 0 && (
+          <div className="sidebar-portfolio">
+            <span className="sidebar-portfolio-label">Subjekt</span>
+            {currentUser.portfolios.length > 1 ? (
+              <select value={activePortfolioId ?? ""} onChange={(event) => setActivePortfolioId(event.target.value)}>
+                {currentUser.portfolios.map((portfolio) => (
+                  <option key={portfolio.id} value={portfolio.id}>
+                    {portfolio.name}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <strong>{currentUser.portfolios[0].name}</strong>
+            )}
+          </div>
+        )}
         <nav>
           {visibleNavGroups.map((group) => (
             <div className="nav-group" key={group.label}>
@@ -1737,23 +1928,129 @@ export default function Page() {
                 </label>
                 {!newUser.is_admin && (
                   <div className="permissions-grid">
-                    {tabs.filter((tab) => tab.id !== "settings").map((tab) => (
-                      <label className="checkbox-row" key={tab.id}>
-                        <input
-                          checked={newUser.allowed_agendas.includes(tab.id)}
-                          onChange={() => toggleNewUserAgenda(tab.id)}
-                          type="checkbox"
-                        />
-                        {tab.label}
-                      </label>
-                    ))}
+                    {tabs
+                      .filter((tab) => GLOBAL_AGENDAS.has(tab.id))
+                      .map((tab) => (
+                        <label className="checkbox-row" key={tab.id}>
+                          <input
+                            checked={newUser.allowed_agendas.includes(tab.id)}
+                            onChange={() => toggleNewUserAgenda(tab.id)}
+                            type="checkbox"
+                          />
+                          {tab.label}
+                        </label>
+                      ))}
                   </div>
                 )}
+                <p className="field-hint">
+                  Přístup k jednotlivým subjektům (Majetek, Půjčky, Akcie, …) se přiděluje zvlášť níže, po založení uživatele.
+                </p>
                 <button className="action-button" disabled={Boolean(workingMessage)} type="submit">
                   <Save size={16} />
                   <span>Přidat uživatele</span>
                 </button>
               </form>
+            )}
+
+            {currentUser?.is_admin && (
+              <div className="security-panel">
+                <div className="panel-header">
+                  <div>
+                    <h3>Subjekty</h3>
+                    <p>Subjekt sdružuje majetek, půjčky i akcie jednoho vlastníka - uživatelům se pak přiděluje přístup k jednotlivým subjektům a agendám níže.</p>
+                  </div>
+                </div>
+                {portfolioStatus && <div className="success-notice">{portfolioStatus}</div>}
+                <div className="portfolio-list">
+                  {portfolios.map((portfolio) =>
+                    renamingPortfolioId === portfolio.id ? (
+                      <form className="portfolio-row" key={portfolio.id} onSubmit={saveRenamedPortfolio}>
+                        <input value={renamePortfolioName} onChange={(event) => setRenamePortfolioName(event.target.value)} autoFocus />
+                        <button className="action-button" type="submit" disabled={portfolioBusy || !renamePortfolioName.trim()}>
+                          <Save size={16} />
+                        </button>
+                        <button type="button" className="link-button" onClick={() => setRenamingPortfolioId(null)}>
+                          Zrušit
+                        </button>
+                      </form>
+                    ) : (
+                      <div className="portfolio-row" key={portfolio.id}>
+                        <span>{portfolio.name}</span>
+                        <button type="button" className="link-button" onClick={() => startRenamingPortfolio(portfolio)}>
+                          Přejmenovat
+                        </button>
+                      </div>
+                    ),
+                  )}
+                </div>
+                <form className="rate-form" onSubmit={createPortfolio}>
+                  <label>
+                    Nový subjekt
+                    <input value={newPortfolioName} onChange={(event) => setNewPortfolioName(event.target.value)} placeholder="Např. Martin Ševčík" />
+                  </label>
+                  <button className="action-button" type="submit" disabled={portfolioBusy || !newPortfolioName.trim()}>
+                    <Save size={16} />
+                    <span>Vytvořit subjekt</span>
+                  </button>
+                </form>
+              </div>
+            )}
+
+            {currentUser?.is_admin && (
+              <div className="security-panel">
+                <div className="panel-header">
+                  <div>
+                    <h3>Přístup uživatelů k subjektům</h3>
+                    <p>Pro každý subjekt zvlášť vyber, které agendy v něm uživatel uvidí.</p>
+                  </div>
+                </div>
+                <div className="portfolio-list">
+                  {rows
+                    .filter((row) => !row.is_admin)
+                    .map((row) => (
+                      <div className="portfolio-row" key={String(row.username)}>
+                        <span>{String(row.username)}</span>
+                        <button type="button" className="link-button" onClick={() => openAccessEditor(row)}>
+                          Spravovat přístup
+                        </button>
+                      </div>
+                    ))}
+                </div>
+                {editingAccessUsername && (
+                  <div className="access-editor">
+                    <p>
+                      Přístup uživatele <strong>{editingAccessUsername}</strong>:
+                    </p>
+                    {portfolios.map((portfolio) => (
+                      <div key={portfolio.id} className="access-editor-portfolio">
+                        <h4>{portfolio.name}</h4>
+                        <div className="permissions-grid">
+                          {PORTFOLIO_SCOPED_TABS.map((tab) => (
+                            <label className="checkbox-row" key={tab.id}>
+                              <input
+                                checked={(accessDraft[portfolio.id] || []).includes(tab.id)}
+                                onChange={() => toggleAccessAgenda(portfolio.id, tab.id)}
+                                type="checkbox"
+                              />
+                              {tab.label}
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                    {accessStatus && <div className="success-notice">{accessStatus}</div>}
+                    <div className="stock-actions">
+                      <button className="action-button" onClick={saveAccessDraft} disabled={accessBusy}>
+                        <Save size={16} />
+                        <span>Uložit přístup</span>
+                      </button>
+                      <button type="button" className="link-button" onClick={() => setEditingAccessUsername(null)}>
+                        Zrušit
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             )}
           </section>
         )}

@@ -234,6 +234,41 @@ textarea {
   overflow: hidden;
 }
 
+.sidebar-portfolio {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  margin-bottom: 12px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.sidebar-portfolio-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #8393a5;
+}
+
+.sidebar-portfolio strong {
+  color: #fff;
+  font-size: 14px;
+}
+
+.sidebar-portfolio select {
+  background: #1c2733;
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+  padding: 6px 8px;
+  width: 100%;
+  font-size: 13px;
+}
+
+.sidebar-collapsed .sidebar-portfolio {
+  display: none;
+}
+
 .sidebar-collapsed .desktop-nav-toggle {
   justify-self: center;
 }
@@ -745,6 +780,48 @@ nav button:hover {
 
 .security-panel .panel-header p {
   margin: 0;
+}
+
+.portfolio-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.portfolio-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+
+.portfolio-row span {
+  flex: 1;
+  font-size: 14px;
+  color: var(--ink);
+}
+
+.portfolio-row input {
+  flex: 1;
+}
+
+.access-editor {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 14px;
+  background: #f8fafb;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.access-editor-portfolio h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: var(--muted);
 }
 
 .two-factor-setup {

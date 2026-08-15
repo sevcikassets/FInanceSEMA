@@ -2,8 +2,10 @@ import base64
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import io
+import json
 import logging
 import unicodedata
+import uuid
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -27,6 +29,8 @@ from sqlalchemy.orm import Session
 
 from .auth import (
     ALL_AGENDAS,
+    GLOBAL_AGENDAS,
+    PORTFOLIO_SCOPED_AGENDAS,
     authenticate,
     create_pending_2fa_token,
     create_token,
@@ -40,7 +44,20 @@ from .config import get_settings
 from .db import Base, engine, get_db
 from .excel_import import import_workbooks
 from .loan_calc import project_annual_interest
-from .models import AppUser, Asset, AssetCost, DailyStatistic, ExchangeRate, LoanMovement, Party, PortfolioPosition, StockTransaction, WatchlistStock
+from .models import (
+    AppUser,
+    Asset,
+    AssetCost,
+    DailyStatistic,
+    ExchangeRate,
+    LoanMovement,
+    Party,
+    Portfolio,
+    PortfolioAccess,
+    PortfolioPosition,
+    StockTransaction,
+    WatchlistStock,
+)
 from .stock_services import (
     build_ticker_history,
     compute_alerts,
@@ -93,6 +110,19 @@ class PatriaImportInput(BaseModel):
     text: str
 
 
+class PortfolioInput(BaseModel):
+    name: str
+
+
+class PortfolioAccessGrant(BaseModel):
+    portfolio_id: uuid.UUID
+    allowed_agendas: list[str] = []
+
+
+class PortfolioAccessInput(BaseModel):
+    grants: list[PortfolioAccessGrant] = []
+
+
 def json_value(value: Any) -> Any:
     if isinstance(value, Decimal):
         return float(value)
@@ -132,6 +162,25 @@ def user_dict(row: AppUser) -> dict[str, Any]:
         "alert_daily_change_pct": json_value(row.alert_daily_change_pct),
         "alert_drop_pct": json_value(row.alert_drop_pct),
     }
+
+
+def portfolio_dict(row: Portfolio) -> dict[str, Any]:
+    return {"id": str(row.id), "name": row.name}
+
+
+def user_portfolios(username: str, db: Session) -> list[dict[str, Any]]:
+    """Every Subjekt this user may see, with the agendas granted within it.
+    Admins (including the env-var bootstrap admin, which may have no AppUser
+    row) get every existing Subjekt with full PORTFOLIO_SCOPED_AGENDAS,
+    mirroring how they already bypass AppUser.allowed_agendas entirely."""
+    portfolios = db.scalars(select(Portfolio).order_by(Portfolio.name)).all()
+    if is_admin_user(username, db):
+        return [{"id": str(p.id), "name": p.name, "allowed_agendas": PORTFOLIO_SCOPED_AGENDAS} for p in portfolios]
+    grants = {
+        grant.portfolio_id: grant.allowed_agendas or []
+        for grant in db.scalars(select(PortfolioAccess).where(PortfolioAccess.username == username)).all()
+    }
+    return [{"id": str(p.id), "name": p.name, "allowed_agendas": grants[p.id]} for p in portfolios if p.id in grants]
 
 
 def resolve_threshold(db: Session, username: str, explicit: Decimal | None, field: str) -> Decimal:
@@ -175,6 +224,40 @@ def require_admin(username: str = Depends(require_user), db: Session = Depends(g
     if username == settings.app_username:
         return username
     raise HTTPException(status_code=403, detail="Pouze administrátor může spravovat uživatele")
+
+
+def is_admin_user(username: str, db: Session) -> bool:
+    user = db.get(AppUser, username)
+    if user is not None:
+        return bool(user.is_active and user.is_admin)
+    return username == settings.app_username
+
+
+def require_portfolio_access(agenda: str | tuple[str, ...] | None):
+    """Dependency factory - every portfolio-scoped endpoint depends on
+    `require_portfolio_access("assets")` etc. `agenda=None` means "any agenda
+    granted on this Subjekt" (cross-agenda endpoints like /summary); a tuple
+    means "any of these" (one endpoint backing two tabs, e.g.
+    /stocks/transactions backs both "Transakce" and "Sledování akcie").
+    Admins (and the env-var bootstrap admin, which may have no AppUser row)
+    bypass the PortfolioAccess check entirely, mirroring require_admin."""
+    agendas = (agenda,) if isinstance(agenda, str) else agenda
+
+    def _dependency(
+        portfolio_id: uuid.UUID = Query(...),
+        username: str = Depends(require_user),
+        db: Session = Depends(get_db),
+    ) -> uuid.UUID:
+        if is_admin_user(username, db):
+            return portfolio_id
+        grant = db.get(PortfolioAccess, (username, portfolio_id))
+        granted = grant.allowed_agendas or [] if grant is not None else []
+        ok = bool(granted) if agendas is None else any(agenda in granted for agenda in agendas)
+        if not ok:
+            raise HTTPException(status_code=403, detail="Nemáte přístup k tomuto subjektu")
+        return portfolio_id
+
+    return _dependency
 
 
 def normalize_match_text(value: str | None) -> str:
@@ -294,6 +377,16 @@ app.add_middleware(
 )
 
 
+def _constraint_exists(conn, table: str, name: str) -> bool:
+    return (
+        conn.execute(
+            text("SELECT 1 FROM information_schema.table_constraints WHERE table_name = :t AND constraint_name = :n"),
+            {"t": table, "n": name},
+        ).scalar()
+        is not None
+    )
+
+
 def ensure_schema_upgrades() -> None:
     """This project uses Base.metadata.create_all (creates missing tables
     only, never alters existing ones) instead of a real migration tool, so
@@ -304,6 +397,91 @@ def ensure_schema_upgrades() -> None:
         conn.execute(text("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
         conn.execute(text("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS alert_daily_change_pct NUMERIC(6, 3)"))
         conn.execute(text("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS alert_drop_pct NUMERIC(6, 3)"))
+
+        # --- Subjekt (Portfolio) support ------------------------------------
+        # `portfolios`/`portfolio_access` are brand-new tables - create_all
+        # (called just before this function, see on_startup) already created
+        # them, no manual DDL needed. Only ALTERs on pre-existing tables need
+        # hand-written statements from here on.
+
+        default_portfolio_id = conn.execute(text("SELECT id FROM portfolios ORDER BY created_at LIMIT 1")).scalar()
+        if default_portfolio_id is None:
+            default_portfolio_id = uuid.uuid4()
+            conn.execute(
+                text("INSERT INTO portfolios (id, name) VALUES (:id, :name)"),
+                {"id": default_portfolio_id, "name": "Výchozí Subjekt"},
+            )
+
+        # Nullable-add -> backfill everything onto the default Subjekt ->
+        # tighten to NOT NULL, for each of the five source-of-truth tables.
+        for table in ("assets", "asset_costs", "loan_movements", "stock_transactions", "watchlist_stocks"):
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS portfolio_id UUID"))
+            conn.execute(text(f"UPDATE {table} SET portfolio_id = :pid WHERE portfolio_id IS NULL"), {"pid": default_portfolio_id})
+            conn.execute(text(f"ALTER TABLE {table} ALTER COLUMN portfolio_id SET NOT NULL"))
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_portfolio_id ON {table} (portfolio_id)"))
+            fk_name = f"fk_{table}_portfolio_id"
+            if not _constraint_exists(conn, table, fk_name):
+                conn.execute(text(f"ALTER TABLE {table} ADD CONSTRAINT {fk_name} FOREIGN KEY (portfolio_id) REFERENCES portfolios (id)"))
+
+        # assets.code was globally unique; two Subjekty must be able to reuse
+        # the same code (e.g. both importing a property-costs workbook, which
+        # falls back to the fixed code "RD-KVASICE" - see excel_import.py),
+        # so it becomes unique per (portfolio_id, code) instead.
+        conn.execute(text("ALTER TABLE assets DROP CONSTRAINT IF EXISTS assets_code_key"))
+        if not _constraint_exists(conn, "assets", "uq_assets_portfolio_code"):
+            conn.execute(text("ALTER TABLE assets ADD CONSTRAINT uq_assets_portfolio_code UNIQUE (portfolio_id, code)"))
+
+        # portfolio_positions/daily_statistics are fully disposable computed
+        # caches - stock_services.recalculate_stocks wipes and rebuilds both
+        # in full on every run - so rather than inventing a meaningless
+        # "which Subjekt did this old cached row belong to" backfill, this
+        # clears them once (guarded to run exactly once ever, via the
+        # portfolio_id column-existence check below) and lets the next
+        # "Přepočítat portfolio" repopulate them scoped to the default
+        # Subjekt. This is NOT the same as the non-destructive guarantee
+        # that applies to real user-entered data above - it's an
+        # intentional one-time reset of a cache.
+        for table, key_col in (("portfolio_positions", "ticker"), ("daily_statistics", "stat_date")):
+            has_column = conn.execute(
+                text("SELECT 1 FROM information_schema.columns WHERE table_name = :t AND column_name = 'portfolio_id'"),
+                {"t": table},
+            ).scalar()
+            if has_column is None:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN portfolio_id UUID"))
+                conn.execute(text(f"DELETE FROM {table}"))
+                conn.execute(text(f"ALTER TABLE {table} ALTER COLUMN portfolio_id SET NOT NULL"))
+                pk_name = conn.execute(
+                    text("SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = :t AND constraint_type = 'PRIMARY KEY'"),
+                    {"t": table},
+                ).scalar()
+                if pk_name:
+                    conn.execute(text(f"ALTER TABLE {table} DROP CONSTRAINT {pk_name}"))
+                conn.execute(text(f"ALTER TABLE {table} ADD PRIMARY KEY (portfolio_id, {key_col})"))
+                fk_name = f"fk_{table}_portfolio_id"
+                if not _constraint_exists(conn, table, fk_name):
+                    conn.execute(text(f"ALTER TABLE {table} ADD CONSTRAINT {fk_name} FOREIGN KEY (portfolio_id) REFERENCES portfolios (id)"))
+
+        # Seed PortfolioAccess for the default Subjekt from each non-admin
+        # user's existing allowed_agendas, so nobody's effective access
+        # silently changes on deploy day. Only inserts if the user has no
+        # grant yet for this Subjekt - safe to rerun, and never overwrites an
+        # admin's later edits via PUT /users/{username}/portfolio-access.
+        users = conn.execute(text("SELECT username, allowed_agendas, is_admin FROM app_users")).all()
+        for username, allowed_agendas, is_admin in users:
+            if is_admin:
+                continue
+            granted = [agenda for agenda in (allowed_agendas or []) if agenda in PORTFOLIO_SCOPED_AGENDAS]
+            if not granted:
+                continue
+            already_granted = conn.execute(
+                text("SELECT 1 FROM portfolio_access WHERE username = :u AND portfolio_id = :p"),
+                {"u": username, "p": default_portfolio_id},
+            ).scalar()
+            if already_granted is None:
+                conn.execute(
+                    text("INSERT INTO portfolio_access (username, portfolio_id, allowed_agendas) VALUES (:u, :p, CAST(:a AS JSONB))"),
+                    {"u": username, "p": default_portfolio_id, "a": json.dumps(granted)},
+                )
 
 
 @app.on_event("startup")
@@ -419,8 +597,9 @@ def me(username: str = Depends(require_user), db: Session = Depends(get_db)) -> 
             "totp_enabled": False,
             "alert_daily_change_pct": None,
             "alert_drop_pct": None,
+            "portfolios": user_portfolios(username, db),
         }
-    return user_dict(user)
+    return user_dict(user) | {"portfolios": user_portfolios(username, db)}
 
 
 @app.put("/auth/me/notification-settings")
@@ -442,7 +621,10 @@ def update_notification_settings(
 @app.get("/users")
 def users(_: str = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     rows = db.scalars(select(AppUser).order_by(AppUser.username)).all()
-    return [user_dict(row) for row in rows]
+    # Embeds each user's Subjekt access (like /auth/me does for the caller
+    # themselves) so the admin "Přístup uživatelů k subjektům" editor has
+    # everything it needs from the one list call already made for this tab.
+    return [user_dict(row) | {"portfolios": user_portfolios(row.username, db)} for row in rows]
 
 
 @app.post("/users")
@@ -468,14 +650,82 @@ def create_user(payload: UserInput, _: str = Depends(require_admin), db: Session
     return user_dict(row)
 
 
+@app.get("/portfolios")
+def list_portfolios(_: str = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    rows = db.scalars(select(Portfolio).order_by(Portfolio.name)).all()
+    return [portfolio_dict(row) for row in rows]
+
+
+@app.post("/portfolios")
+def create_portfolio(payload: PortfolioInput, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Název subjektu je povinný")
+    if db.scalar(select(Portfolio).where(Portfolio.name == name)) is not None:
+        raise HTTPException(status_code=409, detail="Subjekt s tímto názvem už existuje")
+    row = Portfolio(name=name)
+    db.add(row)
+    db.commit()
+    return portfolio_dict(row)
+
+
+@app.put("/portfolios/{portfolio_id}")
+def rename_portfolio(
+    portfolio_id: uuid.UUID, payload: PortfolioInput, _: str = Depends(require_admin), db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    row = db.get(Portfolio, portfolio_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Subjekt nenalezen")
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Název subjektu je povinný")
+    if db.scalar(select(Portfolio).where(Portfolio.name == name, Portfolio.id != portfolio_id)) is not None:
+        raise HTTPException(status_code=409, detail="Subjekt s tímto názvem už existuje")
+    row.name = name
+    db.commit()
+    return portfolio_dict(row)
+
+
+@app.put("/users/{target_username}/portfolio-access")
+def set_user_portfolio_access(
+    target_username: str, payload: PortfolioAccessInput, _: str = Depends(require_admin), db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    """Bulk-replaces a user's full set of Subjekt grants - same bulk-set (not
+    patch/merge) style POST /users already uses for allowed_agendas."""
+    if db.get(AppUser, target_username) is None:
+        raise HTTPException(status_code=404, detail="Uživatel nenalezen")
+    valid_portfolio_ids = {row.id for row in db.scalars(select(Portfolio)).all()}
+    db.execute(delete(PortfolioAccess).where(PortfolioAccess.username == target_username))
+    for grant in payload.grants:
+        if grant.portfolio_id not in valid_portfolio_ids:
+            continue
+        allowed = [agenda for agenda in grant.allowed_agendas if agenda in PORTFOLIO_SCOPED_AGENDAS]
+        if not allowed:
+            continue
+        db.add(PortfolioAccess(username=target_username, portfolio_id=grant.portfolio_id, allowed_agendas=allowed))
+    db.commit()
+    return {"username": target_username, "portfolios": user_portfolios(target_username, db)}
+
+
 @app.get("/summary")
-def summary(_: str = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    latest_stat = db.scalar(select(DailyStatistic).order_by(desc(DailyStatistic.stat_date)).limit(1))
-    loan_total = db.scalar(select(func.coalesce(func.sum(LoanMovement.amount), 0)))
-    asset_total = db.scalar(select(func.coalesce(func.sum(Asset.total_value), 0)))
-    cost_total = db.scalar(select(func.coalesce(func.sum(AssetCost.amount), 0)))
-    portfolio_value = db.scalar(select(func.coalesce(func.sum(PortfolioPosition.market_value_czk), 0)))
-    portfolio_profit = db.scalar(select(func.coalesce(func.sum(PortfolioPosition.profit_czk), 0)))
+def summary(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access(None)), db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    latest_stat = db.scalar(
+        select(DailyStatistic)
+        .where(DailyStatistic.portfolio_id == portfolio_id)
+        .order_by(desc(DailyStatistic.stat_date))
+        .limit(1)
+    )
+    loan_total = db.scalar(select(func.coalesce(func.sum(LoanMovement.amount), 0)).where(LoanMovement.portfolio_id == portfolio_id))
+    asset_total = db.scalar(select(func.coalesce(func.sum(Asset.total_value), 0)).where(Asset.portfolio_id == portfolio_id))
+    cost_total = db.scalar(select(func.coalesce(func.sum(AssetCost.amount), 0)).where(AssetCost.portfolio_id == portfolio_id))
+    portfolio_value = db.scalar(
+        select(func.coalesce(func.sum(PortfolioPosition.market_value_czk), 0)).where(PortfolioPosition.portfolio_id == portfolio_id)
+    )
+    portfolio_profit = db.scalar(
+        select(func.coalesce(func.sum(PortfolioPosition.profit_czk), 0)).where(PortfolioPosition.portfolio_id == portfolio_id)
+    )
     return {
         "loans_total": json_value(loan_total),
         "assets_total": json_value(asset_total),
@@ -484,21 +734,36 @@ def summary(_: str = Depends(require_user), db: Session = Depends(get_db)) -> di
         "portfolio_profit_czk": json_value(portfolio_profit),
         "latest_stat": model_dict(latest_stat) if latest_stat else None,
         "counts": {
-            "loan_movements": db.scalar(select(func.count()).select_from(LoanMovement)),
-            "assets": db.scalar(select(func.count()).select_from(Asset)),
-            "asset_costs": db.scalar(select(func.count()).select_from(AssetCost)),
-            "stock_transactions": db.scalar(select(func.count()).select_from(StockTransaction)),
-            "watchlist_stocks": db.scalar(select(func.count()).select_from(WatchlistStock)),
-            "portfolio_positions": db.scalar(select(func.count()).select_from(PortfolioPosition)),
-            "daily_statistics": db.scalar(select(func.count()).select_from(DailyStatistic)),
+            "loan_movements": db.scalar(select(func.count()).select_from(LoanMovement).where(LoanMovement.portfolio_id == portfolio_id)),
+            "assets": db.scalar(select(func.count()).select_from(Asset).where(Asset.portfolio_id == portfolio_id)),
+            "asset_costs": db.scalar(select(func.count()).select_from(AssetCost).where(AssetCost.portfolio_id == portfolio_id)),
+            "stock_transactions": db.scalar(
+                select(func.count()).select_from(StockTransaction).where(StockTransaction.portfolio_id == portfolio_id)
+            ),
+            "watchlist_stocks": db.scalar(
+                select(func.count()).select_from(WatchlistStock).where(WatchlistStock.portfolio_id == portfolio_id)
+            ),
+            "portfolio_positions": db.scalar(
+                select(func.count()).select_from(PortfolioPosition).where(PortfolioPosition.portfolio_id == portfolio_id)
+            ),
+            "daily_statistics": db.scalar(
+                select(func.count()).select_from(DailyStatistic).where(DailyStatistic.portfolio_id == portfolio_id)
+            ),
             "exchange_rates": db.scalar(select(func.count()).select_from(ExchangeRate)),
         },
     }
 
 
 @app.get("/loans/movements")
-def loan_movements(_: str = Depends(require_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    rows = db.scalars(select(LoanMovement).order_by(desc(LoanMovement.movement_date).nullslast()).limit(500)).all()
+def loan_movements(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("loans")), db: Session = Depends(get_db)
+) -> list[dict[str, Any]]:
+    rows = db.scalars(
+        select(LoanMovement)
+        .where(LoanMovement.portfolio_id == portfolio_id)
+        .order_by(desc(LoanMovement.movement_date).nullslast())
+        .limit(500)
+    ).all()
     party_names = {p.id: p.name for p in db.scalars(select(Party)).all()}
     result = []
     for row in rows:
@@ -510,7 +775,9 @@ def loan_movements(_: str = Depends(require_user), db: Session = Depends(get_db)
 
 
 @app.post("/loans/cleanup-imported-subtotals")
-def cleanup_loan_subtotals(_: str = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+def cleanup_loan_subtotals(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("loans")), db: Session = Depends(get_db)
+) -> dict[str, Any]:
     """One-off cleanup for databases imported before the fix: the source
     "Půjčky Pohyby" sheet has monthly/yearly subtotal rows baked directly
     into the data (a "Leden 2023"/"2023" text label instead of a real date,
@@ -520,15 +787,19 @@ def cleanup_loan_subtotals(_: str = Depends(require_user), db: Session = Depends
     those (movement_date IS NULL, never true for a real movement) without
     touching any real loan data or requiring a full destructive re-import.
     """
-    deleted = db.execute(delete(LoanMovement).where(LoanMovement.movement_date.is_(None))).rowcount
+    deleted = db.execute(
+        delete(LoanMovement).where(LoanMovement.portfolio_id == portfolio_id, LoanMovement.movement_date.is_(None))
+    ).rowcount
     db.commit()
     return {"deleted": deleted}
 
 
 @app.get("/assets")
-def assets(_: str = Depends(require_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def assets(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("assets")), db: Session = Depends(get_db)
+) -> list[dict[str, Any]]:
     owners = {p.id: p.name for p in db.scalars(select(Party)).all()}
-    rows = db.scalars(select(Asset).order_by(Asset.code)).all()
+    rows = db.scalars(select(Asset).where(Asset.portfolio_id == portfolio_id).order_by(Asset.code)).all()
     return [
         model_dict(row) | {"owner": owners.get(row.owner_id), "computed_interest_plan": computed_interest_plan(row)}
         for row in rows
@@ -537,9 +808,11 @@ def assets(_: str = Depends(require_user), db: Session = Depends(get_db)) -> lis
 
 @app.get("/assets/{asset_id}/interest-projection")
 def asset_interest_projection(
-    asset_id: str, _: str = Depends(require_user), db: Session = Depends(get_db)
+    asset_id: str,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("assets")),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    asset = db.get(Asset, asset_id)
+    asset = db.scalar(select(Asset).where(Asset.id == asset_id, Asset.portfolio_id == portfolio_id))
     if asset is None:
         raise HTTPException(status_code=404, detail="Majetek nenalezen")
     projection = computed_interest_plan(asset)
@@ -553,10 +826,12 @@ def asset_interest_projection(
 
 
 @app.get("/assets/agendas")
-def asset_agendas(_: str = Depends(require_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def asset_agendas(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("assets")), db: Session = Depends(get_db)
+) -> list[dict[str, Any]]:
     owners = {p.id: p.name for p in db.scalars(select(Party)).all()}
     payers = {p.id: p.name for p in db.scalars(select(Party)).all()}
-    assets = db.scalars(select(Asset).order_by(Asset.code)).all()
+    assets = db.scalars(select(Asset).where(Asset.portfolio_id == portfolio_id).order_by(Asset.code)).all()
     result = []
     for asset in assets:
         linked_costs = db.scalars(
@@ -566,7 +841,9 @@ def asset_agendas(_: str = Depends(require_user), db: Session = Depends(get_db))
         ).all()
         unlinked_costs = [
             cost
-            for cost in db.scalars(select(AssetCost).where(AssetCost.asset_id.is_(None))).all()
+            for cost in db.scalars(
+                select(AssetCost).where(AssetCost.portfolio_id == portfolio_id, AssetCost.asset_id.is_(None))
+            ).all()
             if source_sheet_matches_asset(cost.source_sheet, asset.name)
         ]
         costs = sorted(
@@ -602,45 +879,80 @@ def asset_agendas(_: str = Depends(require_user), db: Session = Depends(get_db))
 
 
 @app.get("/assets/costs")
-def asset_costs(_: str = Depends(require_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    rows = db.scalars(select(AssetCost).order_by(desc(AssetCost.cost_date).nullslast()).limit(500)).all()
+def asset_costs(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("costs")), db: Session = Depends(get_db)
+) -> list[dict[str, Any]]:
+    rows = db.scalars(
+        select(AssetCost)
+        .where(AssetCost.portfolio_id == portfolio_id)
+        .order_by(desc(AssetCost.cost_date).nullslast())
+        .limit(500)
+    ).all()
     assets_by_id = {a.id: a.name for a in db.scalars(select(Asset)).all()}
     payers = {p.id: p.name for p in db.scalars(select(Party)).all()}
     return [model_dict(row) | {"asset": assets_by_id.get(row.asset_id), "payer": payers.get(row.payer_id)} for row in rows]
 
 
 @app.get("/stocks/transactions")
-def stock_transactions(_: str = Depends(require_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    rows = db.scalars(select(StockTransaction).order_by(desc(StockTransaction.traded_on).nullslast()).limit(500)).all()
+def stock_transactions(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access(("transactions", "history"))),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    rows = db.scalars(
+        select(StockTransaction)
+        .where(StockTransaction.portfolio_id == portfolio_id)
+        .order_by(desc(StockTransaction.traded_on).nullslast())
+        .limit(500)
+    ).all()
     return [model_dict(row) for row in rows]
 
 
 @app.get("/stocks/portfolio")
-def portfolio(_: str = Depends(require_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    rows = db.scalars(select(PortfolioPosition).order_by(desc(PortfolioPosition.market_value_czk).nullslast())).all()
+def portfolio(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("portfolio")), db: Session = Depends(get_db)
+) -> list[dict[str, Any]]:
+    rows = db.scalars(
+        select(PortfolioPosition)
+        .where(PortfolioPosition.portfolio_id == portfolio_id)
+        .order_by(desc(PortfolioPosition.market_value_czk).nullslast())
+    ).all()
     return [model_dict(row) for row in rows]
 
 
 @app.get("/stocks/watchlist")
-def stock_watchlist(_: str = Depends(require_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    rows = db.scalars(select(WatchlistStock).order_by(desc(WatchlistStock.watched_on).nullslast(), WatchlistStock.ticker)).all()
+def stock_watchlist(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("watchlist")), db: Session = Depends(get_db)
+) -> list[dict[str, Any]]:
+    rows = db.scalars(
+        select(WatchlistStock)
+        .where(WatchlistStock.portfolio_id == portfolio_id)
+        .order_by(desc(WatchlistStock.watched_on).nullslast(), WatchlistStock.ticker)
+    ).all()
     return [model_dict(row) for row in rows]
 
 
 @app.get("/stocks/statistics")
-def stock_statistics(_: str = Depends(require_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    rows = db.scalars(select(DailyStatistic).order_by(desc(DailyStatistic.stat_date)).limit(200)).all()
+def stock_statistics(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access(("stats", "charts"))), db: Session = Depends(get_db)
+) -> list[dict[str, Any]]:
+    rows = db.scalars(
+        select(DailyStatistic).where(DailyStatistic.portfolio_id == portfolio_id).order_by(desc(DailyStatistic.stat_date)).limit(200)
+    ).all()
     return [model_dict(row) for row in rows]
 
 
 @app.get("/stocks/overview")
-def stock_overview(_: str = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+def stock_overview(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access(("transactions", "watchlist", "portfolio"))),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
     movements = db.execute(
         select(
             StockTransaction.movement_type,
             func.count().label("count"),
             func.coalesce(func.sum(StockTransaction.amount_czk), 0).label("amount_czk"),
         )
+        .where(StockTransaction.portfolio_id == portfolio_id)
         .group_by(StockTransaction.movement_type)
         .order_by(StockTransaction.movement_type)
     ).all()
@@ -651,11 +963,22 @@ def stock_overview(_: str = Depends(require_user), db: Session = Depends(get_db)
             func.coalesce(func.sum(StockTransaction.gross_amount_ccy), 0).label("amount_ccy"),
             func.coalesce(func.sum(StockTransaction.amount_czk), 0).label("amount_czk"),
         )
+        .where(StockTransaction.portfolio_id == portfolio_id)
         .group_by(StockTransaction.currency)
         .order_by(StockTransaction.currency)
     ).all()
-    top_profit = db.scalars(select(PortfolioPosition).order_by(desc(PortfolioPosition.profit_czk).nullslast()).limit(8)).all()
-    top_loss = db.scalars(select(PortfolioPosition).order_by(PortfolioPosition.profit_czk.nullslast()).limit(8)).all()
+    top_profit = db.scalars(
+        select(PortfolioPosition)
+        .where(PortfolioPosition.portfolio_id == portfolio_id)
+        .order_by(desc(PortfolioPosition.profit_czk).nullslast())
+        .limit(8)
+    ).all()
+    top_loss = db.scalars(
+        select(PortfolioPosition)
+        .where(PortfolioPosition.portfolio_id == portfolio_id)
+        .order_by(PortfolioPosition.profit_czk.nullslast())
+        .limit(8)
+    ).all()
     return {
         "movements": [
             {"movement_type": row.movement_type, "count": row.count, "amount_czk": json_value(row.amount_czk)}
@@ -678,10 +1001,11 @@ def stock_overview(_: str = Depends(require_user), db: Session = Depends(get_db)
 @app.get("/stocks/alerts")
 def stock_alerts(
     username: str = Depends(require_user),
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("alerts")),
     db: Session = Depends(get_db),
     threshold_pct: Decimal | None = Query(default=None),
 ) -> dict[str, Any]:
-    return compute_alerts(db, threshold_pct=resolve_threshold(db, username, threshold_pct, "alert_drop_pct"))
+    return compute_alerts(db, portfolio_id, threshold_pct=resolve_threshold(db, username, threshold_pct, "alert_drop_pct"))
 
 
 @app.get("/stocks/ticker-history")
@@ -689,31 +1013,39 @@ def stock_ticker_history(
     ticker: str,
     date_from: date,
     date_to: date,
-    _: str = Depends(require_user),
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("history")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    return build_ticker_history(db, ticker=ticker, date_from=date_from, date_to=date_to)
+    return build_ticker_history(db, portfolio_id, ticker=ticker, date_from=date_from, date_to=date_to)
 
 
 @app.post("/stocks/import-patria")
-def import_patria(payload: PatriaImportInput, _: str = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+def import_patria(
+    payload: PatriaImportInput,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("transactions")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
     if not payload.text.strip():
         raise HTTPException(status_code=400, detail="Text z Patrie je prázdný")
-    return import_patria_trades(db, payload.text)
+    return import_patria_trades(db, portfolio_id, payload.text)
 
 
 @app.post("/stocks/refresh-prices")
 def refresh_stock_prices(
     username: str = Depends(require_user),
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access(None)),
     db: Session = Depends(get_db),
     threshold_pct: Decimal | None = Query(default=None),
 ) -> dict[str, Any]:
-    return refresh_current_prices(db, threshold_pct=resolve_threshold(db, username, threshold_pct, "alert_daily_change_pct"))
+    return refresh_current_prices(
+        db, portfolio_id, threshold_pct=resolve_threshold(db, username, threshold_pct, "alert_daily_change_pct")
+    )
 
 
 @app.post("/stocks/recalculate")
 def recalculate_stock_data(
     username: str = Depends(require_user),
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access(None)),
     db: Session = Depends(get_db),
     dry_run: bool = False,
     date_from: date | None = Query(default=None),
@@ -731,7 +1063,7 @@ def recalculate_stock_data(
         # does before recomputing - but only for a real (non-preview) run, so
         # "Kontrola (náhled)" keeps its "nothing gets saved" promise.
         cnb_rates_added = ensure_cnb_rates_up_to_date(db) if not dry_run else 0
-        result = recalculate_stocks(db, dry_run=dry_run, date_from=date_from, threshold_pct=effective_threshold)
+        result = recalculate_stocks(db, portfolio_id, dry_run=dry_run, date_from=date_from, threshold_pct=effective_threshold)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 - last-resort safety net, see above
@@ -816,7 +1148,7 @@ def fetch_exchange_rates_from_cnb(
 async def import_excel(
     finance: UploadFile = File(...),
     property_costs: UploadFile | None = File(None),
-    _: str = Depends(require_user),
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access(None)),
 ) -> dict[str, Any]:
     suffix = Path(finance.filename or "finance.xlsm").suffix or ".xlsm"
     with NamedTemporaryFile(delete=False, suffix=suffix) as f:
@@ -827,5 +1159,5 @@ async def import_excel(
         with NamedTemporaryFile(delete=False, suffix=Path(property_costs.filename or "costs.xlsx").suffix or ".xlsx") as f:
             property_path = Path(f.name)
             f.write(await property_costs.read())
-    counts = import_workbooks(finance_path, property_path)
+    counts = import_workbooks(finance_path, property_path, portfolio_id=portfolio_id)
     return {"status": "done", "counts": counts}

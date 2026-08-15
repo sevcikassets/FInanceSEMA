@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import unicodedata
+import uuid
 from collections import Counter
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
@@ -22,6 +23,7 @@ from .models import (
     ImportBatch,
     LoanMovement,
     Party,
+    Portfolio,
     PortfolioPosition,
     StockTransaction,
     TickerDescription,
@@ -84,22 +86,25 @@ def normalize_match_text(value: str | None) -> str:
     return " ".join(part for part in text.lower().replace("-", " ").split() if part not in {"byt"})
 
 
-def reset_imported_tables(db: Session) -> None:
+def reset_imported_tables(db: Session, portfolio_id: uuid.UUID) -> None:
+    # ExchangeRate/TickerDescription are intentionally NOT included here - they
+    # are shared/global reference data (CZK rates, ticker->name lookups), not
+    # one Subjekt's property. Wiping them on every import would delete another
+    # Subjekt's contributed rate/ticker history (see import_exchange_rates,
+    # which upserts instead of blind-inserting for the same reason).
     for model in [
         DailyStatistic,
         PortfolioPosition,
-        TickerDescription,
-        ExchangeRate,
         StockTransaction,
         WatchlistStock,
         AssetCost,
         Asset,
         LoanMovement,
     ]:
-        db.execute(delete(model))
+        db.execute(delete(model).where(model.portfolio_id == portfolio_id))
 
 
-def import_loans(db: Session, wb) -> int:
+def import_loans(db: Session, wb, portfolio_id: uuid.UUID) -> int:
     if "Půjčky Pohyby" not in wb.sheetnames:
         return 0
     ws = wb["Půjčky Pohyby"]
@@ -120,6 +125,7 @@ def import_loans(db: Session, wb) -> int:
         if amount is None:
             continue
         movement = LoanMovement(
+            portfolio_id=portfolio_id,
             movement_date=movement_date,
             lender=get_or_create_party(db, lender_name),
             borrower=get_or_create_party(db, borrower_name),
@@ -136,7 +142,7 @@ def import_loans(db: Session, wb) -> int:
     return count
 
 
-def import_assets(db: Session, wb) -> int:
+def import_assets(db: Session, wb, portfolio_id: uuid.UUID) -> int:
     if "Investice" not in wb.sheetnames:
         return 0
     ws = wb["Investice"]
@@ -153,6 +159,7 @@ def import_assets(db: Session, wb) -> int:
             if (value := as_decimal(ws.cell(r, c).value)) is not None
         }
         asset = Asset(
+            portfolio_id=portfolio_id,
             code=code,
             owner=get_or_create_party(db, as_text(ws.cell(r, 3).value), "owner"),
             asset_type=as_text(ws.cell(r, 4).value),
@@ -175,9 +182,9 @@ def import_assets(db: Session, wb) -> int:
     return count
 
 
-def find_asset_by_name(db: Session, sheet_name: str) -> Asset | None:
+def find_asset_by_name(db: Session, portfolio_id: uuid.UUID, sheet_name: str) -> Asset | None:
     sheet_tokens = normalize_match_text(sheet_name).split()
-    for asset in db.scalars(select(Asset)).all():
+    for asset in db.scalars(select(Asset).where(Asset.portfolio_id == portfolio_id)).all():
         asset_text = normalize_match_text(asset.name)
         if sheet_tokens and all(token in asset_text for token in sheet_tokens):
             return asset
@@ -192,7 +199,7 @@ def find_header_row(ws, required: set[str], max_scan_rows: int = 10) -> tuple[in
     return None
 
 
-def import_asset_cost_sheets(db: Session, wb) -> int:
+def import_asset_cost_sheets(db: Session, wb, portfolio_id: uuid.UUID) -> int:
     count = 0
     skip = {
         "Rekaptiulace ÚVĚRY",
@@ -218,7 +225,7 @@ def import_asset_cost_sheets(db: Session, wb) -> int:
         if header_info is None:
             continue
         header_row, headers = header_info
-        asset = find_asset_by_name(db, ws.title)
+        asset = find_asset_by_name(db, portfolio_id, ws.title)
         for r in range(header_row + 1, ws.max_row + 1):
             amount = as_decimal(ws.cell(r, headers.index("Částka") + 1).value)
             item = as_text(ws.cell(r, headers.index("Účel") + 1).value) if "Účel" in headers else None
@@ -226,6 +233,7 @@ def import_asset_cost_sheets(db: Session, wb) -> int:
                 continue
             db.add(
                 AssetCost(
+                    portfolio_id=portfolio_id,
                     asset=asset,
                     cost_date=as_date(ws.cell(r, headers.index("Datum") + 1).value),
                     supplier=as_text(ws.cell(r, headers.index("Firma") + 1).value) if "Firma" in headers else None,
@@ -239,13 +247,13 @@ def import_asset_cost_sheets(db: Session, wb) -> int:
     return count
 
 
-def import_property_costs(db: Session, path: Path) -> int:
+def import_property_costs(db: Session, path: Path, portfolio_id: uuid.UUID) -> int:
     wb = load_workbook(path, data_only=True, read_only=True)
     if "Finance" not in wb.sheetnames:
         return 0
-    asset = db.scalar(select(Asset).where(Asset.code == "RD-KVASICE"))
+    asset = db.scalar(select(Asset).where(Asset.portfolio_id == portfolio_id, Asset.code == "RD-KVASICE"))
     if asset is None:
-        asset = Asset(code="RD-KVASICE", name="RD Kvasice", asset_type="Nemovitost")
+        asset = Asset(portfolio_id=portfolio_id, code="RD-KVASICE", name="RD Kvasice", asset_type="Nemovitost")
         db.add(asset)
         db.flush()
     ws = wb["Finance"]
@@ -261,6 +269,7 @@ def import_property_costs(db: Session, path: Path) -> int:
             continue
         db.add(
             AssetCost(
+                portfolio_id=portfolio_id,
                 asset=asset,
                 cost_date=as_date(raw_date),
                 payer=get_or_create_party(db, as_text(ws.cell(r, 2).value), "payer"),
@@ -277,7 +286,7 @@ def import_property_costs(db: Session, path: Path) -> int:
     return count
 
 
-def import_stocks(db: Session, wb) -> int:
+def import_stocks(db: Session, wb, portfolio_id: uuid.UUID) -> int:
     if "Akcie" not in wb.sheetnames:
         return 0
     ws = wb["Akcie"]
@@ -290,6 +299,7 @@ def import_stocks(db: Session, wb) -> int:
             continue
         db.add(
             StockTransaction(
+                portfolio_id=portfolio_id,
                 traded_on=as_date(ws.cell(r, 2).value),
                 instrument_type=as_text(ws.cell(r, 3).value),
                 movement_type=movement,
@@ -317,7 +327,7 @@ def import_stocks(db: Session, wb) -> int:
     return count
 
 
-def import_watchlist_stocks(db: Session, wb) -> int:
+def import_watchlist_stocks(db: Session, wb, portfolio_id: uuid.UUID) -> int:
     if "Sledované akcie" not in wb.sheetnames:
         return 0
     ws = wb["Sledované akcie"]
@@ -330,6 +340,7 @@ def import_watchlist_stocks(db: Session, wb) -> int:
             continue
         db.add(
             WatchlistStock(
+                portfolio_id=portfolio_id,
                 watched_on=as_date(ws.cell(r, 2).value),
                 reason=reason,
                 quantity=as_decimal(ws.cell(r, 4).value),
@@ -354,6 +365,10 @@ def import_watchlist_stocks(db: Session, wb) -> int:
 
 
 def import_exchange_rates(db: Session, wb) -> int:
+    # Global/shared reference data (see reset_imported_tables) - no longer
+    # wiped before every import, so this must upsert by (rate_date, currency)
+    # rather than blind-insert, or a second Subjekt's import would hit that
+    # unique constraint on any date/currency the first import already covered.
     if "Kurzy" not in wb.sheetnames:
         return 0
     ws = wb["Kurzy"]
@@ -364,7 +379,11 @@ def import_exchange_rates(db: Session, wb) -> int:
         rate = as_decimal(ws.cell(r, 5).value)
         if not rate_date or not currency or rate is None:
             continue
-        db.add(ExchangeRate(rate_date=rate_date, currency=currency, rate_to_czk=rate))
+        existing = db.scalar(select(ExchangeRate).where(ExchangeRate.rate_date == rate_date, ExchangeRate.currency == currency))
+        if existing is None:
+            db.add(ExchangeRate(rate_date=rate_date, currency=currency, rate_to_czk=rate))
+        else:
+            existing.rate_to_czk = rate
         count += 1
     return count
 
@@ -390,7 +409,7 @@ def import_ticker_descriptions(db: Session, wb) -> int:
     return count
 
 
-def import_portfolio(db: Session, wb) -> int:
+def import_portfolio(db: Session, wb, portfolio_id: uuid.UUID) -> int:
     if "Portfolio" not in wb.sheetnames:
         return 0
     ws = wb["Portfolio"]
@@ -401,6 +420,7 @@ def import_portfolio(db: Session, wb) -> int:
             continue
         db.merge(
             PortfolioPosition(
+                portfolio_id=portfolio_id,
                 ticker=ticker,
                 name=as_text(ws.cell(r, 2).value),
                 quantity=as_decimal(ws.cell(r, 3).value),
@@ -419,7 +439,7 @@ def import_portfolio(db: Session, wb) -> int:
     return count
 
 
-def import_daily_statistics(db: Session, wb) -> int:
+def import_daily_statistics(db: Session, wb, portfolio_id: uuid.UUID) -> int:
     if "Akcie statistika" not in wb.sheetnames:
         return 0
     ws = wb["Akcie statistika"]
@@ -430,6 +450,7 @@ def import_daily_statistics(db: Session, wb) -> int:
             continue
         db.merge(
             DailyStatistic(
+                portfolio_id=portfolio_id,
                 stat_date=stat_date,
                 bought_eur=as_decimal(ws.cell(r, 3).value),
                 total_eur=as_decimal(ws.cell(r, 4).value),
@@ -458,7 +479,7 @@ def import_daily_statistics(db: Session, wb) -> int:
     return count
 
 
-def import_workbooks(finance_path: Path, property_costs_path: Path | None = None) -> dict[str, int]:
+def import_workbooks(finance_path: Path, property_costs_path: Path | None = None, *, portfolio_id: uuid.UUID) -> dict[str, int]:
     Base.metadata.create_all(bind=engine)
     counts: Counter[str] = Counter()
     with SessionLocal() as db:
@@ -466,19 +487,19 @@ def import_workbooks(finance_path: Path, property_costs_path: Path | None = None
         db.add(batch)
         db.flush()
         try:
-            reset_imported_tables(db)
+            reset_imported_tables(db, portfolio_id)
             wb = load_workbook(finance_path, data_only=True, read_only=False, keep_vba=True)
-            counts["loans"] = import_loans(db, wb)
-            counts["assets"] = import_assets(db, wb)
-            counts["asset_costs"] += import_asset_cost_sheets(db, wb)
-            counts["stock_transactions"] = import_stocks(db, wb)
-            counts["watchlist_stocks"] = import_watchlist_stocks(db, wb)
+            counts["loans"] = import_loans(db, wb, portfolio_id)
+            counts["assets"] = import_assets(db, wb, portfolio_id)
+            counts["asset_costs"] += import_asset_cost_sheets(db, wb, portfolio_id)
+            counts["stock_transactions"] = import_stocks(db, wb, portfolio_id)
+            counts["watchlist_stocks"] = import_watchlist_stocks(db, wb, portfolio_id)
             counts["exchange_rates"] = import_exchange_rates(db, wb)
             counts["ticker_descriptions"] = import_ticker_descriptions(db, wb)
-            counts["portfolio_positions"] = import_portfolio(db, wb)
-            counts["daily_statistics"] = import_daily_statistics(db, wb)
+            counts["portfolio_positions"] = import_portfolio(db, wb, portfolio_id)
+            counts["daily_statistics"] = import_daily_statistics(db, wb, portfolio_id)
             if property_costs_path:
-                counts["asset_costs"] += import_property_costs(db, property_costs_path)
+                counts["asset_costs"] += import_property_costs(db, property_costs_path, portfolio_id)
             batch.status = "done"
             batch.row_counts = dict(counts)
             batch.finished_at = datetime.now(UTC)
@@ -497,8 +518,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--finance", required=True, type=Path)
     parser.add_argument("--property-costs", type=Path)
+    parser.add_argument("--portfolio-id", type=uuid.UUID, help="Cílový Subjekt (default: první existující, viz /portfolios)")
     args = parser.parse_args()
-    counts = import_workbooks(args.finance, args.property_costs)
+    Base.metadata.create_all(bind=engine)
+    with SessionLocal() as db:
+        portfolio_id = args.portfolio_id
+        if portfolio_id is None:
+            portfolio = db.scalar(select(Portfolio).order_by(Portfolio.created_at))
+            if portfolio is None:
+                raise SystemExit("Žádný Subjekt v databázi neexistuje - spusťte appku alespoň jednou (vytvoří výchozí) nebo zadejte --portfolio-id.")
+            portfolio_id = portfolio.id
+    counts = import_workbooks(args.finance, args.property_costs, portfolio_id=portfolio_id)
     for key, value in counts.items():
         print(f"{key}: {value}")
 

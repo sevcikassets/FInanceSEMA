@@ -59,6 +59,16 @@ def db_session():
 
 
 @pytest.fixture()
+def portfolio_id(db_session):
+    from app.models import Portfolio
+
+    portfolio = Portfolio(name="Test Subjekt")
+    db_session.add(portfolio)
+    db_session.commit()
+    return portfolio.id
+
+
+@pytest.fixture()
 def client(db_session):
     from fastapi.testclient import TestClient
 

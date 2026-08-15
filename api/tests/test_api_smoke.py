@@ -15,7 +15,7 @@ from .conftest import requires_db
 
 
 @requires_db
-def test_refresh_current_prices_does_not_crash_for_watchlist_only_ticker(db_session, monkeypatch):
+def test_refresh_current_prices_does_not_crash_for_watchlist_only_ticker(db_session, portfolio_id, monkeypatch):
     """Regression test for the bug where `rate` was undefined when a ticker had
     no PortfolioPosition (only StockTransaction/WatchlistStock rows)."""
     from app import stock_services
@@ -23,6 +23,7 @@ def test_refresh_current_prices_does_not_crash_for_watchlist_only_ticker(db_sess
 
     db_session.add(
         StockTransaction(
+            portfolio_id=portfolio_id,
             traded_on=date(2024, 2, 1),
             movement_type="Nákup",
             instrument_name="Apple",
@@ -35,24 +36,32 @@ def test_refresh_current_prices_does_not_crash_for_watchlist_only_ticker(db_sess
         )
     )
     db_session.add(
-        WatchlistStock(watched_on=date(2024, 1, 1), name="Apple", ticker="AAPL", limit_price=Decimal("200"), currency="USD")
+        WatchlistStock(
+            portfolio_id=portfolio_id,
+            watched_on=date(2024, 1, 1),
+            name="Apple",
+            ticker="AAPL",
+            limit_price=Decimal("200"),
+            currency="USD",
+        )
     )
     db_session.commit()
 
     monkeypatch.setattr(stock_services, "fetch_yahoo_price", lambda ticker: {"price": Decimal("190"), "currency": "USD"})
 
-    result = stock_services.refresh_current_prices(db_session, threshold_pct=Decimal("5"))
+    result = stock_services.refresh_current_prices(db_session, portfolio_id, threshold_pct=Decimal("5"))
     assert result["updated"] == 1
     assert result["errors"] == []
 
 
 @requires_db
-def test_compute_alerts_reports_watchlist_breach_and_drawdown(db_session):
+def test_compute_alerts_reports_watchlist_breach_and_drawdown(db_session, portfolio_id):
     from app import stock_services
     from app.models import DailyStatistic, PortfolioPosition, WatchlistStock
 
     db_session.add(
         WatchlistStock(
+            portfolio_id=portfolio_id,
             watched_on=date(2024, 1, 1),
             name="Apple",
             ticker="AAPL",
@@ -63,6 +72,7 @@ def test_compute_alerts_reports_watchlist_breach_and_drawdown(db_session):
     )
     db_session.add(
         PortfolioPosition(
+            portfolio_id=portfolio_id,
             ticker="MSFT",
             name="Microsoft",
             quantity=Decimal("1"),
@@ -80,13 +90,14 @@ def test_compute_alerts_reports_watchlist_breach_and_drawdown(db_session):
     # structured category instead of leaving them buried in that text blob.
     db_session.add(
         DailyStatistic(
+            portfolio_id=portfolio_id,
             stat_date=date(2024, 1, 10),
             alerts="INTC (D:-11.3%), AMD (D:+12.0%) | Chybí cena: XYZ",
         )
     )
     db_session.commit()
 
-    alerts = stock_services.compute_alerts(db_session, threshold_pct=Decimal("10"))
+    alerts = stock_services.compute_alerts(db_session, portfolio_id, threshold_pct=Decimal("10"))
     assert any(a["ticker"] == "AAPL" for a in alerts["watchlist_limit_breaches"])
     assert any(a["ticker"] == "MSFT" for a in alerts["portfolio_drawdowns"])
     movers = {m["ticker"]: m["change_pct"] for m in alerts["daily_movers"]}
@@ -96,12 +107,13 @@ def test_compute_alerts_reports_watchlist_breach_and_drawdown(db_session):
 
 
 @requires_db
-def test_build_ticker_history_accumulates_purchases(db_session, monkeypatch):
+def test_build_ticker_history_accumulates_purchases(db_session, portfolio_id, monkeypatch):
     from app import stock_services
     from app.models import StockTransaction
 
     db_session.add(
         StockTransaction(
+            portfolio_id=portfolio_id,
             traded_on=date(2024, 2, 1),
             movement_type="Nákup",
             instrument_name="Apple",
@@ -127,20 +139,21 @@ def test_build_ticker_history_accumulates_purchases(db_session, monkeypatch):
 
     monkeypatch.setattr(stock_services, "fetch_yahoo_history", fake_history)
 
-    history = stock_services.build_ticker_history(db_session, "AAPL", date(2024, 2, 1), date(2024, 2, 5))
+    history = stock_services.build_ticker_history(db_session, portfolio_id, "AAPL", date(2024, 2, 1), date(2024, 2, 5))
     assert len(history["rows"]) == 5
     assert history["rows"][0]["buy_quantity"] == 2.0
     assert history["summary"]["cumulative_quantity"] == 2.0
 
 
 @requires_db
-def test_asset_endpoints_expose_computed_interest_plan(client):
+def test_asset_endpoints_expose_computed_interest_plan(client, portfolio_id):
     from app.models import Asset
     from app.db import SessionLocal
 
     session = SessionLocal()
     try:
         asset = Asset(
+            portfolio_id=portfolio_id,
             code="TEST-01",
             name="Testovaci byt",
             asset_type="Byt",
@@ -160,12 +173,13 @@ def test_asset_endpoints_expose_computed_interest_plan(client):
     login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
     assert login.status_code == 200
     headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
 
-    assets_response = client.get("/assets", headers=headers)
+    assets_response = client.get("/assets", headers=headers, params=params)
     assert assets_response.status_code == 200
     assert "computed_interest_plan" in assets_response.json()[0]
 
-    projection_response = client.get(f"/assets/{asset_id}/interest-projection", headers=headers)
+    projection_response = client.get(f"/assets/{asset_id}/interest-projection", headers=headers, params=params)
     assert projection_response.status_code == 200
     payload = projection_response.json()
     assert payload["total_computed"] > 0
@@ -173,19 +187,20 @@ def test_asset_endpoints_expose_computed_interest_plan(client):
 
 
 @requires_db
-def test_stocks_alerts_endpoint_requires_auth(client):
-    unauthenticated = client.get("/stocks/alerts")
+def test_stocks_alerts_endpoint_requires_auth(client, portfolio_id):
+    params = {"portfolio_id": str(portfolio_id)}
+    unauthenticated = client.get("/stocks/alerts", params=params)
     assert unauthenticated.status_code == 401
 
     login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
     headers = {"Authorization": f"Bearer {login.json()['token']}"}
-    response = client.get("/stocks/alerts", headers=headers)
+    response = client.get("/stocks/alerts", headers=headers, params=params)
     assert response.status_code == 200
     assert "watchlist_limit_breaches" in response.json()
 
 
 @requires_db
-def test_recalculate_endpoint_returns_proper_error_instead_of_bare_crash(client, monkeypatch):
+def test_recalculate_endpoint_returns_proper_error_instead_of_bare_crash(client, portfolio_id, monkeypatch):
     """Regression test for the "Failed to fetch" report: an unhandled
     exception inside the recalculate endpoint used to reach the browser as a
     bare 500 with no CORS headers (Starlette's outermost error handler sits
@@ -194,14 +209,14 @@ def test_recalculate_endpoint_returns_proper_error_instead_of_bare_crash(client,
     which the TestClient (and a real browser) can read the body of."""
     from app import main
 
-    def boom(db, dry_run=False, date_from=None, threshold_pct=None):
+    def boom(db, portfolio_id, dry_run=False, date_from=None, threshold_pct=None):
         raise RuntimeError("simulated crash deep in the recalculation")
 
     monkeypatch.setattr(main, "recalculate_stocks", boom)
 
     login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
     headers = {"Authorization": f"Bearer {login.json()['token']}", "Origin": "http://localhost:3010"}
-    response = client.post("/stocks/recalculate?dry_run=true", headers=headers)
+    response = client.post(f"/stocks/recalculate?dry_run=true&portfolio_id={portfolio_id}", headers=headers)
 
     assert response.status_code == 500
     assert "simulated crash" in response.json()["detail"]
@@ -212,7 +227,7 @@ def test_recalculate_endpoint_returns_proper_error_instead_of_bare_crash(client,
 
 
 @requires_db
-def test_recalculate_stocks_date_from_preserves_earlier_rows(db_session, monkeypatch):
+def test_recalculate_stocks_date_from_preserves_earlier_rows(db_session, portfolio_id, monkeypatch):
     """`date_from` should behave like the VBA "Zpracovat od" cell: cumulative
     totals are always computed from the very first transaction (so later rows
     stay correct), but rows before `date_from` are left untouched in the DB
@@ -238,6 +253,7 @@ def test_recalculate_stocks_date_from_preserves_earlier_rows(db_session, monkeyp
     for day, qty, price in [(date(2024, 1, 5), 1, 100), (date(2024, 1, 20), 1, 110), (date(2024, 2, 10), 1, 120)]:
         db_session.add(
             StockTransaction(
+                portfolio_id=portfolio_id,
                 traded_on=day,
                 movement_type="Nákup",
                 instrument_name="Apple",
@@ -252,12 +268,12 @@ def test_recalculate_stocks_date_from_preserves_earlier_rows(db_session, monkeyp
     db_session.commit()
 
     # Full recompute establishes the baseline history.
-    full = stock_services.recalculate_stocks(db_session, dry_run=False)
+    full = stock_services.recalculate_stocks(db_session, portfolio_id, dry_run=False)
     assert full["date_from"] is None
     total_rows_after_full = db_session.scalar(select(func.count()).select_from(DailyStatistic))
     assert total_rows_after_full == full["daily_statistics"]
 
-    jan5_before = db_session.get(DailyStatistic, date(2024, 1, 5))
+    jan5_before = db_session.get(DailyStatistic, (portfolio_id, date(2024, 1, 5)))
     assert jan5_before is not None
 
     # Simulate a manually edited / imported historical row, then confirm an
@@ -266,24 +282,24 @@ def test_recalculate_stocks_date_from_preserves_earlier_rows(db_session, monkeyp
     db_session.commit()
 
     date_from = date(2024, 2, 1)
-    incremental = stock_services.recalculate_stocks(db_session, dry_run=False, date_from=date_from)
+    incremental = stock_services.recalculate_stocks(db_session, portfolio_id, dry_run=False, date_from=date_from)
     assert incremental["date_from"] == date_from
 
     # Incremental recalculate only rewrites dates that already existed - total row count is unchanged.
     total_rows_after_incremental = db_session.scalar(select(func.count()).select_from(DailyStatistic))
     assert total_rows_after_incremental == total_rows_after_full
 
-    jan5_after = db_session.get(DailyStatistic, date(2024, 1, 5))
+    jan5_after = db_session.get(DailyStatistic, (portfolio_id, date(2024, 1, 5)))
     assert jan5_after.total_czk == Decimal("999999")  # untouched, before date_from
 
-    feb10_after = db_session.get(DailyStatistic, date(2024, 2, 10))
+    feb10_after = db_session.get(DailyStatistic, (portfolio_id, date(2024, 2, 10)))
     assert feb10_after is not None
     # Cumulative total still reflects all three purchases (100+110+120), not just the Feb one.
     assert feb10_after.total_czk == Decimal("330")
 
 
 @requires_db
-def test_recalculate_stocks_ignores_watchlist_tip_and_plan_rows(db_session, monkeypatch):
+def test_recalculate_stocks_ignores_watchlist_tip_and_plan_rows(db_session, portfolio_id, monkeypatch):
     """Regression test: watchlist/tip/plan rows in `stock_transactions` (imported
     verbatim from the "Akcie" sheet, which mixes real purchases with hypothetical
     ones) must not be counted as real purchases - AkcieStatistika.bas only ever
@@ -299,6 +315,7 @@ def test_recalculate_stocks_ignores_watchlist_tip_and_plan_rows(db_session, monk
     # A real purchase of 1 share for 1000 CZK.
     db_session.add(
         StockTransaction(
+            portfolio_id=portfolio_id,
             traded_on=date(2024, 1, 10),
             movement_type="Nákup",
             instrument_name="Apple",
@@ -314,6 +331,7 @@ def test_recalculate_stocks_ignores_watchlist_tip_and_plan_rows(db_session, monk
     for movement in ("Tip", "Sledované", "Plán"):
         db_session.add(
             StockTransaction(
+                portfolio_id=portfolio_id,
                 traded_on=date(2023, 1, 1),  # earlier than the real purchase, to also exercise first_buy_date
                 movement_type=movement,
                 instrument_name="Apple",
@@ -327,9 +345,9 @@ def test_recalculate_stocks_ignores_watchlist_tip_and_plan_rows(db_session, monk
         )
     db_session.commit()
 
-    stock_services.recalculate_stocks(db_session, dry_run=False)
+    stock_services.recalculate_stocks(db_session, portfolio_id, dry_run=False)
 
-    position = db_session.get(PortfolioPosition, "AAPL")
+    position = db_session.get(PortfolioPosition, (portfolio_id, "AAPL"))
     assert position is not None
     assert position.quantity == Decimal("1")
     assert position.invested_czk == Decimal("1000")
@@ -338,7 +356,7 @@ def test_recalculate_stocks_ignores_watchlist_tip_and_plan_rows(db_session, monk
 
 
 @requires_db
-def test_recalculate_stocks_unrealized_profit_reflects_price_history(db_session, monkeypatch):
+def test_recalculate_stocks_unrealized_profit_reflects_price_history(db_session, portfolio_id, monkeypatch):
     """Regression test for the actual bug this feature was supposed to fix:
     'Nereal. zisk' (unrealized profit) and the 'Hod./Celk. Hod.' market-value
     columns must reflect the ticker's real historical price on each day
@@ -355,6 +373,7 @@ def test_recalculate_stocks_unrealized_profit_reflects_price_history(db_session,
 
     db_session.add(
         StockTransaction(
+            portfolio_id=portfolio_id,
             traded_on=buy_date,
             movement_type="Nákup",
             instrument_name="Test Corp",
@@ -375,14 +394,14 @@ def test_recalculate_stocks_unrealized_profit_reflects_price_history(db_session,
 
     monkeypatch.setattr(stock_services, "fetch_yahoo_history", fake_history)
 
-    stock_services.recalculate_stocks(db_session, dry_run=False)
+    stock_services.recalculate_stocks(db_session, portfolio_id, dry_run=False)
 
-    buy_day_row = db_session.get(DailyStatistic, buy_date)
+    buy_day_row = db_session.get(DailyStatistic, (portfolio_id, buy_date))
     assert buy_day_row is not None
     assert buy_day_row.total_value_czk == Decimal("1000")  # 10 x 100, bought at cost
     assert buy_day_row.unrealized_profit_czk == Decimal("0")
 
-    later_row = db_session.get(DailyStatistic, later_date)
+    later_row = db_session.get(DailyStatistic, (portfolio_id, later_date))
     assert later_row is not None
     assert later_row.value_czk == Decimal("1500")  # 10 shares x 150 CZK
     assert later_row.total_value_czk == Decimal("1500")
@@ -391,7 +410,7 @@ def test_recalculate_stocks_unrealized_profit_reflects_price_history(db_session,
 
 
 @requires_db
-def test_recalculate_stocks_excludes_weekend_fill_days(db_session, monkeypatch):
+def test_recalculate_stocks_excludes_weekend_fill_days(db_session, portfolio_id, monkeypatch):
     """AkcieStatistika.bas only fills in working days (Po-Pa) between purchases -
     no trading happens on weekends, so Excel never shows a Saturday/Sunday row.
     A weekend day with no transaction must be skipped; a weekend day that DOES
@@ -410,6 +429,7 @@ def test_recalculate_stocks_excludes_weekend_fill_days(db_session, monkeypatch):
     for day in (monday, saturday_with_trade, next_monday):
         db_session.add(
             StockTransaction(
+                portfolio_id=portfolio_id,
                 traded_on=day,
                 movement_type="Nákup",
                 instrument_name="Test Corp",
@@ -423,16 +443,16 @@ def test_recalculate_stocks_excludes_weekend_fill_days(db_session, monkeypatch):
         )
     db_session.commit()
 
-    stock_services.recalculate_stocks(db_session, dry_run=False)
+    stock_services.recalculate_stocks(db_session, portfolio_id, dry_run=False)
 
-    assert db_session.get(DailyStatistic, monday) is not None  # weekday
-    assert db_session.get(DailyStatistic, saturday_with_trade) is not None  # real trade, kept despite weekend
-    assert db_session.get(DailyStatistic, sunday_empty) is None  # empty weekend fill day - excluded
-    assert db_session.get(DailyStatistic, next_monday) is not None  # weekday
+    assert db_session.get(DailyStatistic, (portfolio_id, monday)) is not None  # weekday
+    assert db_session.get(DailyStatistic, (portfolio_id, saturday_with_trade)) is not None  # real trade, kept despite weekend
+    assert db_session.get(DailyStatistic, (portfolio_id, sunday_empty)) is None  # empty weekend fill day - excluded
+    assert db_session.get(DailyStatistic, (portfolio_id, next_monday)) is not None  # weekday
 
 
 @requires_db
-def test_recalculate_stocks_computes_alerts_column(db_session, monkeypatch):
+def test_recalculate_stocks_computes_alerts_column(db_session, portfolio_id, monkeypatch):
     """Port of AkcieStatistika.bas's 'Upozorneni' column: a day-over-day price
     move past the threshold, and a ticker with no price data at all, must both
     show up in DailyStatistic.alerts - it used to always be written as None."""
@@ -446,6 +466,7 @@ def test_recalculate_stocks_computes_alerts_column(db_session, monkeypatch):
     for ticker, price in (("TEST", 100), ("NODATA", 50)):
         db_session.add(
             StockTransaction(
+                portfolio_id=portfolio_id,
                 traded_on=day1,
                 movement_type="Nákup",
                 instrument_name=ticker,
@@ -466,20 +487,20 @@ def test_recalculate_stocks_computes_alerts_column(db_session, monkeypatch):
 
     monkeypatch.setattr(stock_services, "fetch_yahoo_history", fake_history)
 
-    stock_services.recalculate_stocks(db_session, dry_run=False, threshold_pct=Decimal("10"))
+    stock_services.recalculate_stocks(db_session, portfolio_id, dry_run=False, threshold_pct=Decimal("10"))
 
-    day2_row = db_session.get(DailyStatistic, day2)
+    day2_row = db_session.get(DailyStatistic, (portfolio_id, day2))
     assert day2_row is not None
     assert day2_row.alerts == "Chybí cena: NODATA"  # TEST unchanged (0%), below threshold - no mover listed
 
-    day3_row = db_session.get(DailyStatistic, day3)
+    day3_row = db_session.get(DailyStatistic, (portfolio_id, day3))
     assert day3_row is not None
     assert "TEST (D:+30.0%)" in day3_row.alerts
     assert "Chybí cena: NODATA" in day3_row.alerts
 
 
 @requires_db
-def test_recalculate_stocks_reports_price_fetch_failures(db_session, monkeypatch):
+def test_recalculate_stocks_reports_price_fetch_failures(db_session, portfolio_id, monkeypatch):
     """When Yahoo returns no history at all for a ticker (network outage,
     rate limiting, unknown symbol), that must be visible as a top-level count
     on the recalculate result - not just buried inside per-day alert strings,
@@ -492,6 +513,7 @@ def test_recalculate_stocks_reports_price_fetch_failures(db_session, monkeypatch
     for ticker in ("TEST", "NODATA"):
         db_session.add(
             StockTransaction(
+                portfolio_id=portfolio_id,
                 traded_on=day1,
                 movement_type="Nákup",
                 instrument_name=ticker,
@@ -512,14 +534,14 @@ def test_recalculate_stocks_reports_price_fetch_failures(db_session, monkeypatch
 
     monkeypatch.setattr(stock_services, "fetch_yahoo_history", fake_history)
 
-    result = stock_services.recalculate_stocks(db_session, dry_run=False)
+    result = stock_services.recalculate_stocks(db_session, portfolio_id, dry_run=False)
 
     assert result["price_fetch_failures"] == 1
     assert result["price_fetch_failed_tickers"] == ["NODATA"]
 
 
 @requires_db
-def test_recalculate_stocks_patches_latest_day_with_live_quote(db_session, monkeypatch):
+def test_recalculate_stocks_patches_latest_day_with_live_quote(db_session, portfolio_id, monkeypatch):
     """AkcieStatistika.bas's 'Krok 5b-2': when the daily-candle history has no
     exact close for the latest trading day (Yahoo publishes it late, or the
     recalc runs mid-session), Excel patches that one day in with a live quote
@@ -537,6 +559,7 @@ def test_recalculate_stocks_patches_latest_day_with_live_quote(db_session, monke
 
     db_session.add(
         StockTransaction(
+            portfolio_id=portfolio_id,
             traded_on=buy_day,
             movement_type="Nákup",
             instrument_name="Held Corp",
@@ -550,6 +573,7 @@ def test_recalculate_stocks_patches_latest_day_with_live_quote(db_session, monke
     )
     db_session.add(
         StockTransaction(
+            portfolio_id=portfolio_id,
             traded_on=buy_day,
             movement_type="Nákup",
             instrument_name="Sold Corp",
@@ -563,6 +587,7 @@ def test_recalculate_stocks_patches_latest_day_with_live_quote(db_session, monke
     )
     db_session.add(
         StockTransaction(
+            portfolio_id=portfolio_id,
             traded_on=buy_day,
             movement_type="Prodej",
             instrument_name="Sold Corp",
@@ -590,13 +615,13 @@ def test_recalculate_stocks_patches_latest_day_with_live_quote(db_session, monke
     monkeypatch.setattr(stock_services, "fetch_yahoo_history", fake_history)
     monkeypatch.setattr(stock_services, "fetch_yahoo_price", fake_price)
 
-    stock_services.recalculate_stocks(db_session, dry_run=False)
+    stock_services.recalculate_stocks(db_session, portfolio_id, dry_run=False)
 
     assert live_quote_calls == ["HELD"]  # SOLD is fully closed out - no extra lookup needed
 
     from app.models import DailyStatistic
 
-    latest_row = db_session.get(DailyStatistic, latest_weekday)
+    latest_row = db_session.get(DailyStatistic, (portfolio_id, latest_weekday))
     assert latest_row is not None
     assert latest_row.value_czk == Decimal("111")  # HELD priced via the live-quote patch, not the stale candle
 
@@ -733,7 +758,7 @@ def test_ensure_cnb_rates_up_to_date_survives_one_bad_day(db_session, monkeypatc
 
 
 @requires_db
-def test_import_loans_skips_baked_in_subtotal_rows(db_session):
+def test_import_loans_skips_baked_in_subtotal_rows(db_session, portfolio_id):
     """The source 'Půjčky Pohyby' sheet has monthly/yearly subtotal rows
     physically sitting between the real movements (column A holds a text
     label like "Leden 2023" or "2023" instead of a date, lender/borrower
@@ -753,7 +778,7 @@ def test_import_loans_skips_baked_in_subtotal_rows(db_session):
     ws.append([datetime(2023, 3, 1), "TANAKA, s.r.o.", "ACE-TECH, s.r.o.", 7000000, 0.06, "měsíčně", None, None, None])
     ws.append(["2023", None, None, 7054139, None, None, None, None, None])  # year subtotal - must be skipped
 
-    count = import_loans(db_session, wb)
+    count = import_loans(db_session, wb, portfolio_id)
     db_session.commit()
 
     assert count == 2  # only the two real movements
@@ -764,19 +789,23 @@ def test_import_loans_skips_baked_in_subtotal_rows(db_session):
 
 
 @requires_db
-def test_cleanup_loan_subtotals_endpoint_removes_only_dateless_rows(client, db_session):
+def test_cleanup_loan_subtotals_endpoint_removes_only_dateless_rows(client, db_session, portfolio_id):
     """Regression cleanup path for databases imported before the fix: a
     dateless LoanMovement (the old subtotal artifact) must be deleted, a
     real dated movement must survive."""
     from app.models import LoanMovement
 
-    db_session.add(LoanMovement(movement_date=None, amount=Decimal("54139"), source_row=3))
-    db_session.add(LoanMovement(movement_date=date(2023, 1, 15), amount=Decimal("54139"), source_row=2))
+    db_session.add(LoanMovement(portfolio_id=portfolio_id, movement_date=None, amount=Decimal("54139"), source_row=3))
+    db_session.add(
+        LoanMovement(portfolio_id=portfolio_id, movement_date=date(2023, 1, 15), amount=Decimal("54139"), source_row=2)
+    )
     db_session.commit()
 
     login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
     headers = {"Authorization": f"Bearer {login.json()['token']}"}
-    response = client.post("/loans/cleanup-imported-subtotals", headers=headers)
+    response = client.post(
+        "/loans/cleanup-imported-subtotals", headers=headers, params={"portfolio_id": str(portfolio_id)}
+    )
 
     assert response.status_code == 200
     assert response.json()["deleted"] == 1
@@ -787,7 +816,7 @@ def test_cleanup_loan_subtotals_endpoint_removes_only_dateless_rows(client, db_s
 
 
 @requires_db
-def test_two_factor_setup_confirm_and_login_flow(client):
+def test_two_factor_setup_confirm_and_login_flow(client, portfolio_id):
     """End-to-end 2FA enrollment + login: setup returns a scannable secret,
     confirm requires a real TOTP code (not just any string), and once
     enabled, plain username+password login stops short of a full token until
@@ -822,8 +851,9 @@ def test_two_factor_setup_confirm_and_login_flow(client):
     pending_token = body["pending_token"]
 
     # The pending token alone must not grant access to a real endpoint.
+    params = {"portfolio_id": str(portfolio_id)}
     pending_headers = {"Authorization": f"Bearer {pending_token}"}
-    denied = client.get("/summary", headers=pending_headers)
+    denied = client.get("/summary", headers=pending_headers, params=params)
     assert denied.status_code == 401
 
     wrong_code = client.post("/auth/2fa/login", json={"pending_token": pending_token, "code": "000000"})
@@ -835,7 +865,7 @@ def test_two_factor_setup_confirm_and_login_flow(client):
     full_token = finish.json()["token"]
 
     full_headers = {"Authorization": f"Bearer {full_token}"}
-    ok = client.get("/summary", headers=full_headers)
+    ok = client.get("/summary", headers=full_headers, params=params)
     assert ok.status_code == 200
 
     # Disable requires the correct password + a valid current code.
@@ -901,7 +931,7 @@ def test_admin_reset_2fa_endpoint_clears_lost_device_lockout(client, db_session)
 
 
 @requires_db
-def test_notification_settings_are_saved_per_user_and_used_as_alert_default(client, db_session):
+def test_notification_settings_are_saved_per_user_and_used_as_alert_default(client, db_session, portfolio_id):
     """Nastaveni tab: a user's own daily-change/drop thresholds persist via
     /auth/me, and /stocks/alerts falls back to the saved drop threshold when
     the caller doesn't pass an explicit threshold_pct."""
@@ -909,6 +939,7 @@ def test_notification_settings_are_saved_per_user_and_used_as_alert_default(clie
 
     db_session.add(
         PortfolioPosition(
+            portfolio_id=portfolio_id,
             ticker="TST",
             name="Test Corp",
             quantity=Decimal("10"),
@@ -945,8 +976,164 @@ def test_notification_settings_are_saved_per_user_and_used_as_alert_default(clie
     assert me_after.json()["alert_drop_pct"] == 8
 
     # -10% drawdown breaches an 8% saved threshold but not the 10% app default.
-    alerts_default = client.get("/stocks/alerts", headers=headers)
+    alerts_default = client.get("/stocks/alerts", headers=headers, params={"portfolio_id": str(portfolio_id)})
     assert any(row["ticker"] == "TST" for row in alerts_default.json()["portfolio_drawdowns"])
 
-    alerts_explicit = client.get("/stocks/alerts", headers=headers, params={"threshold_pct": 50})
+    alerts_explicit = client.get(
+        "/stocks/alerts", headers=headers, params={"portfolio_id": str(portfolio_id), "threshold_pct": 50}
+    )
     assert not any(row["ticker"] == "TST" for row in alerts_explicit.json()["portfolio_drawdowns"])
+
+
+@requires_db
+def test_portfolio_scoping_isolates_data_between_subjekty(client, db_session):
+    """Core guarantee of the Subjekt (Portfolio) feature: a user granted
+    access to only one Subjekt/one agenda cannot read another Subjekt's data,
+    nor an agenda they weren't granted within their own Subjekt - enforced
+    server-side, not just hidden client-side."""
+    from app.auth import hash_password
+    from app.models import Asset, AppUser, Portfolio, PortfolioAccess
+
+    portfolio_a = Portfolio(name="Subjekt A")
+    portfolio_b = Portfolio(name="Subjekt B")
+    db_session.add_all([portfolio_a, portfolio_b])
+    db_session.flush()
+
+    db_session.add(Asset(portfolio_id=portfolio_a.id, code="A-01", name="Byt A"))
+    db_session.add(Asset(portfolio_id=portfolio_b.id, code="B-01", name="Byt B"))
+    db_session.add(
+        AppUser(username="scoped", password_hash=hash_password("s3cret!"), is_active=True, is_admin=False, allowed_agendas=[])
+    )
+    db_session.add(PortfolioAccess(username="scoped", portfolio_id=portfolio_a.id, allowed_agendas=["assets"]))
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "scoped", "password": "s3cret!"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+
+    granted = client.get("/assets", headers=headers, params={"portfolio_id": str(portfolio_a.id)})
+    assert granted.status_code == 200
+    assert [row["code"] for row in granted.json()] == ["A-01"]
+
+    other_subjekt = client.get("/assets", headers=headers, params={"portfolio_id": str(portfolio_b.id)})
+    assert other_subjekt.status_code == 403
+
+    ungranted_agenda = client.get("/loans/movements", headers=headers, params={"portfolio_id": str(portfolio_a.id)})
+    assert ungranted_agenda.status_code == 403
+
+
+@requires_db
+def test_recalculate_stocks_keeps_same_ticker_separate_across_subjekty(db_session, monkeypatch):
+    """The compound (portfolio_id, ticker) primary key on PortfolioPosition
+    must actually keep two Subjekty's positions independent - this is the
+    concrete risk that migrating off the old ticker-only primary key was
+    meant to fix."""
+    from app import stock_services
+    from app.models import Portfolio, PortfolioPosition, StockTransaction
+
+    portfolio_a = Portfolio(name="Subjekt A")
+    portfolio_b = Portfolio(name="Subjekt B")
+    db_session.add_all([portfolio_a, portfolio_b])
+    db_session.flush()
+
+    monkeypatch.setattr(stock_services, "fetch_yahoo_history", lambda ticker, date_from, date_to: {"currency": "CZK", "points": []})
+
+    for portfolio, qty in ((portfolio_a, 1), (portfolio_b, 5)):
+        db_session.add(
+            StockTransaction(
+                portfolio_id=portfolio.id,
+                traded_on=date(2024, 1, 10),
+                movement_type="Nákup",
+                instrument_name="Apple",
+                ticker="AAPL",
+                quantity=Decimal(qty),
+                unit_price_ccy=Decimal("100"),
+                gross_amount_ccy=Decimal(100 * qty),
+                currency="CZK",
+                amount_czk=Decimal(100 * qty),
+            )
+        )
+    db_session.commit()
+
+    stock_services.recalculate_stocks(db_session, portfolio_a.id, dry_run=False)
+    stock_services.recalculate_stocks(db_session, portfolio_b.id, dry_run=False)
+
+    position_a = db_session.get(PortfolioPosition, (portfolio_a.id, "AAPL"))
+    position_b = db_session.get(PortfolioPosition, (portfolio_b.id, "AAPL"))
+    assert position_a is not None and position_b is not None
+    assert position_a.quantity == Decimal("1")
+    assert position_b.quantity == Decimal("5")  # not 6 - the two Subjekty never merge
+
+
+@requires_db
+def test_admin_sees_every_portfolio_without_explicit_grants(client, db_session):
+    """Admins bypass PortfolioAccess entirely (mirrors the existing
+    admin-bypasses-allowed_agendas behaviour) - no explicit grant row is
+    needed for an admin to reach every Subjekt."""
+    from app.models import Portfolio
+
+    portfolio_a = Portfolio(name="Subjekt A")
+    portfolio_b = Portfolio(name="Subjekt B")
+    db_session.add_all([portfolio_a, portfolio_b])
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+
+    for portfolio in (portfolio_a, portfolio_b):
+        response = client.get("/assets", headers=headers, params={"portfolio_id": str(portfolio.id)})
+        assert response.status_code == 200
+
+    me = client.get("/auth/me", headers=headers)
+    portfolio_ids = {row["id"] for row in me.json()["portfolios"]}
+    assert {str(portfolio_a.id), str(portfolio_b.id)}.issubset(portfolio_ids)
+    assert all(row["allowed_agendas"] for row in me.json()["portfolios"])
+
+
+@requires_db
+def test_portfolio_access_bulk_replace_round_trips_through_auth_me(client, db_session):
+    """PUT /users/{username}/portfolio-access bulk-replaces a user's full
+    grant set (like POST /users already does for allowed_agendas) - a second,
+    smaller call must replace, not merge with, the first."""
+    from app.auth import hash_password
+    from app.models import AppUser, Portfolio
+
+    portfolio_a = Portfolio(name="Subjekt A")
+    portfolio_b = Portfolio(name="Subjekt B")
+    db_session.add_all([portfolio_a, portfolio_b])
+    db_session.add(
+        AppUser(username="scoped", password_hash=hash_password("s3cret!"), is_active=True, is_admin=False, allowed_agendas=[])
+    )
+    db_session.commit()
+
+    admin_login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['token']}"}
+
+    grant_both = client.put(
+        f"/users/scoped/portfolio-access",
+        headers=admin_headers,
+        json={
+            "grants": [
+                {"portfolio_id": str(portfolio_a.id), "allowed_agendas": ["assets", "loans"]},
+                {"portfolio_id": str(portfolio_b.id), "allowed_agendas": ["transactions"]},
+            ]
+        },
+    )
+    assert grant_both.status_code == 200
+
+    scoped_login = client.post("/auth/login", json={"username": "scoped", "password": "s3cret!"})
+    scoped_headers = {"Authorization": f"Bearer {scoped_login.json()['token']}"}
+    me_after_first = client.get("/auth/me", headers=scoped_headers).json()
+    assert {row["id"]: row["allowed_agendas"] for row in me_after_first["portfolios"]} == {
+        str(portfolio_a.id): ["assets", "loans"],
+        str(portfolio_b.id): ["transactions"],
+    }
+
+    grant_one = client.put(
+        f"/users/scoped/portfolio-access",
+        headers=admin_headers,
+        json={"grants": [{"portfolio_id": str(portfolio_a.id), "allowed_agendas": ["assets"]}]},
+    )
+    assert grant_one.status_code == 200
+
+    me_after_second = client.get("/auth/me", headers=scoped_headers).json()
+    assert {row["id"]: row["allowed_agendas"] for row in me_after_second["portfolios"]} == {str(portfolio_a.id): ["assets"]}
