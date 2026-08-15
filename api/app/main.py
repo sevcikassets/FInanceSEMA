@@ -48,6 +48,7 @@ from .models import (
     AppUser,
     Asset,
     AssetCost,
+    CostCategory,
     DailyStatistic,
     ExchangeRate,
     LoanMovement,
@@ -121,6 +122,10 @@ class PatriaImportInput(BaseModel):
 
 
 class PortfolioInput(BaseModel):
+    name: str
+
+
+class CostCategoryInput(BaseModel):
     name: str
 
 
@@ -930,6 +935,48 @@ def asset_costs(
     assets_by_id = {a.id: a.name for a in db.scalars(select(Asset)).all()}
     payers = {p.id: p.name for p in db.scalars(select(Party)).all()}
     return [model_dict(row) | {"asset": assets_by_id.get(row.asset_id), "payer": payers.get(row.payer_id)} for row in rows]
+
+
+@app.get("/assets/cost-categories")
+def list_cost_categories(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("categories")), db: Session = Depends(get_db)
+) -> list[dict[str, Any]]:
+    rows = db.scalars(
+        select(CostCategory).where(CostCategory.portfolio_id == portfolio_id).order_by(CostCategory.name)
+    ).all()
+    return [{"id": str(row.id), "name": row.name} for row in rows]
+
+
+@app.post("/assets/cost-categories")
+def create_cost_category(
+    payload: CostCategoryInput,
+    portfolio_id: uuid.UUID = Query(...),
+    _: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if db.get(Portfolio, portfolio_id) is None:
+        raise HTTPException(status_code=404, detail="Subjekt nenalezen")
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Název kategorie je povinný")
+    if db.scalar(select(CostCategory).where(CostCategory.portfolio_id == portfolio_id, CostCategory.name == name)) is not None:
+        raise HTTPException(status_code=409, detail="Kategorie s tímto názvem už existuje")
+    row = CostCategory(portfolio_id=portfolio_id, name=name)
+    db.add(row)
+    db.commit()
+    return {"id": str(row.id), "name": row.name}
+
+
+@app.delete("/assets/cost-categories/{category_id}")
+def delete_cost_category(
+    category_id: uuid.UUID, _: str = Depends(require_admin), db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    row = db.get(CostCategory, category_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Kategorie nenalezena")
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted"}
 
 
 @app.get("/stocks/transactions")

@@ -23,6 +23,7 @@ import {
   Save,
   Settings as SettingsIcon,
   ShieldCheck,
+  Tag,
   TrendingUp,
   WalletCards,
   X,
@@ -70,14 +71,6 @@ type TickerHistoryResult = {
   summary: Row | null;
 };
 
-type AssetAgenda = {
-  asset: Row;
-  cost_total: number;
-  cost_count: number;
-  costs: Row[];
-  categories: Row[];
-};
-
 // A "Subjekt" in the UI (kept as "Portfolio"/portfolio_id internally/in the
 // API - "Subjekt" is only the user-facing Czech label, chosen to avoid
 // colliding with the pre-existing "portfolio" tab, which is the stock
@@ -109,6 +102,7 @@ type TwoFactorSetup = {
 const tabs = [
   { id: "assets", label: "Majetek", icon: Building2, endpoint: "/assets" },
   { id: "costs", label: "Náklady", icon: WalletCards, endpoint: "/assets/costs" },
+  { id: "categories", label: "Kategorie nákladů", icon: Tag, endpoint: "/assets/cost-categories" },
   { id: "loans", label: "Půjčky", icon: Coins, endpoint: "/loans/movements" },
   { id: "transactions", label: "Transakce", icon: FileSpreadsheet, endpoint: "/stocks/transactions" },
   { id: "watchlist", label: "Sledované", icon: ListChecks, endpoint: "/stocks/watchlist" },
@@ -127,7 +121,7 @@ const tabs = [
 // here - it's always visible to every logged-in user regardless of agenda
 // permissions, see visibleTabs/visibleNavGroups below.
 const navGroups = [
-  { label: "Majetek", items: ["assets", "costs"] },
+  { label: "Majetek", items: ["assets", "costs", "categories"] },
   { label: "Půjčky", items: ["loans"] },
   { label: "Akcie", items: ["transactions", "watchlist", "stats", "portfolio", "history", "alerts", "charts"] },
   { label: "Nastavení", items: ["rates", "subjects", "users", "settings"] },
@@ -142,7 +136,7 @@ const tabsById = Object.fromEntries(tabs.map((tab) => [tab.id, tab]));
 const STOCK_OVERVIEW_TABS = ["transactions", "watchlist", "portfolio"];
 
 // Tabs that render their own custom panel instead of the generic data table.
-const NON_TABLE_TABS = new Set(["assets", "history", "alerts", "charts", "settings", "subjects"]);
+const NON_TABLE_TABS = new Set(["assets", "history", "alerts", "charts", "settings", "subjects", "categories"]);
 
 // "rates" (shared CNB exchange-rate history), "users" (user management) and
 // "subjects" (Subjekt management) apply app-wide and stay governed by
@@ -224,7 +218,6 @@ const columns: Record<string, string[]> = {
   ],
 };
 
-const costColumns = ["cost_date", "payer", "supplier", "category", "item", "amount", "note"];
 const statSumColumns = ["bought_eur", "bought_usd", "bought_czk", "dividends", "daily_profit_czk"];
 const statLatestColumns = [
   "total_eur",
@@ -843,7 +836,6 @@ export default function Page() {
   const [latestRates, setLatestRates] = useState<LatestRates | null>(null);
   const [stockOverview, setStockOverview] = useState<StockOverview | null>(null);
   const [alerts, setAlerts] = useState<Alerts | null>(null);
-  const [assetAgendas, setAssetAgendas] = useState<AssetAgenda[]>([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [expandedStatMonths, setExpandedStatMonths] = useState<Set<string>>(() => new Set());
@@ -902,6 +894,9 @@ export default function Page() {
   });
   const [editUserBusy, setEditUserBusy] = useState(false);
   const [editUserStatus, setEditUserStatus] = useState<string | null>(null);
+  const [newCategoryName, setNewCategoryName] = useState("");
+  const [categoryBusy, setCategoryBusy] = useState(false);
+  const [categoryStatus, setCategoryStatus] = useState<string | null>(null);
   const allowedAgendaSet = useMemo(
     () => new Set(currentUser?.is_admin ? tabs.map((tab) => tab.id) : currentUser?.allowed_agendas || tabs.map((tab) => tab.id)),
     [currentUser],
@@ -1103,7 +1098,6 @@ export default function Page() {
       if (activeTab === "rates") requests.push(api("/rates/latest"));
       if (needsStockOverview) requests.push(api(withPortfolio("/stocks/overview")));
       if (needsAlerts) requests.push(api(withPortfolio("/stocks/alerts")));
-      if (activeTab === "assets") requests.push(api(withPortfolio("/assets/agendas")));
       if (needsPortfolioList) requests.push(api("/portfolios"));
       const [summaryData, ...rest] = await Promise.all(requests);
       if (latestLoadRequestRef.current !== requestId) return;
@@ -1113,7 +1107,6 @@ export default function Page() {
       if (activeTab === "rates") setLatestRates(rest[restIndex++] as LatestRates);
       if (needsStockOverview) setStockOverview(rest[restIndex++] as StockOverview);
       if (needsAlerts) setAlerts(rest[restIndex++] as Alerts);
-      if (activeTab === "assets") setAssetAgendas(rest[restIndex++] as AssetAgenda[]);
       if (needsPortfolioList) setPortfolios(rest[restIndex++] as { id: string; name: string }[]);
     } catch (err) {
       if (latestLoadRequestRef.current !== requestId) return;
@@ -1491,6 +1484,37 @@ export default function Page() {
     }
   }
 
+  async function createCostCategory(event: React.FormEvent) {
+    event.preventDefault();
+    setCategoryStatus(null);
+    setCategoryBusy(true);
+    try {
+      await api(withPortfolio("/assets/cost-categories"), {
+        method: "POST",
+        body: JSON.stringify({ name: newCategoryName.trim() }),
+      });
+      setNewCategoryName("");
+      await loadAll();
+    } catch (err) {
+      setCategoryStatus(err instanceof Error ? err.message : "Kategorii se nepodařilo vytvořit");
+    } finally {
+      setCategoryBusy(false);
+    }
+  }
+
+  async function deleteCostCategory(categoryId: string) {
+    setCategoryStatus(null);
+    setCategoryBusy(true);
+    try {
+      await api(`/assets/cost-categories/${categoryId}`, { method: "DELETE" });
+      await loadAll();
+    } catch (err) {
+      setCategoryStatus(err instanceof Error ? err.message : "Kategorii se nepodařilo smazat");
+    } finally {
+      setCategoryBusy(false);
+    }
+  }
+
   async function cleanupLoanSubtotals() {
     setError(null);
     setLoanCleanupStatus(null);
@@ -1837,6 +1861,45 @@ export default function Page() {
                 </select>
               </label>
             </div>
+          </section>
+        )}
+
+        {activeTab === "categories" && (
+          <section className="work-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Kategorie nákladů</h2>
+                <p>Číselník kategorií pro záznamy v Nákladech, aby se stejná kategorie nezapisovala pokaždé jinak. Přidávat a mazat může jen administrátor.</p>
+              </div>
+            </div>
+            {categoryStatus && <div className="success-notice">{categoryStatus}</div>}
+            <div className="portfolio-list">
+              {rows
+                .filter((row) => typeof row.name === "string")
+                .map((row) => (
+                  <div className="portfolio-row" key={String(row.id)}>
+                    <span>{String(row.name)}</span>
+                    {currentUser?.is_admin && (
+                      <button type="button" className="link-button" onClick={() => deleteCostCategory(String(row.id))} disabled={categoryBusy}>
+                        Smazat
+                      </button>
+                    )}
+                  </div>
+                ))}
+              {rows.length === 0 && <p className="alert-empty">Zatím žádné kategorie.</p>}
+            </div>
+            {currentUser?.is_admin && (
+              <form className="rate-form" onSubmit={createCostCategory}>
+                <label>
+                  Nová kategorie
+                  <input value={newCategoryName} onChange={(event) => setNewCategoryName(event.target.value)} placeholder="Např. Energie" />
+                </label>
+                <button className="action-button" type="submit" disabled={categoryBusy || !newCategoryName.trim()}>
+                  <Save size={16} />
+                  <span>Vytvořit kategorii</span>
+                </button>
+              </form>
+            )}
           </section>
         )}
 
@@ -2589,51 +2652,41 @@ export default function Page() {
           </section>
         )}
 
-        {activeTab === "assets" && assetAgendas.length > 0 && (
+        {activeTab === "assets" && rows.length > 0 && (
           <section className="asset-agendas">
             <div className="section-heading">
-              <h2>Majetkové agendy</h2>
-              <p>Každý majetek má vlastní přehled hodnot, součty nákladů a navázané položky.</p>
+              <h2>Evidence majetku</h2>
+              <p>Přehled majetku s celkovou rekapitulací hodnot u každé položky. Náklady jsou v samostatné záložce Náklady.</p>
             </div>
-            {assetAgendas.map((agenda) => (
-              <article className="asset-agenda" key={String(agenda.asset.id || agenda.asset.code)}>
+            {rows.map((asset) => (
+              <article className="asset-agenda" key={String(asset.id || asset.code)}>
                 <header>
                   <div>
-                    <h2>{String(agenda.asset.name || "")}</h2>
+                    <h2>{String(asset.name || "")}</h2>
                     <p>
-                      {String(agenda.asset.code || "")} · {String(agenda.asset.owner || "Bez vlastníka")} · {String(agenda.asset.asset_type || "Bez typu")}
+                      {String(asset.code || "")} · {String(asset.owner || "Bez vlastníka")} · {String(asset.asset_type || "Bez typu")}
                     </p>
                   </div>
                   <div className="agenda-metrics">
                     <div>
                       <span>Hodnota</span>
-                      <strong>{formatValue("total_value", agenda.asset.total_value)}</strong>
+                      <strong>{formatValue("total_value", asset.total_value)}</strong>
                     </div>
                     <div>
-                      <span>Náklady</span>
-                      <strong>{formatValue("amount", agenda.cost_total)}</strong>
+                      <span>Vlastní zdroje</span>
+                      <strong>{formatValue("own_funds", asset.own_funds)}</strong>
                     </div>
                     <div>
-                      <span>Záznamy</span>
-                      <strong>{formatValue("count", agenda.cost_count)}</strong>
+                      <span>Úvěr</span>
+                      <strong>{formatValue("borrowed_amount", asset.borrowed_amount)}</strong>
                     </div>
                   </div>
                 </header>
-                {agenda.categories.length > 0 && (
-                  <div className="category-strip">
-                    {agenda.categories.map((category) => (
-                      <div key={String(category.category)}>
-                        <span>{String(category.category)}</span>
-                        <strong>{formatValue("amount", category.amount)}</strong>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                {interestPlanEntries(agenda.asset).length > 0 && (
+                {interestPlanEntries(asset).length > 0 && (
                   <div className="interest-plan">
                     <h3>Dopočtená projekce úroku (2026–2055)</h3>
                     <div className="interest-plan-grid">
-                      {interestPlanEntries(agenda.asset).map(([year, amount]) => (
+                      {interestPlanEntries(asset).map(([year, amount]) => (
                         <div key={year}>
                           <span>{year}</span>
                           <strong>{formatValue("amount", amount)}</strong>
@@ -2642,33 +2695,6 @@ export default function Page() {
                     </div>
                   </div>
                 )}
-                <div className="nested-table">
-                  <table>
-                    <thead>
-                      <tr>
-                        {costColumns.map((col) => (
-                          <th key={col}>{labels[col] || col}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {agenda.costs.map((cost, index) => (
-                        <tr key={String(cost.id || index)}>
-                          {costColumns.map((col) => (
-                            <td className={isNumericCell(cost[col]) ? "numeric-cell" : ""} key={col}>
-                              {formatValue(col, cost[col])}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                      {agenda.costs.length === 0 && (
-                        <tr>
-                          <td colSpan={costColumns.length}>Bez evidovaných nákladů.</td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
               </article>
             ))}
           </section>

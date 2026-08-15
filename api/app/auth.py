@@ -14,6 +14,7 @@ security = HTTPBearer(auto_error=False)
 ALL_AGENDAS = [
     "assets",
     "costs",
+    "categories",
     "loans",
     "transactions",
     "watchlist",

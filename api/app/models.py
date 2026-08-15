@@ -144,6 +144,22 @@ class AssetCost(Base):
     payer: Mapped[Party | None] = relationship()
 
 
+class CostCategory(Base):
+    """Admin-managed dictionary of cost categories per Subjekt, so the same
+    category doesn't end up spelled differently across cost entries (see
+    AssetCost.category, a free-text column). Read access to the "categories"
+    agenda is available to any user granted it for the Subjekt; only admins
+    may add/remove entries - see require_portfolio_access/require_admin
+    usage in main.py."""
+
+    __tablename__ = "cost_categories"
+    __table_args__ = (UniqueConstraint("portfolio_id", "name", name="uq_cost_categories_portfolio_name"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+
+
 class StockTransaction(Base):
     __tablename__ = "stock_transactions"
 

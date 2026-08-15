@@ -1193,3 +1193,45 @@ def test_update_user_endpoint_edits_profile_and_login_still_works(client, db_ses
         "/users/admin", headers=headers, json={"full_name": "Administrátor", "is_admin": False, "is_active": True, "allowed_agendas": []}
     )
     assert self_lockout.status_code == 400
+
+
+@requires_db
+def test_cost_categories_admin_only_write_scoped_read(client, db_session, portfolio_id):
+    """GET requires the "categories" agenda (granted per-Subjekt); POST/DELETE
+    require admin regardless of that grant. Names are unique per Subjekt."""
+    from app.auth import hash_password
+    from app.models import AppUser, PortfolioAccess
+
+    db_session.add(
+        AppUser(username="reader", password_hash=hash_password("s3cret!"), is_active=True, is_admin=False, allowed_agendas=[])
+    )
+    db_session.add(PortfolioAccess(username="reader", portfolio_id=portfolio_id, allowed_agendas=["categories"]))
+    db_session.commit()
+
+    admin_login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['token']}"}
+    reader_login = client.post("/auth/login", json={"username": "reader", "password": "s3cret!"})
+    reader_headers = {"Authorization": f"Bearer {reader_login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    created = client.post("/assets/cost-categories", headers=admin_headers, params=params, json={"name": "Energie"})
+    assert created.status_code == 200
+    category_id = created.json()["id"]
+
+    duplicate = client.post("/assets/cost-categories", headers=admin_headers, params=params, json={"name": "Energie"})
+    assert duplicate.status_code == 409
+
+    # Reader has the read grant but is not admin - can list, can't write.
+    listed = client.get("/assets/cost-categories", headers=reader_headers, params=params)
+    assert listed.status_code == 200
+    assert [row["name"] for row in listed.json()] == ["Energie"]
+
+    forbidden_create = client.post("/assets/cost-categories", headers=reader_headers, params=params, json={"name": "Voda"})
+    assert forbidden_create.status_code == 403
+    forbidden_delete = client.delete(f"/assets/cost-categories/{category_id}", headers=reader_headers)
+    assert forbidden_delete.status_code == 403
+
+    deleted = client.delete(f"/assets/cost-categories/{category_id}", headers=admin_headers)
+    assert deleted.status_code == 200
+    listed_after = client.get("/assets/cost-categories", headers=admin_headers, params=params)
+    assert listed_after.json() == []
