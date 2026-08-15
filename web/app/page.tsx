@@ -114,10 +114,9 @@ const tabs = [
 // here - it's always visible to every logged-in user regardless of agenda
 // permissions, see visibleTabs/visibleNavGroups below.
 const navGroups = [
-  { label: "Přehled", items: ["alerts", "charts"] },
   { label: "Majetek", items: ["assets", "costs"] },
   { label: "Půjčky", items: ["loans"] },
-  { label: "Akcie", items: ["transactions", "watchlist", "stats", "portfolio", "history"] },
+  { label: "Akcie", items: ["transactions", "watchlist", "stats", "portfolio", "history", "alerts", "charts"] },
   { label: "Nastavení", items: ["rates", "users", "settings"] },
 ];
 
@@ -439,6 +438,9 @@ function PortfolioChart({
   const yAt = (value: number) => marginTop + plotHeight - ((value - min) / (max - min)) * plotHeight;
   const zeroY = yAt(0);
 
+  const yTickCount = 4;
+  const yTicks = Array.from({ length: yTickCount }, (_, i) => min + ((max - min) * i) / (yTickCount - 1));
+
   function linePath(key: string) {
     return data.map((point, index) => `${index === 0 ? "M" : "L"} ${xAt(index).toFixed(1)} ${yAt(numberValue(point[key])).toFixed(1)}`).join(" ");
   }
@@ -492,40 +494,62 @@ function PortfolioChart({
           </div>
         )}
       </div>
-      <svg
-        viewBox={`0 0 ${width} ${height}`}
-        preserveAspectRatio="none"
-        className="portfolio-chart-svg"
-        onMouseMove={handleMove}
-        onMouseLeave={() => setHoverIndex(null)}
-        role="img"
-        aria-label={title}
-      >
-        {mode !== "lines" && (
-          <line x1={marginLeft} x2={width - marginRight} y1={zeroY} y2={zeroY} className="portfolio-chart-baseline" />
-        )}
-        {mode === "lines" &&
-          series.map((s) => <path key={s.key} d={linePath(s.key)} fill="none" stroke={s.color} strokeWidth={2} />)}
-        {mode === "area" && (
-          <path d={areaPath(series[0].key, null)} fill={series[0].color} fillOpacity={0.22} stroke={series[0].color} strokeWidth={2} />
-        )}
-        {mode === "diverging-area" && (
-          <>
-            <path d={areaPath(series[0].key, "positive")} className="portfolio-chart-fill positive" stroke="none" />
-            <path d={areaPath(series[0].key, "negative")} className="portfolio-chart-fill negative" stroke="none" />
-            <path d={linePath(series[0].key)} fill="none" stroke="var(--accent)" strokeWidth={1.5} />
-          </>
-        )}
-        {hoverPoint && (
-          <line
-            x1={xAt(hoverIndex as number)}
-            x2={xAt(hoverIndex as number)}
-            y1={marginTop}
-            y2={marginTop + plotHeight}
-            className="portfolio-chart-crosshair"
-          />
-        )}
-      </svg>
+      <div className="portfolio-chart-plot">
+        <div className="portfolio-chart-yaxis">
+          {yTicks
+            .slice()
+            .reverse()
+            .map((tick, index) => (
+              <span key={index} style={{ top: `${((yAt(tick) / height) * 100).toFixed(2)}%` }}>
+                {formatY(tick)}
+              </span>
+            ))}
+        </div>
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          preserveAspectRatio="none"
+          className="portfolio-chart-svg"
+          onMouseMove={handleMove}
+          onMouseLeave={() => setHoverIndex(null)}
+          role="img"
+          aria-label={title}
+        >
+          {yTicks.map((tick, index) => (
+            <line
+              key={index}
+              x1={marginLeft}
+              x2={width - marginRight}
+              y1={yAt(tick)}
+              y2={yAt(tick)}
+              className="portfolio-chart-gridline"
+            />
+          ))}
+          {mode !== "lines" && (
+            <line x1={marginLeft} x2={width - marginRight} y1={zeroY} y2={zeroY} className="portfolio-chart-baseline" />
+          )}
+          {mode === "lines" &&
+            series.map((s) => <path key={s.key} d={linePath(s.key)} fill="none" stroke={s.color} strokeWidth={2} />)}
+          {mode === "area" && (
+            <path d={areaPath(series[0].key, null)} fill={series[0].color} fillOpacity={0.22} stroke={series[0].color} strokeWidth={2} />
+          )}
+          {mode === "diverging-area" && (
+            <>
+              <path d={areaPath(series[0].key, "positive")} className="portfolio-chart-fill positive" stroke="none" />
+              <path d={areaPath(series[0].key, "negative")} className="portfolio-chart-fill negative" stroke="none" />
+              <path d={linePath(series[0].key)} fill="none" stroke="var(--accent)" strokeWidth={1.5} />
+            </>
+          )}
+          {hoverPoint && (
+            <line
+              x1={xAt(hoverIndex as number)}
+              x2={xAt(hoverIndex as number)}
+              y1={marginTop}
+              y2={marginTop + plotHeight}
+              className="portfolio-chart-crosshair"
+            />
+          )}
+        </svg>
+      </div>
       <div className="portfolio-chart-axis">
         <span>{formatDateWithWeekday(String(data[0].date))}</span>
         <span>{formatDateWithWeekday(String(data[data.length - 1].date))}</span>
