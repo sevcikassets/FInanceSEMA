@@ -243,12 +243,26 @@ def import_patria_trades(db: Session, portfolio_id: uuid.UUID, text: str) -> dic
                 }
             )
             continue
+        ticker = ticker_from_existing_data(db, trade.isin, trade.instrument_name, trade.market)
+        # Patria's own export only ever gives the plain security name ("SPDR
+        # USA S/C VALUE") - every other import path (the historical Excel
+        # sheet) stores it as "TICKER - Name" ("ZPRV - SPDR USA S/C VALUE"),
+        # which is what the rest of the app displays. Match that convention
+        # once a ticker is actually resolved, using the bare symbol (before
+        # any Yahoo exchange suffix like ".DE") to match how it reads
+        # elsewhere; leave the plain name alone if no ticker could be found.
+        # Done before the duplicate check below so that check compares
+        # against what's actually stored, not the pre-import raw name.
+        instrument_name = trade.instrument_name
+        if ticker and instrument_name:
+            display_ticker = ticker.split(".")[0]
+            instrument_name = f"{display_ticker} - {instrument_name}"
         duplicate = db.scalar(
             select(StockTransaction)
             .where(
                 StockTransaction.portfolio_id == portfolio_id,
                 StockTransaction.traded_on == trade.traded_on,
-                StockTransaction.instrument_name == trade.instrument_name,
+                StockTransaction.instrument_name == instrument_name,
                 StockTransaction.quantity == trade.quantity,
                 StockTransaction.unit_price_ccy == trade.unit_price_ccy,
             )
@@ -260,14 +274,13 @@ def import_patria_trades(db: Session, portfolio_id: uuid.UUID, text: str) -> dic
         rate = rate_for_day(db, trade.currency, trade.traded_on)
         fee_czk = trade.fee_ccy * rate
         amount_czk = trade.gross_amount_ccy * rate + fee_czk
-        ticker = ticker_from_existing_data(db, trade.isin, trade.instrument_name, trade.market)
         db.add(
             StockTransaction(
                 portfolio_id=portfolio_id,
                 traded_on=trade.traded_on,
                 instrument_type="Akcie",
                 movement_type=trade.movement_type,
-                instrument_name=trade.instrument_name,
+                instrument_name=instrument_name,
                 isin=trade.isin,
                 ticker=ticker,
                 market=trade.market,

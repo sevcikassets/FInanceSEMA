@@ -1393,6 +1393,21 @@ export default function Page() {
     setNotifDropPct(currentUser?.alert_drop_pct != null ? String(currentUser.alert_drop_pct) : "");
   }, [currentUser]);
 
+  // Defaults "Napočítat od" to the last day already computed for this
+  // Subjekt, the first time it's known (once per portfolio per session) -
+  // so a normal recalculation continues incrementally by default instead of
+  // starting empty (= full history) every time. Only once, so it never
+  // fights a manual clear/edit afterward (clearing it to force a full
+  // recompute is still a supported, intentional action).
+  const recalcDefaultedPortfolios = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const latest = summary?.latest_stat?.stat_date;
+    if (typeof latest !== "string" || !activePortfolioId) return;
+    if (recalcDefaultedPortfolios.current.has(activePortfolioId)) return;
+    recalcDefaultedPortfolios.current.add(activePortfolioId);
+    setRecalcFromDate(latest);
+  }, [activePortfolioId, summary?.latest_stat?.stat_date]);
+
   useEffect(() => {
     if (visibleTabs.length > 0 && !isTabVisible(activeTab)) {
       setActiveTab(visibleTabs[0].id);
@@ -3267,6 +3282,10 @@ export default function Page() {
       setStockActionStatus(
         `${dryRun ? "Kontrolní přepočet" : "Přepočet"}${result.date_from ? ` od ${result.date_from}` : " (celá historie)"}: transakce ${result.transactions}, portfolio ${result.portfolio_positions}, statistiky ${result.daily_statistics}.${zeroStatsHint}${priceFailureHint}`,
       );
+      // Advance "Napočítat od" to the day this run actually reached, so the
+      // next recalculation continues incrementally from there by default
+      // instead of silently going back to a full-history recompute.
+      if (!dryRun && result.computed_range_to) setRecalcFromDate(result.computed_range_to);
       if (!dryRun) await loadAll();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Přepočet akcií se nepodařil");

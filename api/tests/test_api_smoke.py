@@ -1865,3 +1865,72 @@ def test_version_endpoint_is_unauthenticated_and_reports_build_time(client):
     response = client.get("/version")
     assert response.status_code == 200
     assert "built_at" in response.json()
+
+
+@requires_db
+def test_import_patria_trades_prefixes_instrument_name_with_resolved_ticker(db_session, portfolio_id):
+    """Patria's own export only ever gives the plain security name - every
+    other import path (the historical Excel sheet) stores "TICKER - Name",
+    which is what the rest of the app displays. Once a ticker is resolved
+    from prior data for the same ISIN, the Patria-imported row must match
+    that convention instead of showing the bare name."""
+    from app import stock_services
+    from app.models import StockTransaction
+
+    db_session.add(
+        StockTransaction(
+            portfolio_id=portfolio_id,
+            traded_on=date(2026, 7, 1),
+            movement_type="Nákup",
+            instrument_name="ZPRV - SPDR USA S/C VALUE",
+            isin="IE00BSPLC413",
+            ticker="ZPRV.DE",
+            market="XETR",
+            quantity=Decimal("1"),
+        )
+    )
+    db_session.commit()
+
+    text = (
+        "12.08.2026 16:33:19\t1,00\tNákup\tSPDR USA S/C VALUE\t5,15\tLimit\tXETR\n"
+        "14.08.2026\t82,40\t0,00\tIE00BSPLC413\t0,00\t87,55\tEUR\n"
+    )
+    result = stock_services.import_patria_trades(db_session, portfolio_id, text)
+    assert result["inserted"] == 1
+
+    imported = (
+        db_session.query(StockTransaction)
+        .filter(StockTransaction.traded_on == date(2026, 8, 12))
+        .one()
+    )
+    assert imported.instrument_name == "ZPRV - SPDR USA S/C VALUE"
+    assert imported.ticker == "ZPRV.DE"
+
+    # Re-importing the exact same paste must be recognized as a duplicate
+    # (comparing against the now-prefixed stored name, not the raw one).
+    again = stock_services.import_patria_trades(db_session, portfolio_id, text)
+    assert again["inserted"] == 0
+    assert again["skipped_duplicates"] == 1
+
+
+@requires_db
+def test_import_patria_trades_leaves_name_plain_when_ticker_unresolved(db_session, portfolio_id):
+    """A brand new instrument with no prior transaction/ticker mapping for
+    its ISIN has nothing to prefix with - the plain Patria name must be
+    stored as-is rather than a broken/empty prefix."""
+    from app import stock_services
+    from app.models import StockTransaction
+
+    text = (
+        "01.08.2026 10:00:00\t2,00\tNákup\tNever Seen Before Inc\t1,00\tLimit\tXNAS\n"
+        "03.08.2026\t50,00\t0,00\tUS0000000000\t0,00\t100,00\tUSD\n"
+    )
+    result = stock_services.import_patria_trades(db_session, portfolio_id, text)
+    assert result["inserted"] == 1
+    imported = (
+        db_session.query(StockTransaction)
+        .filter(StockTransaction.traded_on == date(2026, 8, 1))
+        .one()
+    )
+    assert imported.instrument_name == "Never Seen Before Inc"
+    assert imported.ticker is None
