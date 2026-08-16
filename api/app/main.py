@@ -307,13 +307,45 @@ def computed_interest_plan(asset: Asset, calculation_mode: str | None) -> dict[s
     return {str(year): json_value(value) for year, value in sorted(projection.items())}
 
 
-def asset_net_worth_contribution(asset: Asset, calculation_mode: str | None) -> Decimal:
+# Types whose displayed "Hodnota" is already a whole-asset market/appraisal
+# figure - adding accumulated AssetCost spending on top would double-count.
+# Any other type (a future "Auto", "Sbírka", ...) has no such external
+# valuation, so money actually spent on it is the best available signal of
+# how much of the family's wealth is tied up in it.
+REAL_ESTATE_TYPE_NAMES = {"byt", "nemovitost"}
+
+
+def asset_costs_count_in_value(asset_type_name: str | None, calculation_mode: str | None) -> bool:
+    if calculation_mode == "debt_interest":
+        return False
+    return (asset_type_name or "").strip().lower() not in REAL_ESTATE_TYPE_NAMES
+
+
+def asset_costs_by_id(db: Session, portfolio_id: uuid.UUID) -> dict[uuid.UUID, Decimal]:
+    """Cumulative AssetCost.amount per asset_id, for folding into net worth -
+    a single grouped query instead of one per asset."""
+    rows = db.execute(
+        select(AssetCost.asset_id, func.coalesce(func.sum(AssetCost.amount), 0))
+        .where(AssetCost.portfolio_id == portfolio_id, AssetCost.asset_id.is_not(None))
+        .group_by(AssetCost.asset_id)
+    ).all()
+    return {asset_id: total for asset_id, total in rows}
+
+
+def asset_net_worth_contribution(
+    asset: Asset, calculation_mode: str | None, asset_type_name: str | None, costs_total: Decimal
+) -> Decimal:
     """How much this asset counts toward /summary's assets_total: a
     debt_interest asset (Hypotéka) is money OWED, so its borrowed_amount
-    reduces net worth; everything else counts its total_value as-is."""
+    reduces net worth; everything else counts its total_value as-is, plus
+    accumulated costs for types where that isn't already reflected in
+    total_value (see asset_costs_count_in_value)."""
     if calculation_mode == "debt_interest":
         return -(asset.borrowed_amount or Decimal("0"))
-    return asset.total_value or Decimal("0")
+    value = asset.total_value or Decimal("0")
+    if asset_costs_count_in_value(asset_type_name, calculation_mode):
+        value += costs_total
+    return value
 
 
 def asset_outstanding_balance(asset: Asset, calculation_mode: str | None) -> Decimal:
@@ -1320,14 +1352,17 @@ def summary(
     # asset_net_worth_contribution. Portfolios here have a handful of assets,
     # so a Python loop is simpler (and keeps the branching logic in one
     # place) than duplicating the mode-dependent CASE in SQL.
-    asset_types_by_id = {t.id: t.calculation_mode for t in db.scalars(select(AssetType).where(AssetType.portfolio_id == portfolio_id)).all()}
+    asset_types_by_id = {t.id: t for t in db.scalars(select(AssetType).where(AssetType.portfolio_id == portfolio_id)).all()}
     asset_rows = db.scalars(select(Asset).where(Asset.portfolio_id == portfolio_id)).all()
-    asset_total = sum(
-        (asset_net_worth_contribution(row, asset_types_by_id.get(row.asset_type_id)) for row in asset_rows), Decimal("0")
-    )
-    mortgage_outstanding = sum(
-        (asset_outstanding_balance(row, asset_types_by_id.get(row.asset_type_id)) for row in asset_rows), Decimal("0")
-    )
+    costs_by_asset = asset_costs_by_id(db, portfolio_id)
+    asset_total = Decimal("0")
+    mortgage_outstanding = Decimal("0")
+    for row in asset_rows:
+        asset_type = asset_types_by_id.get(row.asset_type_id)
+        calculation_mode = asset_type.calculation_mode if asset_type else None
+        asset_type_name = asset_type.name if asset_type else row.asset_type
+        asset_total += asset_net_worth_contribution(row, calculation_mode, asset_type_name, costs_by_asset.get(row.id, Decimal("0")))
+        mortgage_outstanding += asset_outstanding_balance(row, calculation_mode)
     cost_total = db.scalar(select(func.coalesce(func.sum(AssetCost.amount), 0)).where(AssetCost.portfolio_id == portfolio_id))
     portfolio_value = db.scalar(
         select(func.coalesce(func.sum(PortfolioPosition.market_value_czk), 0)).where(PortfolioPosition.portfolio_id == portfolio_id)
@@ -1666,12 +1701,16 @@ def _asset_dict(db: Session, row: Asset) -> dict[str, Any]:
     asset_type = db.get(AssetType, row.asset_type_id) if row.asset_type_id else None
     linked = db.get(Asset, row.linked_asset_id) if row.linked_asset_id else None
     calculation_mode = asset_type.calculation_mode if asset_type else None
+    asset_type_name = asset_type.name if asset_type else row.asset_type
+    costs_total = db.scalar(select(func.coalesce(func.sum(AssetCost.amount), 0)).where(AssetCost.asset_id == row.id))
     return model_dict(row) | {
         "owner": owner.name if owner else None,
-        "asset_type": asset_type.name if asset_type else row.asset_type,
+        "asset_type": asset_type_name,
         "calculation_mode": calculation_mode,
         "computed_interest_plan": computed_interest_plan(row, calculation_mode),
-        "net_worth_contribution": json_value(asset_net_worth_contribution(row, calculation_mode)),
+        "costs_czk": json_value(costs_total),
+        "costs_counted_in_value": asset_costs_count_in_value(asset_type_name, calculation_mode),
+        "net_worth_contribution": json_value(asset_net_worth_contribution(row, calculation_mode, asset_type_name, costs_total)),
         "linked_asset": linked.name if linked else None,
         "linked_asset_code": linked.code if linked else None,
     }
@@ -1705,19 +1744,24 @@ def assets(
     asset_types = {t.id: t for t in db.scalars(select(AssetType).where(AssetType.portfolio_id == portfolio_id)).all()}
     rows = db.scalars(select(Asset).where(Asset.portfolio_id == portfolio_id).order_by(Asset.code)).all()
     assets_by_id = {row.id: row for row in rows}
+    costs_by_asset = asset_costs_by_id(db, portfolio_id)
     result = []
     for row in rows:
         asset_type = asset_types.get(row.asset_type_id)
         calculation_mode = asset_type.calculation_mode if asset_type else None
+        asset_type_name = asset_type.name if asset_type else row.asset_type
         linked = assets_by_id.get(row.linked_asset_id) if row.linked_asset_id else None
+        costs_total = costs_by_asset.get(row.id, Decimal("0"))
         result.append(
             model_dict(row)
             | {
                 "owner": owners.get(row.owner_id),
-                "asset_type": asset_type.name if asset_type else row.asset_type,
+                "asset_type": asset_type_name,
                 "calculation_mode": calculation_mode,
                 "computed_interest_plan": computed_interest_plan(row, calculation_mode),
-                "net_worth_contribution": json_value(asset_net_worth_contribution(row, calculation_mode)),
+                "costs_czk": json_value(costs_total),
+                "costs_counted_in_value": asset_costs_count_in_value(asset_type_name, calculation_mode),
+                "net_worth_contribution": json_value(asset_net_worth_contribution(row, calculation_mode, asset_type_name, costs_total)),
                 "linked_asset": linked.name if linked else None,
                 "linked_asset_code": linked.code if linked else None,
             }

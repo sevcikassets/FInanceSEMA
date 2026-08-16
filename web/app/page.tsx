@@ -309,6 +309,7 @@ const labels: Record<string, string> = {
   total_value: "Celkem",
   own_funds: "Vlastní zdroje",
   borrowed_amount: "Půjčeno",
+  costs_czk: "Náklady",
   interest_rate: "Úrok",
   cost_date: "Datum",
   asset: "Majetek",
@@ -4797,6 +4798,12 @@ export default function Page() {
                       <span>Úvěr</span>
                       <strong>{formatValue("borrowed_amount", asset.borrowed_amount)}</strong>
                     </div>
+                    {Boolean(asset.costs_counted_in_value) && (
+                      <div>
+                        <span>Náklady</span>
+                        <strong>{formatValue("costs_czk", asset.costs_czk)}</strong>
+                      </div>
+                    )}
                     <div>
                       <span>Čistý dopad na jmění</span>
                       <strong className={numberValue(asset.net_worth_contribution) >= 0 ? "positive" : "negative"}>

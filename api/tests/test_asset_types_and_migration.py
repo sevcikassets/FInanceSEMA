@@ -492,3 +492,60 @@ def test_summary_assets_total_nets_debt_interest_contribution(client, db_session
     response = client.get("/summary", headers=headers, params={"portfolio_id": str(portfolio_id)})
     assert response.status_code == 200
     assert response.json()["assets_total"] == -500000.0
+
+
+@requires_db
+def test_asset_costs_count_toward_value_except_for_real_estate_types(client, db_session, portfolio_id):
+    """A "Byt"/"Nemovitost"-typed asset's total_value is already a whole-
+    property market figure - AssetCost spending on it must NOT be added on
+    top, or net worth would double-count. Any other type (here "Auto") has
+    no such external valuation, so accumulated costs are the best signal of
+    money actually tied up in it and must be folded into its value."""
+    from app.models import Asset, AssetCost, AssetType
+
+    byt_type = AssetType(portfolio_id=portfolio_id, name="Byt", calculation_mode="none")
+    nemovitost_type = AssetType(portfolio_id=portfolio_id, name="Nemovitost", calculation_mode="none")
+    auto_type = AssetType(portfolio_id=portfolio_id, name="Auto", calculation_mode="none")
+    db_session.add_all([byt_type, nemovitost_type, auto_type])
+    db_session.flush()
+
+    byt = Asset(portfolio_id=portfolio_id, code="COST-1", name="Byt Test", asset_type_id=byt_type.id, total_value=Decimal("1000000"))
+    nemovitost = Asset(
+        portfolio_id=portfolio_id, code="COST-2", name="RD Test", asset_type_id=nemovitost_type.id, total_value=Decimal("2000000")
+    )
+    auto = Asset(portfolio_id=portfolio_id, code="COST-3", name="Auto Test", asset_type_id=auto_type.id, total_value=Decimal("300000"))
+    db_session.add_all([byt, nemovitost, auto])
+    db_session.commit()
+
+    db_session.add_all(
+        [
+            AssetCost(portfolio_id=portfolio_id, asset_id=byt.id, item="Oprava střechy", amount=Decimal("50000"), cost_date=date(2024, 1, 1)),
+            AssetCost(portfolio_id=portfolio_id, asset_id=nemovitost.id, item="Oprava plotu", amount=Decimal("20000"), cost_date=date(2024, 1, 1)),
+            AssetCost(portfolio_id=portfolio_id, asset_id=auto.id, item="Servis", amount=Decimal("15000"), cost_date=date(2024, 1, 1)),
+            AssetCost(portfolio_id=portfolio_id, asset_id=auto.id, item="Pneu", amount=Decimal("8000"), cost_date=date(2024, 2, 1)),
+        ]
+    )
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    listed = client.get("/assets", headers=headers, params=params)
+    assert listed.status_code == 200
+    by_code = {row["code"]: row for row in listed.json()}
+
+    assert by_code["COST-1"]["costs_czk"] == 50000
+    assert by_code["COST-1"]["costs_counted_in_value"] is False
+    assert by_code["COST-1"]["net_worth_contribution"] == 1000000  # unchanged - costs not added
+
+    assert by_code["COST-2"]["costs_counted_in_value"] is False
+    assert by_code["COST-2"]["net_worth_contribution"] == 2000000  # unchanged - costs not added
+
+    assert by_code["COST-3"]["costs_czk"] == 23000
+    assert by_code["COST-3"]["costs_counted_in_value"] is True
+    assert by_code["COST-3"]["net_worth_contribution"] == 323000  # 300000 + 23000
+
+    summary = client.get("/summary", headers=headers, params=params)
+    assert summary.status_code == 200
+    assert summary.json()["assets_total"] == 1000000 + 2000000 + 323000
