@@ -1934,3 +1934,67 @@ def test_import_patria_trades_leaves_name_plain_when_ticker_unresolved(db_sessio
     )
     assert imported.instrument_name == "Never Seen Before Inc"
     assert imported.ticker is None
+
+
+@requires_db
+def test_summary_mortgage_outstanding_decreases_from_borrowed_amount(client, db_session, portfolio_id):
+    """A Hypotéka's outstanding balance must be read off its own
+    amortization schedule as of today, not the static original
+    borrowed_amount - otherwise the KPI would never reflect payments made
+    so far."""
+    from app.models import Asset, AssetType
+
+    asset_type = AssetType(portfolio_id=portfolio_id, name="Hypotéka", calculation_mode="debt_interest")
+    db_session.add(asset_type)
+    db_session.flush()
+    db_session.add(
+        Asset(
+            portfolio_id=portfolio_id,
+            code="HYP-01",
+            name="Testovaci hypoteka",
+            asset_type_id=asset_type.id,
+            borrowed_amount=Decimal("1200000"),
+            interest_rate=Decimal("0.05"),
+            loan_years=Decimal("10"),
+            # Far enough in the past (relative to "today" in any plausible
+            # test run) that several years of payments have already
+            # happened, without pinning the test to an exact "today".
+            borrowed_from=date(2020, 1, 1),
+        )
+    )
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    response = client.get("/summary", headers=headers, params={"portfolio_id": str(portfolio_id)})
+    assert response.status_code == 200
+    outstanding = response.json()["mortgage_outstanding_czk"]
+    assert 0 < outstanding < 1200000
+
+
+@requires_db
+def test_summary_mortgage_outstanding_falls_back_to_borrowed_amount_without_schedule(client, db_session, portfolio_id):
+    """No interest_rate means amortization_schedule() can't compute
+    anything - the outstanding balance must fall back to the plain
+    borrowed_amount rather than silently reporting 0."""
+    from app.models import Asset, AssetType
+
+    asset_type = AssetType(portfolio_id=portfolio_id, name="Hypotéka", calculation_mode="debt_interest")
+    db_session.add(asset_type)
+    db_session.flush()
+    db_session.add(
+        Asset(
+            portfolio_id=portfolio_id,
+            code="HYP-02",
+            name="Hypoteka bez uroku",
+            asset_type_id=asset_type.id,
+            borrowed_amount=Decimal("500000"),
+        )
+    )
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    response = client.get("/summary", headers=headers, params={"portfolio_id": str(portfolio_id)})
+    assert response.status_code == 200
+    assert response.json()["mortgage_outstanding_czk"] == 500000

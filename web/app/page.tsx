@@ -38,6 +38,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8010";
 type Summary = {
   loans_total: number;
   assets_total: number;
+  mortgage_outstanding_czk: number;
   asset_costs_total: number;
   portfolio_value_czk: number;
   portfolio_profit_czk: number;
@@ -3483,11 +3484,6 @@ export default function Page() {
               </p>
             </div>
           </div>
-          <div className="topbar-actions">
-            <button className="icon-button" onClick={loadAll} title="Obnovit data">
-              <RefreshCw size={18} />
-            </button>
-          </div>
         </header>
 
         {summary && (
@@ -3497,20 +3493,21 @@ export default function Page() {
               <strong>{money(summary.portfolio_value_czk)}</strong>
             </div>
             <div>
-              <span>Zisk portfolia</span>
-              <strong className={summary.portfolio_profit_czk >= 0 ? "positive" : "negative"}>{money(summary.portfolio_profit_czk)}</strong>
-            </div>
-            <div>
               <span>Majetek</span>
               <strong>{money(summary.assets_total)}</strong>
             </div>
             <div>
-              <span>Náklady</span>
-              <strong>{money(summary.asset_costs_total)}</strong>
+              <span>Zisk portfolia</span>
+              <strong className={summary.portfolio_profit_czk >= 0 ? "positive" : "negative"}>{money(summary.portfolio_profit_czk)}</strong>
             </div>
             <div>
-              <span>Půjčky</span>
-              <strong>{money(summary.loans_total)}</strong>
+              <span>Hypotéky</span>
+              <strong>{money(summary.mortgage_outstanding_czk)}</strong>
+            </div>
+            <div className="kpis-actions">
+              <button className="icon-button" onClick={loadAll} title="Obnovit data">
+                <RefreshCw size={18} />
+              </button>
             </div>
           </section>
         )}

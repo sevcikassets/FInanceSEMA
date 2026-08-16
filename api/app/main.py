@@ -316,6 +316,33 @@ def asset_net_worth_contribution(asset: Asset, calculation_mode: str | None) -> 
     return asset.total_value or Decimal("0")
 
 
+def asset_outstanding_balance(asset: Asset, calculation_mode: str | None) -> Decimal:
+    """Current outstanding principal for a Hypotéka (debt_interest) asset -
+    read off its own amortization schedule as of today, so it actually goes
+    down after each scheduled payment instead of sitting at the original
+    borrowed_amount forever. Falls back to borrowed_amount when the schedule
+    can't be computed (missing interest rate/dates) or the loan hasn't
+    reached its first payment date yet - the best knowable figure in that
+    case is simply "nothing has been paid down yet"."""
+    if calculation_mode != "debt_interest":
+        return Decimal("0")
+    borrowed = asset.borrowed_amount or Decimal("0")
+    schedule = amortization_schedule(
+        pv=asset.borrowed_amount,
+        interest_rate=asset.interest_rate,
+        start_date=asset.borrowed_from,
+        loan_years=asset.loan_years,
+        end_date=asset.borrowed_to,
+        first_payment_date=asset.first_payment_date,
+        first_payment_amount=asset.first_payment_amount,
+    )
+    today = date.today()
+    past_periods = [period for period in schedule if period["date"] <= today]
+    if not past_periods:
+        return borrowed
+    return past_periods[-1]["balance"]
+
+
 def loan_movement_interest_plan(movement: LoanMovement) -> dict[str, Any]:
     """Same amortization projection as computed_interest_plan, applied to a
     LoanMovement instead of an Asset - every movement with amount/
@@ -1298,6 +1325,9 @@ def summary(
     asset_total = sum(
         (asset_net_worth_contribution(row, asset_types_by_id.get(row.asset_type_id)) for row in asset_rows), Decimal("0")
     )
+    mortgage_outstanding = sum(
+        (asset_outstanding_balance(row, asset_types_by_id.get(row.asset_type_id)) for row in asset_rows), Decimal("0")
+    )
     cost_total = db.scalar(select(func.coalesce(func.sum(AssetCost.amount), 0)).where(AssetCost.portfolio_id == portfolio_id))
     portfolio_value = db.scalar(
         select(func.coalesce(func.sum(PortfolioPosition.market_value_czk), 0)).where(PortfolioPosition.portfolio_id == portfolio_id)
@@ -1308,6 +1338,7 @@ def summary(
     return {
         "loans_total": json_value(loan_total),
         "assets_total": json_value(asset_total),
+        "mortgage_outstanding_czk": json_value(mortgage_outstanding),
         "asset_costs_total": json_value(cost_total),
         "portfolio_value_czk": json_value(portfolio_value),
         "portfolio_profit_czk": json_value(portfolio_profit),

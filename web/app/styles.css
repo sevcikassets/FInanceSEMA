@@ -405,18 +405,19 @@ nav button:hover {
   padding: 0;
 }
 
-.topbar-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-shrink: 0;
-}
-
 .kpis {
   display: grid;
-  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  grid-template-columns: repeat(4, minmax(160px, 1fr)) auto;
+  align-items: stretch;
   gap: 12px;
   margin-bottom: 18px;
+}
+
+.kpis-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
 }
 
 .kpis div {
