@@ -75,6 +75,8 @@ from .stock_services import (
     build_ticker_history,
     compute_alerts,
     import_patria_trades,
+    movement_is_buy,
+    movement_is_sell,
     recalculate_stocks,
     refresh_current_prices,
 )
@@ -308,6 +310,71 @@ def period_bounds(period: str) -> tuple[date, date]:
     return date(year, month, 1), date(year, month, last_day)
 
 
+def classify_loan_interest(
+    db: Session, portfolio_id: uuid.UUID, self_party_ids: set[uuid.UUID], period: str
+) -> tuple[Decimal, Decimal, list[dict[str, Any]]]:
+    """Classifies every LoanMovement's interest for `period` as received,
+    paid, or excluded (both sides self = internal transfer; neither side
+    self = not this Subjekt's business), per PortfolioSelfParty. Also folds
+    in Hypotéka-typed Assets (always "paid" - a mortgage is always our own
+    liability, no self-party ambiguity - matches computed_interest_plan's
+    existing "debt_interest = paid" framing).
+
+    Returns (total_received, total_paid, detail) where detail is a flat list
+    of every non-zero contributor - used both for the stored aggregate
+    (compute_monthly_evaluation, which only keeps the two totals) and the
+    on-demand interest-detail endpoint (recomputed live, never persisted,
+    since it's cheap and re-deriving avoids a second child table to keep in
+    sync with the aggregate)."""
+    interest_received = Decimal("0")
+    interest_paid = Decimal("0")
+    detail: list[dict[str, Any]] = []
+
+    party_names = {p.id: p.name for p in db.scalars(select(Party)).all()}
+    for movement in db.scalars(select(LoanMovement).where(LoanMovement.portfolio_id == portfolio_id)).all():
+        lender_is_self = movement.lender_id in self_party_ids
+        borrower_is_self = movement.borrower_id in self_party_ids
+        if lender_is_self == borrower_is_self:
+            continue  # both self (internal transfer) or neither (not this Subjekt's business) -> excluded
+        interest = amortization_interest_in_period(
+            movement.amount, movement.interest_rate, movement.movement_date, None, movement.planned_end_date, period
+        )
+        if interest == 0:
+            continue
+        if lender_is_self:
+            interest_received += interest
+            counterparty = party_names.get(movement.borrower_id)
+        else:
+            interest_paid += interest
+            counterparty = party_names.get(movement.lender_id)
+        detail.append(
+            {
+                "direction": "received" if lender_is_self else "paid",
+                "source": "loan",
+                "counterparty": counterparty,
+                "description": movement.description,
+                "interest_czk": json_value(interest),
+            }
+        )
+
+    asset_types = {t.id: t for t in db.scalars(select(AssetType).where(AssetType.portfolio_id == portfolio_id)).all()}
+    for asset in db.scalars(select(Asset).where(Asset.portfolio_id == portfolio_id)).all():
+        asset_type = asset_types.get(asset.asset_type_id)
+        if asset_type is None or asset_type.calculation_mode != "debt_interest":
+            continue
+        interest = amortization_interest_in_period(
+            asset.borrowed_amount, asset.interest_rate, asset.borrowed_from, asset.loan_years, asset.borrowed_to, period
+        )
+        if interest == 0:
+            continue
+        interest_paid += interest
+        detail.append(
+            {"direction": "paid", "source": "asset", "counterparty": asset.name, "description": asset.code, "interest_czk": json_value(interest)}
+        )
+
+    return interest_received, interest_paid, detail
+
+
 def compute_monthly_evaluation(db: Session, portfolio_id: uuid.UUID, period: str) -> MonthlyEvaluation:
     """Computes and upserts the Vyhodnocení for one Subjekt/period - see
     MonthlyEvaluation's docstring in models.py for what each figure means.
@@ -319,30 +386,20 @@ def compute_monthly_evaluation(db: Session, portfolio_id: uuid.UUID, period: str
     self_party_ids = {
         row.party_id for row in db.scalars(select(PortfolioSelfParty).where(PortfolioSelfParty.portfolio_id == portfolio_id)).all()
     }
+    interest_received, interest_paid, _ = classify_loan_interest(db, portfolio_id, self_party_ids, period)
 
-    interest_received = Decimal("0")
-    interest_paid = Decimal("0")
-    for movement in db.scalars(select(LoanMovement).where(LoanMovement.portfolio_id == portfolio_id)).all():
-        lender_is_self = movement.lender_id in self_party_ids
-        borrower_is_self = movement.borrower_id in self_party_ids
-        if lender_is_self == borrower_is_self:
-            continue  # both self (internal transfer) or neither (not this Subjekt's business) -> excluded
-        interest = amortization_interest_in_period(
-            movement.amount, movement.interest_rate, movement.movement_date, None, movement.planned_end_date, period
+    stock_income = Decimal("0")
+    stock_expense = Decimal("0")
+    for transaction in db.scalars(
+        select(StockTransaction).where(
+            StockTransaction.portfolio_id == portfolio_id, StockTransaction.traded_on.between(period_start, period_end)
         )
-        if lender_is_self:
-            interest_received += interest
-        else:
-            interest_paid += interest
-
-    asset_types = {t.id: t for t in db.scalars(select(AssetType).where(AssetType.portfolio_id == portfolio_id)).all()}
-    for asset in db.scalars(select(Asset).where(Asset.portfolio_id == portfolio_id)).all():
-        asset_type = asset_types.get(asset.asset_type_id)
-        if asset_type is None or asset_type.calculation_mode != "debt_interest":
-            continue
-        interest_paid += amortization_interest_in_period(
-            asset.borrowed_amount, asset.interest_rate, asset.borrowed_from, asset.loan_years, asset.borrowed_to, period
-        )
+    ).all():
+        amount = transaction.amount_czk or Decimal("0")
+        if movement_is_buy(transaction.movement_type):
+            stock_expense += amount
+        elif movement_is_sell(transaction.movement_type):
+            stock_income += amount
 
     realized_profit = db.scalar(
         select(func.coalesce(func.sum(DailyStatistic.realized_profit_czk), 0))
@@ -377,6 +434,8 @@ def compute_monthly_evaluation(db: Session, portfolio_id: uuid.UUID, period: str
     evaluation.realized_profit_czk = realized_profit
     evaluation.unrealized_profit_delta_czk = unrealized_delta
     evaluation.dividends_czk = dividends
+    evaluation.stock_income_czk = stock_income
+    evaluation.stock_expense_czk = stock_expense
     evaluation.computed_at = datetime.now(timezone.utc)
     db.flush()
 
@@ -792,6 +851,11 @@ def ensure_schema_upgrades() -> None:
         # explicit POST /evaluations/compute call.
         conn.execute(text("ALTER TABLE daily_statistics ADD COLUMN IF NOT EXISTS realized_profit_czk NUMERIC(20, 2)"))
         conn.execute(text("ALTER TABLE daily_statistics ADD COLUMN IF NOT EXISTS realized_profit_total_czk NUMERIC(20, 2)"))
+        # monthly_evaluations itself was a brand-new table at the time these
+        # two columns were added - not brand-new anymore for any deploy that
+        # already ran the migration above once, so they need their own ALTER.
+        conn.execute(text("ALTER TABLE monthly_evaluations ADD COLUMN IF NOT EXISTS stock_income_czk NUMERIC(20, 2) NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE monthly_evaluations ADD COLUMN IF NOT EXISTS stock_expense_czk NUMERIC(20, 2) NOT NULL DEFAULT 0"))
 
     # The data-shape migration below (moving rows, splitting one row into
     # two, copying several fields) is simpler and far less error-prone as
@@ -1227,6 +1291,31 @@ def list_evaluations(
         select(MonthlyEvaluation).where(MonthlyEvaluation.portfolio_id == portfolio_id).order_by(desc(MonthlyEvaluation.period))
     ).all()
     return [_evaluation_dict(db, evaluation) for evaluation in evaluations]
+
+
+@app.get("/evaluations/{evaluation_id}/interest-detail")
+def evaluation_interest_detail(
+    evaluation_id: uuid.UUID,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("evaluations")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Per-movement/per-Hypotéka breakdown of interest_received_czk/
+    interest_paid_czk - recomputed live from classify_loan_interest, not
+    stored (the aggregate on MonthlyEvaluation is the only persisted figure;
+    this just re-derives the same numbers' composition on demand)."""
+    evaluation = db.scalar(
+        select(MonthlyEvaluation).where(MonthlyEvaluation.id == evaluation_id, MonthlyEvaluation.portfolio_id == portfolio_id)
+    )
+    if evaluation is None:
+        raise HTTPException(status_code=404, detail="Vyhodnocení nenalezeno")
+    self_party_ids = {
+        row.party_id for row in db.scalars(select(PortfolioSelfParty).where(PortfolioSelfParty.portfolio_id == portfolio_id)).all()
+    }
+    _, _, detail = classify_loan_interest(db, portfolio_id, self_party_ids, evaluation.period)
+    return {
+        "received": [row for row in detail if row["direction"] == "received"],
+        "paid": [row for row in detail if row["direction"] == "paid"],
+    }
 
 
 @app.get("/loans/movements")

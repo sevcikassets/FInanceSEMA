@@ -211,3 +211,101 @@ def test_self_parties_admin_only_and_round_trips(client, db_session, portfolio_i
     listed = client.get(f"/portfolios/{portfolio_id}/self-parties", headers=admin_headers)
     assert listed.status_code == 200
     assert [row["id"] for row in listed.json()] == [str(party.id)]
+
+
+@requires_db
+def test_evaluation_includes_stock_investment_cashflow(client, db_session, portfolio_id):
+    """Money moving into/out of the stock portfolio (buys/sells) is as real
+    a cash movement as an Asset's costs, even though stocks aren't tracked
+    as an Asset row - shown as its own figure in Pohyby hotovosti."""
+    from app.models import StockTransaction
+
+    db_session.add_all(
+        [
+            StockTransaction(
+                portfolio_id=portfolio_id, traded_on=date(2024, 5, 3), movement_type="Nákup",
+                instrument_name="Test Corp", ticker="TEST", quantity=Decimal("10"),
+                amount_czk=Decimal("1000"), currency="CZK",
+            ),
+            StockTransaction(
+                portfolio_id=portfolio_id, traded_on=date(2024, 5, 20), movement_type="Prodej",
+                instrument_name="Test Corp", ticker="TEST", quantity=Decimal("-4"),
+                amount_czk=Decimal("450"), currency="CZK",
+            ),
+            # A "Tip" row (watchlist/hypothetical) must not count as a real cash movement.
+            StockTransaction(
+                portfolio_id=portfolio_id, traded_on=date(2024, 5, 10), movement_type="Tip",
+                instrument_name="Ignored Corp", ticker="IGN", quantity=Decimal("5"),
+                amount_czk=Decimal("999999"), currency="CZK",
+            ),
+        ]
+    )
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    response = client.post("/evaluations/compute", headers=headers, params={"portfolio_id": str(portfolio_id), "period": "2024-05"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stock_expense_czk"] == 1000  # the buy
+    assert body["stock_income_czk"] == 450  # the sell
+
+
+@requires_db
+def test_evaluation_interest_detail_matches_aggregate_and_excludes_correctly(client, db_session, portfolio_id):
+    """The on-demand breakdown must sum to exactly the same totals stored on
+    the MonthlyEvaluation aggregate, and must list only the classified
+    (self<->external) movements - not the excluded self<->self/external<->
+    external ones."""
+    from app.models import LoanMovement, Party
+
+    self_a = Party(name="Detail Self A", kind="unknown")
+    self_d = Party(name="Detail Self D", kind="unknown")
+    external_b = Party(name="Detail External B", kind="unknown")
+    external_c = Party(name="Detail External C", kind="unknown")
+    db_session.add_all([self_a, self_d, external_b, external_c])
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    client.put(f"/portfolios/{portfolio_id}/self-parties", headers=headers, json={"party_ids": [str(self_a.id), str(self_d.id)]})
+
+    loan_terms = dict(movement_date=date(2024, 6, 1), planned_end_date=date(2025, 5, 31), interest_rate=Decimal("0.12"))
+    db_session.add_all(
+        [
+            LoanMovement(portfolio_id=portfolio_id, lender_id=self_a.id, borrower_id=external_b.id, amount=Decimal("120000"), **loan_terms),
+            LoanMovement(portfolio_id=portfolio_id, lender_id=external_c.id, borrower_id=self_a.id, amount=Decimal("60000"), **loan_terms),
+            LoanMovement(portfolio_id=portfolio_id, lender_id=self_a.id, borrower_id=self_d.id, amount=Decimal("999999"), **loan_terms),
+            LoanMovement(portfolio_id=portfolio_id, lender_id=external_b.id, borrower_id=external_c.id, amount=Decimal("999999"), **loan_terms),
+        ]
+    )
+    db_session.commit()
+
+    computed = client.post("/evaluations/compute", headers=headers, params={**params, "period": "2024-07"})
+    assert computed.status_code == 200
+    evaluation = computed.json()
+
+    detail = client.get(f"/evaluations/{evaluation['id']}/interest-detail", headers=headers, params=params)
+    assert detail.status_code == 200
+    body = detail.json()
+
+    assert len(body["received"]) == 1
+    assert body["received"][0]["counterparty"] == "Detail External B"
+    assert sum(row["interest_czk"] for row in body["received"]) == pytest.approx(evaluation["interest_received_czk"])
+
+    assert len(body["paid"]) == 1
+    assert body["paid"][0]["counterparty"] == "Detail External C"
+    assert sum(row["interest_czk"] for row in body["paid"]) == pytest.approx(evaluation["interest_paid_czk"])
+
+    # Cross-portfolio access is rejected, same as every other portfolio-scoped endpoint.
+    from app.models import Portfolio
+
+    other_portfolio = Portfolio(name="Jiny Subjekt Detail")
+    db_session.add(other_portfolio)
+    db_session.commit()
+    wrong_scope = client.get(
+        f"/evaluations/{evaluation['id']}/interest-detail", headers=headers, params={"portfolio_id": str(other_portfolio.id)}
+    )
+    assert wrong_scope.status_code == 404

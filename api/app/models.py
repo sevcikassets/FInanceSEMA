@@ -366,6 +366,13 @@ class MonthlyEvaluation(Base):
     realized_profit_czk: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0)
     unrealized_profit_delta_czk: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0)
     dividends_czk: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0)
+    # Cash flow into/out of the stock portfolio itself (buys/sells that
+    # month, from StockTransaction) - shown in "Pohyby hotovosti" alongside
+    # the per-Asset breakdown below, since money moving into investments is
+    # as real a cash movement as an Asset's costs, even though stocks aren't
+    # tracked as an Asset row in this app.
+    stock_income_czk: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0)
+    stock_expense_czk: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0)
 
 
 class MonthlyEvaluationAssetCashflow(Base):

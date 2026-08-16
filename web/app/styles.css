@@ -1105,6 +1105,39 @@ nav button:hover {
   font-size: 14px;
 }
 
+.evaluation-line-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.evaluation-line-toggle:hover {
+  color: var(--accent);
+}
+
+.evaluation-interest-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: -2px 0 8px 16px;
+  padding: 6px 10px;
+  border-left: 2px solid var(--line);
+  font-size: 12px;
+}
+
+.evaluation-interest-detail-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+}
+
 .history-form {
   display: grid;
   grid-template-columns: minmax(120px, 160px) minmax(140px, 180px) minmax(140px, 180px) auto;

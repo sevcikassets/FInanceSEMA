@@ -81,6 +81,8 @@ type Evaluation = {
   realized_profit_czk: number;
   unrealized_profit_delta_czk: number;
   dividends_czk: number;
+  stock_income_czk: number;
+  stock_expense_czk: number;
   stock_data_as_of: string | null;
   asset_cashflows: {
     asset_id: string | null;
@@ -442,6 +444,57 @@ function RecalcFromField({ value, onChange }: { value: string; onChange: (value:
         {value ? `Přepočítají se jen dny od ${value} dál, starší řádky zůstanou beze změny.` : "Prázdné = přepočítá se celá historie."}
       </span>
     </div>
+  );
+}
+
+// A "Výsledkové operace" line (Vyhodnocení tab) that expands to show which
+// loans/Hypotéky contributed to interest_received_czk/interest_paid_czk -
+// the other P&L lines (stocks) don't need this, that detail already exists
+// elsewhere in the app (Portfolio/Transakce/Denní statistika tabs).
+function InterestLine({
+  label,
+  amount,
+  expanded,
+  detail,
+  busy,
+  onToggle,
+}: {
+  label: string;
+  amount: number;
+  expanded: boolean;
+  detail: Row[] | undefined;
+  busy: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <>
+      <p>
+        <button type="button" className="evaluation-line-toggle" onClick={onToggle}>
+          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          <span>{label}</span>
+        </button>
+        <strong>{money(amount)}</strong>
+      </p>
+      {expanded && (
+        <div className="evaluation-interest-detail">
+          {busy && detail === undefined ? (
+            <p className="field-hint">Načítám…</p>
+          ) : !detail || detail.length === 0 ? (
+            <p className="field-hint">Žádné položky.</p>
+          ) : (
+            detail.map((row, index) => (
+              <div className="evaluation-interest-detail-row" key={index}>
+                <span>
+                  {String(row.counterparty || "?")}
+                  {row.description ? ` — ${String(row.description)}` : ""}
+                </span>
+                <span>{money(numberValue(row.interest_czk))}</span>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1011,6 +1064,9 @@ export default function Page() {
   const [evaluationBusy, setEvaluationBusy] = useState(false);
   const [evaluationStatus, setEvaluationStatus] = useState<string | null>(null);
   const [expandedEvaluations, setExpandedEvaluations] = useState<Set<string>>(() => new Set());
+  const [expandedInterestRows, setExpandedInterestRows] = useState<Set<string>>(() => new Set());
+  const [interestDetailCache, setInterestDetailCache] = useState<Record<string, { received: Row[]; paid: Row[] }>>({});
+  const [interestDetailBusy, setInterestDetailBusy] = useState<string | null>(null);
   const [showCostDetail, setShowCostDetail] = useState(true);
   const [costAssetFilter, setCostAssetFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -1980,6 +2036,29 @@ export default function Page() {
     });
   }
 
+  async function toggleInterestDetail(evaluationId: string, direction: "received" | "paid") {
+    const key = `${evaluationId}:${direction}`;
+    if (expandedInterestRows.has(key)) {
+      setExpandedInterestRows((current) => {
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+      return;
+    }
+    setExpandedInterestRows((current) => new Set(current).add(key));
+    if (interestDetailCache[evaluationId]) return;
+    setInterestDetailBusy(evaluationId);
+    try {
+      const result = (await api(withPortfolio(`/evaluations/${evaluationId}/interest-detail`))) as { received: Row[]; paid: Row[] };
+      setInterestDetailCache((current) => ({ ...current, [evaluationId]: result }));
+    } catch (err) {
+      setEvaluationStatus(err instanceof Error ? err.message : "Rozpad úroků se nepodařilo načíst");
+    } finally {
+      setInterestDetailBusy(null);
+    }
+  }
+
   // Bypasses the shared api() helper on purpose - it always forces
   // Content-Type: application/json, which would break multipart form
   // encoding for the file upload.
@@ -2780,14 +2859,22 @@ export default function Page() {
                         <div className="mini-grids">
                           <div>
                             <h3>Výsledkové operace</h3>
-                            <p>
-                              <span>Úroky přijaté</span>
-                              <strong>{money(evaluation.interest_received_czk)}</strong>
-                            </p>
-                            <p>
-                              <span>Úroky zaplacené</span>
-                              <strong>{money(evaluation.interest_paid_czk)}</strong>
-                            </p>
+                            <InterestLine
+                              label="Úroky přijaté"
+                              amount={evaluation.interest_received_czk}
+                              expanded={expandedInterestRows.has(`${evaluation.id}:received`)}
+                              detail={interestDetailCache[evaluation.id]?.received}
+                              busy={interestDetailBusy === evaluation.id}
+                              onToggle={() => toggleInterestDetail(evaluation.id, "received")}
+                            />
+                            <InterestLine
+                              label="Úroky zaplacené"
+                              amount={evaluation.interest_paid_czk}
+                              expanded={expandedInterestRows.has(`${evaluation.id}:paid`)}
+                              detail={interestDetailCache[evaluation.id]?.paid}
+                              busy={interestDetailBusy === evaluation.id}
+                              onToggle={() => toggleInterestDetail(evaluation.id, "paid")}
+                            />
                             <p>
                               <span>Realizovaný zisk/ztráta akcie</span>
                               <strong className={evaluation.realized_profit_czk >= 0 ? "positive" : "negative"}>
@@ -2806,17 +2893,25 @@ export default function Page() {
                             </p>
                           </div>
                         </div>
-                        <h3>Pohyby hotovosti podle majetku</h3>
+                        <h3>Pohyby hotovosti</h3>
                         <table>
                           <thead>
                             <tr>
-                              <th>Majetek</th>
+                              <th>Položka</th>
                               <th>Příjmy</th>
                               <th>Výdaje</th>
                               <th>Čistý pohyb</th>
                             </tr>
                           </thead>
                           <tbody>
+                            {(evaluation.stock_income_czk !== 0 || evaluation.stock_expense_czk !== 0) && (
+                              <tr>
+                                <td>Akcie (nákupy/prodeje)</td>
+                                <td className="numeric-cell">{money(evaluation.stock_income_czk)}</td>
+                                <td className="numeric-cell">{money(evaluation.stock_expense_czk)}</td>
+                                <td className="numeric-cell">{money(evaluation.stock_income_czk - evaluation.stock_expense_czk)}</td>
+                              </tr>
+                            )}
                             {evaluation.asset_cashflows.map((cashflow) => (
                               <tr key={cashflow.asset_id || "none"}>
                                 <td>{cashflow.asset_code ? `${cashflow.asset_code} — ${cashflow.asset_name}` : cashflow.asset_name}</td>
@@ -2825,13 +2920,15 @@ export default function Page() {
                                 <td className="numeric-cell">{money(cashflow.income_czk - cashflow.expense_czk)}</td>
                               </tr>
                             ))}
-                            {evaluation.asset_cashflows.length === 0 && (
-                              <tr>
-                                <td colSpan={4} className="alert-empty">
-                                  Žádné náklady v tomto měsíci.
-                                </td>
-                              </tr>
-                            )}
+                            {evaluation.asset_cashflows.length === 0 &&
+                              evaluation.stock_income_czk === 0 &&
+                              evaluation.stock_expense_czk === 0 && (
+                                <tr>
+                                  <td colSpan={4} className="alert-empty">
+                                    Žádné pohyby v tomto měsíci.
+                                  </td>
+                                </tr>
+                              )}
                           </tbody>
                         </table>
                       </div>
