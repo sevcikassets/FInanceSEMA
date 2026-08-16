@@ -818,6 +818,13 @@ function chartPercent(value: number) {
   return new Intl.NumberFormat("cs-CZ", { style: "percent", maximumFractionDigits: 1 }).format(value || 0);
 }
 
+// Every destructive delete asks for confirmation first, naming the specific
+// record so a mis-click is caught before it's permanent - there's no undo
+// for any of these.
+function confirmDelete(description: string): boolean {
+  return window.confirm(`Opravdu smazat ${description}? Tuto akci nelze vrátit zpět.`);
+}
+
 function rateForCurrency(latestRates: LatestRates | null, currency: string) {
   return latestRates?.rates.find((rate) => String(rate.currency) === currency)?.rate_to_czk ?? null;
 }
@@ -3433,7 +3440,9 @@ export default function Page() {
                         <button
                           type="button"
                           className="link-button"
-                          onClick={() => deleteAssetType(String(row.id))}
+                          onClick={() => {
+                            if (confirmDelete(`typ majetku "${String(row.name)}"`)) deleteAssetType(String(row.id));
+                          }}
                           disabled={assetTypeBusy}
                         >
                           Smazat
@@ -3512,7 +3521,14 @@ export default function Page() {
                   <div className="portfolio-row" key={String(row.id)}>
                     <span>{String(row.name)}</span>
                     {currentUser?.is_admin && (
-                      <button type="button" className="link-button" onClick={() => deletePayer(String(row.id))} disabled={payerBusy}>
+                      <button
+                        type="button"
+                        className="link-button"
+                        onClick={() => {
+                          if (confirmDelete(`plátce "${String(row.name)}"`)) deletePayer(String(row.id));
+                        }}
+                        disabled={payerBusy}
+                      >
                         Smazat
                       </button>
                     )}
@@ -3551,7 +3567,14 @@ export default function Page() {
                   <div className="portfolio-row" key={String(row.id)}>
                     <span>{String(row.name)}</span>
                     {currentUser?.is_admin && (
-                      <button type="button" className="link-button" onClick={() => deleteCostCategory(String(row.id))} disabled={categoryBusy}>
+                      <button
+                        type="button"
+                        className="link-button"
+                        onClick={() => {
+                          if (confirmDelete(`kategorii "${String(row.name)}"`)) deleteCostCategory(String(row.id));
+                        }}
+                        disabled={categoryBusy}
+                      >
                         Smazat
                       </button>
                     )}
@@ -4540,7 +4563,14 @@ export default function Page() {
                   <button type="button" className="link-button" onClick={() => openAssetEditor(asset)}>
                     Upravit
                   </button>
-                  <button type="button" className="link-button" onClick={() => deleteAsset(String(asset.id))} disabled={assetBusy}>
+                  <button
+                    type="button"
+                    className="link-button"
+                    onClick={() => {
+                      if (confirmDelete(`majetek "${String(asset.name)}" (${String(asset.code)})`)) deleteAsset(String(asset.id));
+                    }}
+                    disabled={assetBusy}
+                  >
                     Smazat
                   </button>
                   {asset.calculation_mode === "debt_interest" && (
@@ -4622,7 +4652,10 @@ export default function Page() {
                               <button
                                 type="button"
                                 className="link-button"
-                                onClick={() => deleteCost(String(row.id))}
+                                onClick={() => {
+                                  if (confirmDelete(`náklad "${String(row.item)}" z ${String(row.cost_date || "?")} (${formatValue("amount", row.amount)})`))
+                                    deleteCost(String(row.id));
+                                }}
                                 disabled={costBusy}
                               >
                                 Smazat
@@ -4635,7 +4668,9 @@ export default function Page() {
                                   <button
                                     type="button"
                                     className="link-button"
-                                    onClick={() => deleteCostAttachment(String(row.id))}
+                                    onClick={() => {
+                                      if (confirmDelete(`přílohu nákladu "${String(row.item)}"`)) deleteCostAttachment(String(row.id));
+                                    }}
                                     disabled={costAttachmentBusy === String(row.id)}
                                   >
                                     Smazat přílohu
@@ -4666,7 +4701,14 @@ export default function Page() {
                               <button
                                 type="button"
                                 className="link-button"
-                                onClick={() => deleteLoan(String(row.id))}
+                                onClick={() => {
+                                  if (
+                                    confirmDelete(
+                                      `pohyb půjčky ${String(row.lender || "?")} → ${String(row.borrower || "?")} (${formatValue("amount", row.amount)}, ${String(row.movement_date || "?")})`,
+                                    )
+                                  )
+                                    deleteLoan(String(row.id));
+                                }}
                                 disabled={loanBusy}
                               >
                                 Smazat
@@ -4688,7 +4730,14 @@ export default function Page() {
                             <button
                               type="button"
                               className="link-button"
-                              onClick={() => deleteTransaction(String(row.id))}
+                              onClick={() => {
+                                if (
+                                  confirmDelete(
+                                    `pohyb "${String(row.movement_type || "?")} ${String(row.instrument_name || "")}" z ${String(row.traded_on || "?")}`,
+                                  )
+                                )
+                                  deleteTransaction(String(row.id));
+                              }}
                               disabled={transactionBusy}
                             >
                               Smazat
