@@ -77,8 +77,11 @@ from .stock_services import (
     import_patria_trades,
     movement_is_buy,
     movement_is_sell,
+    normalize_ticker,
+    rate_for_day,
     recalculate_stocks,
     refresh_current_prices,
+    ticker_from_existing_data,
 )
 
 
@@ -133,6 +136,27 @@ class ExchangeRateInput(BaseModel):
 
 class PatriaImportInput(BaseModel):
     text: str
+
+
+class StockTransactionInput(BaseModel):
+    traded_on: date
+    instrument_type: str | None = "Akcie"
+    movement_type: str
+    cluster: str | None = None
+    instrument_name: str | None = None
+    isin: str | None = None
+    ticker: str | None = None
+    market: str | None = None
+    quantity: Decimal | None = None
+    unit_price_ccy: Decimal | None = None
+    # Amount and fee in the trading currency - fee_czk/amount_czk are derived
+    # server-side (same formula as the Patria import), so a manual entry only
+    # ever needs the currency-native figures actually printed on a broker
+    # confirmation/dividend advice, never a hand-computed CZK conversion.
+    gross_amount_ccy: Decimal | None = None
+    currency: str = "CZK"
+    fee_ccy: Decimal | None = None
+    description: str | None = None
 
 
 class PortfolioInput(BaseModel):
@@ -2139,6 +2163,99 @@ def stock_transactions(
         .limit(500)
     ).all()
     return [model_dict(row) for row in rows]
+
+
+def _apply_stock_transaction_payload(db: Session, row: StockTransaction, payload: StockTransactionInput) -> None:
+    """Shared create/update logic - derives the ticker (when not given
+    explicitly) and fee_czk/amount_czk from the currency-native figures,
+    exactly like import_patria_trades, so a manual entry never needs a
+    hand-computed CZK conversion. Also normalizes quantity's sign from
+    movement_type (sell = negative), matching the Patria parser."""
+    movement_type = payload.movement_type.strip()
+    quantity = payload.quantity
+    if quantity is not None:
+        if movement_is_sell(movement_type):
+            quantity = -abs(quantity)
+        elif movement_is_buy(movement_type):
+            quantity = abs(quantity)
+    ticker = (
+        normalize_ticker(payload.ticker, payload.market)
+        if payload.ticker
+        else ticker_from_existing_data(db, payload.isin, payload.instrument_name, payload.market)
+    )
+    currency = (payload.currency or "CZK").upper()
+    rate = rate_for_day(db, currency, payload.traded_on)
+    fee_ccy = payload.fee_ccy or Decimal("0")
+    gross_amount_ccy = payload.gross_amount_ccy or Decimal("0")
+    fee_czk = fee_ccy * rate
+    amount_czk = gross_amount_ccy * rate + fee_czk
+
+    row.traded_on = payload.traded_on
+    row.instrument_type = (payload.instrument_type or "").strip() or None
+    row.movement_type = movement_type
+    row.cluster = (payload.cluster or "").strip() or None
+    row.instrument_name = (payload.instrument_name or "").strip() or None
+    row.isin = (payload.isin or "").strip() or None
+    row.ticker = ticker
+    row.market = (payload.market or "").strip() or None
+    row.quantity = quantity
+    row.unit_price_ccy = payload.unit_price_ccy
+    row.gross_amount_ccy = gross_amount_ccy
+    row.currency = currency
+    row.fee_ccy = fee_ccy
+    row.fee_czk = fee_czk
+    row.amount_czk = amount_czk
+    row.description = (payload.description or "").strip() or None
+
+
+@app.post("/stocks/transactions")
+def create_stock_transaction(
+    payload: StockTransactionInput,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("transactions")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if not payload.movement_type.strip():
+        raise HTTPException(status_code=400, detail="Typ pohybu je povinný")
+    row = StockTransaction(portfolio_id=portfolio_id)
+    _apply_stock_transaction_payload(db, row, payload)
+    db.add(row)
+    db.commit()
+    return model_dict(row)
+
+
+@app.put("/stocks/transactions/{transaction_id}")
+def update_stock_transaction(
+    transaction_id: uuid.UUID,
+    payload: StockTransactionInput,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("transactions")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    row = db.scalar(
+        select(StockTransaction).where(StockTransaction.id == transaction_id, StockTransaction.portfolio_id == portfolio_id)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Pohyb nenalezen")
+    if not payload.movement_type.strip():
+        raise HTTPException(status_code=400, detail="Typ pohybu je povinný")
+    _apply_stock_transaction_payload(db, row, payload)
+    db.commit()
+    return model_dict(row)
+
+
+@app.delete("/stocks/transactions/{transaction_id}")
+def delete_stock_transaction(
+    transaction_id: uuid.UUID,
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("transactions")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    row = db.scalar(
+        select(StockTransaction).where(StockTransaction.id == transaction_id, StockTransaction.portfolio_id == portfolio_id)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Pohyb nenalezen")
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted"}
 
 
 @app.get("/stocks/portfolio")

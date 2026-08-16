@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import select
 
 from .conftest import requires_db
@@ -1559,5 +1560,143 @@ def test_loan_movement_write_requires_loans_agenda_grant(client, db_session, por
     response = client.post(
         "/loans/movements", headers=headers, params=params,
         json={"movement_date": "2025-01-01", "lender": "A", "borrower": "B", "amount": "1"},
+    )
+    assert response.status_code == 403
+
+
+@requires_db
+def test_stock_transaction_crud_derives_czk_amounts_and_is_portfolio_scoped(client, db_session, portfolio_id):
+    """Manual entry (e.g. a dividend the broker doesn't feed through Patria
+    import) only ever supplies currency-native figures - fee_czk/amount_czk
+    must be derived server-side via the day's exchange rate, exactly like
+    import_patria_trades, and quantity's sign normalized from movement_type."""
+    from app.models import ExchangeRate, Portfolio
+
+    db_session.add(ExchangeRate(rate_date=date(2026, 6, 1), currency="USD", rate_to_czk=Decimal("23.0")))
+    other_portfolio = Portfolio(name="Jiny Subjekt")
+    db_session.add(other_portfolio)
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    # A manually-entered dividend: gross 2.61 USD, -0.39 USD withholding tax.
+    created = client.post(
+        "/stocks/transactions",
+        headers=headers,
+        params=params,
+        json={
+            "traded_on": "2026-06-05",
+            "movement_type": "Dividenda",
+            "instrument_name": "MA - MasterCard",
+            "isin": "US57636Q1040",
+            "ticker": "MA",
+            "market": "XNYS",
+            "quantity": "3",
+            "gross_amount_ccy": "2.61",
+            "currency": "usd",
+            "fee_ccy": "-0.39",
+            "description": "Ruční záznam dividendy",
+        },
+    )
+    assert created.status_code == 200
+    body = created.json()
+    transaction_id = body["id"]
+    assert body["currency"] == "USD"
+    assert body["ticker"] == "MA"
+    assert float(body["fee_czk"]) == pytest.approx(-0.39 * 23.0)
+    assert float(body["amount_czk"]) == pytest.approx(2.61 * 23.0 - 0.39 * 23.0)
+
+    # A sell must end up with a negative quantity even though a positive
+    # number was entered, same convention as the Patria parser.
+    sell = client.post(
+        "/stocks/transactions",
+        headers=headers,
+        params=params,
+        json={
+            "traded_on": "2026-06-06",
+            "movement_type": "Prodej",
+            "ticker": "MA",
+            "quantity": "3",
+            "gross_amount_ccy": "100",
+            "currency": "USD",
+        },
+    )
+    assert sell.status_code == 200
+    assert float(sell.json()["quantity"]) == -3
+
+    listed = client.get("/stocks/transactions", headers=headers, params=params)
+    assert len(listed.json()) == 2
+
+    updated = client.put(
+        f"/stocks/transactions/{transaction_id}",
+        headers=headers,
+        params=params,
+        json={
+            "traded_on": "2026-06-05",
+            "movement_type": "Dividenda",
+            "instrument_name": "MA - MasterCard",
+            "ticker": "MA",
+            "quantity": "3",
+            "gross_amount_ccy": "2.61",
+            "currency": "USD",
+            "fee_ccy": "-0.39",
+            "description": "Opravený popis",
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["description"] == "Opravený popis"
+
+    # Scoped to the wrong Subjekt, the same transaction is invisible.
+    other_params = {"portfolio_id": str(other_portfolio.id)}
+    wrong_scope_update = client.put(
+        f"/stocks/transactions/{transaction_id}",
+        headers=headers,
+        params=other_params,
+        json={"traded_on": "2026-06-05", "movement_type": "Dividenda"},
+    )
+    assert wrong_scope_update.status_code == 404
+    wrong_scope_delete = client.delete(f"/stocks/transactions/{transaction_id}", headers=headers, params=other_params)
+    assert wrong_scope_delete.status_code == 404
+
+    deleted = client.delete(f"/stocks/transactions/{transaction_id}", headers=headers, params=params)
+    assert deleted.status_code == 200
+    listed_after = client.get("/stocks/transactions", headers=headers, params=params)
+    assert len(listed_after.json()) == 1
+
+
+@requires_db
+def test_stock_transaction_create_rejects_blank_movement_type(client, db_session, portfolio_id):
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    response = client.post(
+        "/stocks/transactions",
+        headers=headers,
+        params=params,
+        json={"traded_on": "2026-06-05", "movement_type": "  "},
+    )
+    assert response.status_code == 400
+
+
+@requires_db
+def test_stock_transaction_write_requires_transactions_agenda_grant(client, db_session, portfolio_id):
+    from app.auth import hash_password
+    from app.models import AppUser, PortfolioAccess
+
+    db_session.add(
+        AppUser(username="viewer3", password_hash=hash_password("s3cret!"), is_active=True, is_admin=False, allowed_agendas=[])
+    )
+    db_session.add(PortfolioAccess(username="viewer3", portfolio_id=portfolio_id, allowed_agendas=["assets"]))
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "viewer3", "password": "s3cret!"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    response = client.post(
+        "/stocks/transactions", headers=headers, params=params, json={"traded_on": "2026-06-05", "movement_type": "Nákup"},
     )
     assert response.status_code == 403

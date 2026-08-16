@@ -217,6 +217,7 @@ const columns: Record<string, string[]> = {
     "difference_czk",
     "difference_pct",
     "description",
+    "actions",
   ],
   watchlist: [
     "watched_on",
@@ -1165,6 +1166,23 @@ export default function Page() {
   });
   const [assetBusy, setAssetBusy] = useState(false);
   const [assetStatus, setAssetStatus] = useState<string | null>(null);
+  const [editingTransactionId, setEditingTransactionId] = useState<string | null>(null);
+  const [transactionDraft, setTransactionDraft] = useState({
+    traded_on: "",
+    movement_type: "Nákup",
+    instrument_name: "",
+    isin: "",
+    ticker: "",
+    market: "",
+    quantity: "",
+    unit_price_ccy: "",
+    gross_amount_ccy: "",
+    currency: "CZK",
+    fee_ccy: "",
+    description: "",
+  });
+  const [transactionBusy, setTransactionBusy] = useState(false);
+  const [transactionStatus, setTransactionStatus] = useState<string | null>(null);
   const [assetSchedule, setAssetSchedule] = useState<{ forId: string; rows: Row[] } | null>(null);
   const [assetScheduleBusy, setAssetScheduleBusy] = useState<string | null>(null);
   const [newAssetTypeDraft, setNewAssetTypeDraft] = useState({ name: "", calculation_mode: "none", required_fields: [] as string[] });
@@ -1928,6 +1946,95 @@ export default function Page() {
       setError(err instanceof Error ? err.message : "Smazání nákladu se nezdařilo");
     } finally {
       setCostBusy(false);
+    }
+  }
+
+  function openNewTransactionForm() {
+    setEditingTransactionId("__new__");
+    setTransactionDraft({
+      traded_on: "",
+      movement_type: "Nákup",
+      instrument_name: "",
+      isin: "",
+      ticker: "",
+      market: "",
+      quantity: "",
+      unit_price_ccy: "",
+      gross_amount_ccy: "",
+      currency: "CZK",
+      fee_ccy: "",
+      description: "",
+    });
+    setTransactionStatus(null);
+  }
+
+  function openTransactionEditor(row: Row) {
+    setEditingTransactionId(String(row.id));
+    setTransactionDraft({
+      traded_on: row.traded_on ? String(row.traded_on) : "",
+      movement_type: row.movement_type ? String(row.movement_type) : "Nákup",
+      instrument_name: row.instrument_name ? String(row.instrument_name) : "",
+      isin: row.isin ? String(row.isin) : "",
+      ticker: row.ticker ? String(row.ticker) : "",
+      market: row.market ? String(row.market) : "",
+      quantity: row.quantity != null ? String(Math.abs(numberValue(row.quantity))) : "",
+      unit_price_ccy: row.unit_price_ccy != null ? String(row.unit_price_ccy) : "",
+      gross_amount_ccy: row.gross_amount_ccy != null ? String(row.gross_amount_ccy) : "",
+      currency: row.currency ? String(row.currency) : "CZK",
+      fee_ccy: row.fee_ccy != null ? String(row.fee_ccy) : "",
+      description: row.description ? String(row.description) : "",
+    });
+    setTransactionStatus(null);
+  }
+
+  function closeTransactionEditor() {
+    setEditingTransactionId(null);
+  }
+
+  async function saveTransactionDraft(event: React.FormEvent) {
+    event.preventDefault();
+    if (!transactionDraft.traded_on || !transactionDraft.movement_type.trim() || !editingTransactionId) return;
+    setTransactionBusy(true);
+    setTransactionStatus(null);
+    try {
+      const payload = {
+        traded_on: transactionDraft.traded_on,
+        movement_type: transactionDraft.movement_type.trim(),
+        instrument_name: transactionDraft.instrument_name.trim() || null,
+        isin: transactionDraft.isin.trim() || null,
+        ticker: transactionDraft.ticker.trim() || null,
+        market: transactionDraft.market.trim() || null,
+        quantity: transactionDraft.quantity.trim() ? Number(transactionDraft.quantity) : null,
+        unit_price_ccy: transactionDraft.unit_price_ccy.trim() ? Number(transactionDraft.unit_price_ccy) : null,
+        gross_amount_ccy: transactionDraft.gross_amount_ccy.trim() ? Number(transactionDraft.gross_amount_ccy) : null,
+        currency: transactionDraft.currency.trim() || "CZK",
+        fee_ccy: transactionDraft.fee_ccy.trim() ? Number(transactionDraft.fee_ccy) : null,
+        description: transactionDraft.description.trim() || null,
+      };
+      if (editingTransactionId === "__new__") {
+        await api(withPortfolio("/stocks/transactions"), { method: "POST", body: JSON.stringify(payload) });
+      } else {
+        await api(withPortfolio(`/stocks/transactions/${editingTransactionId}`), { method: "PUT", body: JSON.stringify(payload) });
+      }
+      setEditingTransactionId(null);
+      await loadAll();
+    } catch (err) {
+      setTransactionStatus(err instanceof Error ? err.message : "Uložení pohybu se nezdařilo");
+    } finally {
+      setTransactionBusy(false);
+    }
+  }
+
+  async function deleteTransaction(transactionId: string) {
+    setTransactionBusy(true);
+    setError(null);
+    try {
+      await api(withPortfolio(`/stocks/transactions/${transactionId}`), { method: "DELETE" });
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Smazání pohybu se nezdařilo");
+    } finally {
+      setTransactionBusy(false);
     }
   }
 
@@ -3963,6 +4070,129 @@ export default function Page() {
                   <Download size={16} />
                   <span>Importovat Patria</span>
                 </button>
+                <button className="action-button" onClick={openNewTransactionForm}>
+                  <span>+ Přidat pohyb ručně</span>
+                </button>
+              </div>
+            )}
+            {activeTab === "transactions" && editingTransactionId && (
+              <div className="access-editor">
+                <p>{editingTransactionId === "__new__" ? "Nový pohyb:" : "Úprava pohybu:"}</p>
+                <form className="cost-form-grid" onSubmit={saveTransactionDraft}>
+                  <label>
+                    Datum
+                    <input
+                      type="date"
+                      value={transactionDraft.traded_on}
+                      onChange={(event) => setTransactionDraft((value) => ({ ...value, traded_on: event.target.value }))}
+                      required
+                    />
+                  </label>
+                  <label>
+                    Typ pohybu
+                    <select
+                      value={transactionDraft.movement_type}
+                      onChange={(event) => setTransactionDraft((value) => ({ ...value, movement_type: event.target.value }))}
+                    >
+                      <option value="Nákup">Nákup</option>
+                      <option value="Prodej">Prodej</option>
+                      <option value="Dividenda">Dividenda</option>
+                    </select>
+                  </label>
+                  <label>
+                    Cenný papír
+                    <input
+                      value={transactionDraft.instrument_name}
+                      onChange={(event) => setTransactionDraft((value) => ({ ...value, instrument_name: event.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    ISIN
+                    <input
+                      value={transactionDraft.isin}
+                      onChange={(event) => setTransactionDraft((value) => ({ ...value, isin: event.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Ticker
+                    <input
+                      value={transactionDraft.ticker}
+                      onChange={(event) => setTransactionDraft((value) => ({ ...value, ticker: event.target.value }))}
+                    />
+                    <span className="field-hint">Prázdné = dopočítá se z ISIN/názvu, pokud je papír už evidovaný.</span>
+                  </label>
+                  <label>
+                    Trh
+                    <input
+                      value={transactionDraft.market}
+                      onChange={(event) => setTransactionDraft((value) => ({ ...value, market: event.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Počet kusů
+                    <input
+                      type="number"
+                      step="0.000001"
+                      value={transactionDraft.quantity}
+                      onChange={(event) => setTransactionDraft((value) => ({ ...value, quantity: event.target.value }))}
+                    />
+                    <span className="field-hint">Znaménko se řídí typem pohybu (prodej se odečte automaticky).</span>
+                  </label>
+                  <label>
+                    Cena za kus (CM)
+                    <input
+                      type="number"
+                      step="0.000001"
+                      value={transactionDraft.unit_price_ccy}
+                      onChange={(event) => setTransactionDraft((value) => ({ ...value, unit_price_ccy: event.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Celková cena (CM)
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={transactionDraft.gross_amount_ccy}
+                      onChange={(event) => setTransactionDraft((value) => ({ ...value, gross_amount_ccy: event.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Měna
+                    <input
+                      value={transactionDraft.currency}
+                      onChange={(event) => setTransactionDraft((value) => ({ ...value, currency: event.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Poplatek (CM)
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={transactionDraft.fee_ccy}
+                      onChange={(event) => setTransactionDraft((value) => ({ ...value, fee_ccy: event.target.value }))}
+                    />
+                    <span className="field-hint">
+                      U dividendy sem patří srážková daň jako záporná hodnota (snižuje čistou částku).
+                    </span>
+                  </label>
+                  <label>
+                    Poznámka
+                    <input
+                      value={transactionDraft.description}
+                      onChange={(event) => setTransactionDraft((value) => ({ ...value, description: event.target.value }))}
+                    />
+                  </label>
+                  {transactionStatus && <div className="success-notice cost-form-note">{transactionStatus}</div>}
+                  <div className="stock-actions cost-form-note">
+                    <button className="action-button" type="submit" disabled={transactionBusy || !transactionDraft.traded_on}>
+                      <Save size={16} />
+                      <span>Uložit pohyb</span>
+                    </button>
+                    <button type="button" className="link-button" onClick={closeTransactionEditor}>
+                      Zrušit
+                    </button>
+                  </div>
+                </form>
               </div>
             )}
             <div className="mini-grids">
@@ -4396,6 +4626,20 @@ export default function Page() {
                               </button>
                             </div>
                           ) : null
+                        ) : col === "actions" && activeTab === "transactions" ? (
+                          <div className="cost-row-actions" onClick={(event) => event.stopPropagation()}>
+                            <button type="button" className="link-button" onClick={() => openTransactionEditor(row)}>
+                              Upravit
+                            </button>
+                            <button
+                              type="button"
+                              className="link-button"
+                              onClick={() => deleteTransaction(String(row.id))}
+                              disabled={transactionBusy}
+                            >
+                              Smazat
+                            </button>
+                          </div>
                         ) : isClickableSummary && colIndex === 0 ? (
                           <span className={`stat-month-toggle${isLoanMonthSummary ? " nested-toggle" : ""}`}>
                             {summaryExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
