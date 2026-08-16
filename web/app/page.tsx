@@ -1042,6 +1042,7 @@ export default function Page() {
   const [adminResetStatus, setAdminResetStatus] = useState<string | null>(null);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [apiBuildTime, setApiBuildTime] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState(tabs[0].id);
   const [rows, setRows] = useState<Row[]>([]);
   const [latestRates, setLatestRates] = useState<LatestRates | null>(null);
@@ -1053,8 +1054,6 @@ export default function Page() {
   const [expandedStatMonths, setExpandedStatMonths] = useState<Set<string>>(() => new Set());
   const [expandedLoanYears, setExpandedLoanYears] = useState<Set<string>>(() => new Set());
   const [expandedLoanMonths, setExpandedLoanMonths] = useState<Set<string>>(() => new Set());
-  const [loanCleanupStatus, setLoanCleanupStatus] = useState<string | null>(null);
-  const [loanCleanupBusy, setLoanCleanupBusy] = useState(false);
   const [editingLoanId, setEditingLoanId] = useState<string | null>(null);
   const [loanDraft, setLoanDraft] = useState({
     movement_date: "",
@@ -1348,6 +1347,17 @@ export default function Page() {
     if (saved) setToken(saved);
     const savedPortfolio = localStorage.getItem("finance-portfolio-id");
     if (savedPortfolio) setActivePortfolioId(savedPortfolio);
+  }, []);
+
+  // Unauthenticated, so this works even on the login screen - shown in the
+  // sidebar footer to make it unambiguous which build is actually live
+  // (came up debugging a "works in dev, not in prod" report where the real
+  // question was whether production had even been redeployed yet).
+  useEffect(() => {
+    fetch(`${API_URL}/version`)
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data) => setApiBuildTime(data?.built_at ?? null))
+      .catch(() => setApiBuildTime(null));
   }, []);
 
   useEffect(() => {
@@ -3174,25 +3184,6 @@ export default function Page() {
     }
   }
 
-  async function cleanupLoanSubtotals() {
-    setError(null);
-    setLoanCleanupStatus(null);
-    setLoanCleanupBusy(true);
-    try {
-      const result = await api(withPortfolio("/loans/cleanup-imported-subtotals"), { method: "POST" });
-      setLoanCleanupStatus(
-        result.deleted > 0
-          ? `Odstraněno ${result.deleted} importovaných mezisoučtových řádků.`
-          : "Žádné importované mezisoučty k odstranění nebyly nalezeny.",
-      );
-      await loadAll();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Vyčištění mezisoučtů se nepodařilo");
-    } finally {
-      setLoanCleanupBusy(false);
-    }
-  }
-
   async function importPatriaTrades() {
     setError(null);
     setStockActionStatus(null);
@@ -3429,6 +3420,9 @@ export default function Page() {
             <LogOut size={18} />
             <span>Odhlásit se</span>
           </button>
+          <span className="sidebar-version">
+            Web: {process.env.NEXT_PUBLIC_BUILD_TIME || "?"} · API: {apiBuildTime || "?"}
+          </span>
         </div>
       </aside>
 
@@ -3497,13 +3491,9 @@ export default function Page() {
                 <p>
                   Součty po měsících a letech jsou počítané appkou (klikni na řádek pro rozbalení/sbalení) - ne
                   naimportované z Excelu.
-                  {loanCleanupStatus ? ` ${loanCleanupStatus}` : ""}
                 </p>
               </div>
               <div className="stock-actions">
-                <button className="action-button" onClick={cleanupLoanSubtotals} disabled={loanCleanupBusy}>
-                  <span>{loanCleanupBusy ? "Čistím…" : "Vyčistit staré importované mezisoučty"}</span>
-                </button>
                 <button className="action-button" onClick={openNewLoanForm}>
                   <span>+ Přidat pohyb</span>
                 </button>
@@ -4796,13 +4786,15 @@ export default function Page() {
                               >
                                 Smazat
                               </button>
-                              <button type="button" className="link-button" onClick={() => viewLoanSchedule(String(row.id))}>
-                                {loanScheduleBusy === String(row.id)
-                                  ? "Načítám…"
-                                  : loanSchedule?.forId === String(row.id)
-                                    ? "Skrýt splátkový kalendář"
-                                    : "Splátkový kalendář"}
-                              </button>
+                              {row.interest_rate && row.planned_end_date && (
+                                <button type="button" className="link-button" onClick={() => viewLoanSchedule(String(row.id))}>
+                                  {loanScheduleBusy === String(row.id)
+                                    ? "Načítám…"
+                                    : loanSchedule?.forId === String(row.id)
+                                      ? "Skrýt splátkový kalendář"
+                                      : "Splátkový kalendář"}
+                                </button>
+                              )}
                             </div>
                           ) : null
                         ) : col === "actions" && activeTab === "transactions" ? (

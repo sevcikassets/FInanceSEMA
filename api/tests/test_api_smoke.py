@@ -799,33 +799,6 @@ def test_import_loans_skips_baked_in_subtotal_rows(db_session, portfolio_id):
 
 
 @requires_db
-def test_cleanup_loan_subtotals_endpoint_removes_only_dateless_rows(client, db_session, portfolio_id):
-    """Regression cleanup path for databases imported before the fix: a
-    dateless LoanMovement (the old subtotal artifact) must be deleted, a
-    real dated movement must survive."""
-    from app.models import LoanMovement
-
-    db_session.add(LoanMovement(portfolio_id=portfolio_id, movement_date=None, amount=Decimal("54139"), source_row=3))
-    db_session.add(
-        LoanMovement(portfolio_id=portfolio_id, movement_date=date(2023, 1, 15), amount=Decimal("54139"), source_row=2)
-    )
-    db_session.commit()
-
-    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
-    headers = {"Authorization": f"Bearer {login.json()['token']}"}
-    response = client.post(
-        "/loans/cleanup-imported-subtotals", headers=headers, params={"portfolio_id": str(portfolio_id)}
-    )
-
-    assert response.status_code == 200
-    assert response.json()["deleted"] == 1
-
-    remaining = db_session.scalars(select(LoanMovement)).all()
-    assert len(remaining) == 1
-    assert remaining[0].movement_date == date(2023, 1, 15)
-
-
-@requires_db
 def test_two_factor_setup_confirm_and_login_flow(client, portfolio_id):
     """End-to-end 2FA enrollment + login: setup returns a scannable secret,
     confirm requires a real TOTP code (not just any string), and once
@@ -1882,3 +1855,13 @@ def test_merge_parties_rejects_keep_id_inside_remove_ids(client, db_session, por
     headers = {"Authorization": f"Bearer {login.json()['token']}"}
     response = client.post("/parties/merge", headers=headers, json={"keep_id": str(party.id), "remove_ids": [str(party.id)]})
     assert response.status_code == 400
+
+
+@requires_db
+def test_version_endpoint_is_unauthenticated_and_reports_build_time(client):
+    """Lets the sidebar (and whoever's debugging a deploy) tell at a glance
+    which build is actually live - no login needed, since it's meant to
+    work even from the login screen."""
+    response = client.get("/version")
+    assert response.status_code == 200
+    assert "built_at" in response.json()

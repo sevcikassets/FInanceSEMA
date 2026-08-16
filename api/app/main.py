@@ -985,6 +985,23 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# Stamped into the image at `docker build` time (see api/Dockerfile) - read
+# once at import time rather than per-request, since it never changes for
+# the life of a running container. Falls back to None outside Docker (e.g.
+# running main.py directly against a local Python env), where the file was
+# never created.
+_BUILD_TIME_PATH = Path(__file__).resolve().parent.parent / "BUILD_TIME"
+try:
+    BUILD_TIME = _BUILD_TIME_PATH.read_text().strip()
+except OSError:
+    BUILD_TIME = None
+
+
+@app.get("/version")
+def version() -> dict[str, str | None]:
+    return {"built_at": BUILD_TIME}
+
+
 @app.post("/auth/login")
 def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     user = db.get(AppUser, payload.username)
@@ -1575,26 +1592,6 @@ def loan_movement_payment_schedule(
         }
         for period in schedule
     ]
-
-
-@app.post("/loans/cleanup-imported-subtotals")
-def cleanup_loan_subtotals(
-    portfolio_id: uuid.UUID = Depends(require_portfolio_access("loans")), db: Session = Depends(get_db)
-) -> dict[str, Any]:
-    """One-off cleanup for databases imported before the fix: the source
-    "Půjčky Pohyby" sheet has monthly/yearly subtotal rows baked directly
-    into the data (a "Leden 2023"/"2023" text label instead of a real date,
-    no lender/borrower) which used to be imported as if they were real loan
-    movements. import_loans no longer creates these, but a database imported
-    before that fix still has the old ones sitting in it - this deletes just
-    those (movement_date IS NULL, never true for a real movement) without
-    touching any real loan data or requiring a full destructive re-import.
-    """
-    deleted = db.execute(
-        delete(LoanMovement).where(LoanMovement.portfolio_id == portfolio_id, LoanMovement.movement_date.is_(None))
-    ).rowcount
-    db.commit()
-    return {"deleted": deleted}
 
 
 def _asset_dict(db: Session, row: Asset) -> dict[str, Any]:

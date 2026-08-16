@@ -155,6 +155,15 @@ textarea {
   text-overflow: ellipsis;
 }
 
+.sidebar-version {
+  padding: 0 10px;
+  color: #5b6b7d;
+  font-size: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .sidebar-logout-button {
   display: grid;
   grid-template-columns: 20px 1fr;
