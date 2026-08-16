@@ -622,37 +622,27 @@ def recalculate_stocks(
             if traded_on:
                 ticker_qty_events[ticker][traded_on] += quantity
 
+    # Quantity/invested basis only for now - priced further down once the fresh
+    # Yahoo history (including today's live-quote patch) has been fetched, so
+    # positions are valued with the exact same price DailyStatistic uses for
+    # "today" instead of whatever stale price was last stored (previously this
+    # only updated via the separate "Ceny" refresh action, so "Zisk portfolia"
+    # could silently drift out of sync with the recalculated daily statistics).
     computed_positions: list[PortfolioPosition] = []
-    total_market_value = ZERO
     for data in positions.values():
         quantity = decimal_or_zero(data["quantity"])
         if quantity <= ZERO:
             continue
-        price = decimal_or_zero(data["current_price"])
-        rate = latest_rate(db, data["currency"])
-        market_value = quantity * price * rate
-        invested = decimal_or_zero(data["invested_czk"])
-        profit = market_value - invested
-        total_market_value += market_value
         computed_positions.append(
             PortfolioPosition(
                 portfolio_id=portfolio_id,
                 ticker=data["ticker"],
                 name=data["name"],
                 quantity=quantity,
-                current_price=as_decimal(price),
                 currency=data["currency"],
-                market_value_czk=market_value,
-                invested_czk=invested,
-                profit_czk=profit,
-                profit_pct=(profit / invested) if invested else None,
+                invested_czk=decimal_or_zero(data["invested_czk"]),
                 first_buy_date=data["first_buy_date"],
             )
-        )
-
-    for position in computed_positions:
-        position.portfolio_share_pct = (
-            decimal_or_zero(position.market_value_czk) / total_market_value if total_market_value else None
         )
 
     alert_threshold = Decimal(str(threshold_pct))
@@ -752,6 +742,30 @@ def recalculate_stocks(
         if idx < 0:
             return None
         return price_values[ticker][idx]
+
+    # Price and value every currently-held position using the same fresh data
+    # just fetched above (history close, or the live-quote patch for today) -
+    # falling back to whatever price was already stored only if Yahoo had
+    # nothing at all for that ticker (network problem, delisted, bad symbol).
+    total_market_value = ZERO
+    for position in computed_positions:
+        data = positions[position.ticker]
+        fresh_price = price_at_or_before(position.ticker, date.today())
+        price = fresh_price if fresh_price is not None else decimal_or_zero(data["current_price"])
+        rate = latest_rate(db, position.currency)
+        market_value = position.quantity * price * rate
+        invested = decimal_or_zero(position.invested_czk)
+        profit = market_value - invested
+        position.current_price = as_decimal(price)
+        position.market_value_czk = market_value
+        position.profit_czk = profit
+        position.profit_pct = (profit / invested) if invested else None
+        total_market_value += market_value
+
+    for position in computed_positions:
+        position.portfolio_share_pct = (
+            decimal_or_zero(position.market_value_czk) / total_market_value if total_market_value else None
+        )
 
     ticker_running_qty: dict[str, Decimal] = defaultdict(Decimal)
     previous_total_value_czk = ZERO
