@@ -495,35 +495,49 @@ def test_summary_assets_total_nets_debt_interest_contribution(client, db_session
 
 
 @requires_db
-def test_asset_costs_count_toward_value_except_for_nemovitost_type(client, db_session, portfolio_id):
-    """A "Nemovitost"-typed asset's total_value is already a whole-property
-    market figure - AssetCost spending on it must NOT be added on top, or
-    net worth would double-count. Every other type (Byt, Stavba, a future
-    "Auto", ...) has no such external valuation, so accumulated costs are
-    the best signal of money actually tied up in it and must be folded into
-    its value."""
-    from app.models import Asset, AssetCost, AssetType
+def test_asset_costs_count_toward_value_except_nemovitost_category(client, db_session, portfolio_id):
+    """A cost booked under an "A. Nemovitost"-style category is the
+    property's own purchase price (splátka, provize, ...) - already
+    reflected in total_value, so it must NOT be added on top regardless of
+    the ASSET's own type (a Byt has these too, e.g. a down payment cost).
+    Every other category is real additional spending and must be folded
+    into net worth - this applies to a "Nemovitost"-typed asset just the
+    same as any other type."""
+    from app.models import Asset, AssetCost, AssetType, CostCategory
 
     byt_type = AssetType(portfolio_id=portfolio_id, name="Byt", calculation_mode="none")
     nemovitost_type = AssetType(portfolio_id=portfolio_id, name="Nemovitost", calculation_mode="none")
-    stavba_type = AssetType(portfolio_id=portfolio_id, name="Stavba", calculation_mode="none")
-    db_session.add_all([byt_type, nemovitost_type, stavba_type])
+    db_session.add_all([byt_type, nemovitost_type])
+    db_session.flush()
+
+    nemovitost_category = CostCategory(portfolio_id=portfolio_id, name="A. Nemovitost")
+    materials_category = CostCategory(portfolio_id=portfolio_id, name="B. Materiál")
+    db_session.add_all([nemovitost_category, materials_category])
     db_session.flush()
 
     byt = Asset(portfolio_id=portfolio_id, code="COST-1", name="Byt Test", asset_type_id=byt_type.id, total_value=Decimal("1000000"))
-    nemovitost = Asset(
-        portfolio_id=portfolio_id, code="COST-2", name="RD Test", asset_type_id=nemovitost_type.id, total_value=Decimal("2000000")
-    )
-    stavba = Asset(portfolio_id=portfolio_id, code="COST-3", name="Stavba Test", asset_type_id=stavba_type.id, total_value=Decimal("300000"))
-    db_session.add_all([byt, nemovitost, stavba])
+    rd = Asset(portfolio_id=portfolio_id, code="COST-2", name="RD Test", asset_type_id=nemovitost_type.id, total_value=Decimal("2000000"))
+    db_session.add_all([byt, rd])
     db_session.commit()
 
     db_session.add_all(
         [
-            AssetCost(portfolio_id=portfolio_id, asset_id=byt.id, item="Oprava střechy", amount=Decimal("50000"), cost_date=date(2024, 1, 1)),
-            AssetCost(portfolio_id=portfolio_id, asset_id=nemovitost.id, item="Oprava plotu", amount=Decimal("20000"), cost_date=date(2024, 1, 1)),
-            AssetCost(portfolio_id=portfolio_id, asset_id=stavba.id, item="Základy", amount=Decimal("15000"), cost_date=date(2024, 1, 1)),
-            AssetCost(portfolio_id=portfolio_id, asset_id=stavba.id, item="Střecha", amount=Decimal("8000"), cost_date=date(2024, 2, 1)),
+            AssetCost(
+                portfolio_id=portfolio_id, asset_id=byt.id, item="První splátka na byt", amount=Decimal("400000"),
+                category_id=nemovitost_category.id, cost_date=date(2024, 1, 1),
+            ),
+            AssetCost(
+                portfolio_id=portfolio_id, asset_id=byt.id, item="Oprava střechy", amount=Decimal("50000"),
+                category_id=materials_category.id, cost_date=date(2024, 1, 1),
+            ),
+            AssetCost(
+                portfolio_id=portfolio_id, asset_id=rd.id, item="Kupní cena pozemku", amount=Decimal("1800000"),
+                category_id=nemovitost_category.id, cost_date=date(2024, 1, 1),
+            ),
+            AssetCost(
+                portfolio_id=portfolio_id, asset_id=rd.id, item="Materiál na plot", amount=Decimal("20000"),
+                category_id=materials_category.id, cost_date=date(2024, 1, 1),
+            ),
         ]
     )
     db_session.commit()
@@ -536,17 +550,14 @@ def test_asset_costs_count_toward_value_except_for_nemovitost_type(client, db_se
     assert listed.status_code == 200
     by_code = {row["code"]: row for row in listed.json()}
 
-    assert by_code["COST-1"]["costs_czk"] == 50000
+    assert by_code["COST-1"]["costs_czk"] == 50000  # only the materiál cost, not the purchase-price installment
     assert by_code["COST-1"]["costs_counted_in_value"] is True
     assert by_code["COST-1"]["net_worth_contribution"] == 1050000  # 1000000 + 50000
 
-    assert by_code["COST-2"]["costs_counted_in_value"] is False
-    assert by_code["COST-2"]["net_worth_contribution"] == 2000000  # unchanged - Nemovitost, costs not added
-
-    assert by_code["COST-3"]["costs_czk"] == 23000
-    assert by_code["COST-3"]["costs_counted_in_value"] is True
-    assert by_code["COST-3"]["net_worth_contribution"] == 323000  # 300000 + 23000
+    assert by_code["COST-2"]["costs_czk"] == 20000  # a Nemovitost-typed asset counts non-Nemovitost-category costs too
+    assert by_code["COST-2"]["costs_counted_in_value"] is True
+    assert by_code["COST-2"]["net_worth_contribution"] == 2020000  # 2000000 + 20000
 
     summary = client.get("/summary", headers=headers, params=params)
     assert summary.status_code == 200
-    assert summary.json()["assets_total"] == 1050000 + 2000000 + 323000
+    assert summary.json()["assets_total"] == 1050000 + 2020000

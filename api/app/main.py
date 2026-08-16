@@ -307,46 +307,49 @@ def computed_interest_plan(asset: Asset, calculation_mode: str | None) -> dict[s
     return {str(year): json_value(value) for year, value in sorted(projection.items())}
 
 
-# "Nemovitost" is the one type whose displayed "Hodnota" is already a
-# whole-property market/appraisal figure - adding accumulated AssetCost
-# spending on top would double-count. Every other type (Byt, Stavba, a
-# future "Auto", "Sbírka", ...) has no such external valuation, so money
-# actually spent on it is the best available signal of how much of the
-# family's wealth is tied up in it.
-REAL_ESTATE_TYPE_NAMES = {"nemovitost"}
+# A cost booked under a "Nemovitost"-named category (e.g. "A. Nemovitost")
+# is the property's own purchase price/acquisition cost (splátka, provize,
+# ...) - already reflected in the asset's total_value, so folding it into
+# net worth on top would double-count. Every other category (materiál,
+# služby, vybavení, ...) is real additional spending not otherwise
+# reflected in total_value, regardless of which asset or asset type it's
+# booked against - see asset_costs_by_id.
+def is_real_estate_cost_category(category_name: str | None) -> bool:
+    return "nemovitost" in (category_name or "").strip().lower()
 
 
-def asset_costs_count_in_value(asset_type_name: str | None, calculation_mode: str | None) -> bool:
-    if calculation_mode == "debt_interest":
-        return False
-    return (asset_type_name or "").strip().lower() not in REAL_ESTATE_TYPE_NAMES
+def asset_costs_count_in_value(calculation_mode: str | None) -> bool:
+    """A Hypotéka's contribution is purely -borrowed_amount (see
+    asset_net_worth_contribution) - costs don't apply there. Every other
+    type counts its non-real-estate-category costs."""
+    return calculation_mode != "debt_interest"
 
 
 def asset_costs_by_id(db: Session, portfolio_id: uuid.UUID) -> dict[uuid.UUID, Decimal]:
     """Cumulative AssetCost.amount per asset_id, for folding into net worth -
-    a single grouped query instead of one per asset."""
+    excludes costs under a "Nemovitost"-named category (see
+    is_real_estate_cost_category). A single query instead of one per asset."""
     rows = db.execute(
-        select(AssetCost.asset_id, func.coalesce(func.sum(AssetCost.amount), 0))
+        select(AssetCost.asset_id, AssetCost.amount, CostCategory.name, AssetCost.category)
+        .outerjoin(CostCategory, CostCategory.id == AssetCost.category_id)
         .where(AssetCost.portfolio_id == portfolio_id, AssetCost.asset_id.is_not(None))
-        .group_by(AssetCost.asset_id)
     ).all()
-    return {asset_id: total for asset_id, total in rows}
+    totals: dict[uuid.UUID, Decimal] = defaultdict(Decimal)
+    for asset_id, amount, category_name, legacy_category in rows:
+        if is_real_estate_cost_category(category_name or legacy_category):
+            continue
+        totals[asset_id] += amount or Decimal("0")
+    return dict(totals)
 
 
-def asset_net_worth_contribution(
-    asset: Asset, calculation_mode: str | None, asset_type_name: str | None, costs_total: Decimal
-) -> Decimal:
+def asset_net_worth_contribution(asset: Asset, calculation_mode: str | None, costs_total: Decimal) -> Decimal:
     """How much this asset counts toward /summary's assets_total: a
     debt_interest asset (Hypotéka) is money OWED, so its borrowed_amount
     reduces net worth; everything else counts its total_value as-is, plus
-    accumulated costs for types where that isn't already reflected in
-    total_value (see asset_costs_count_in_value)."""
+    accumulated non-real-estate-category costs (see asset_costs_count_in_value)."""
     if calculation_mode == "debt_interest":
         return -(asset.borrowed_amount or Decimal("0"))
-    value = asset.total_value or Decimal("0")
-    if asset_costs_count_in_value(asset_type_name, calculation_mode):
-        value += costs_total
-    return value
+    return (asset.total_value or Decimal("0")) + costs_total
 
 
 def asset_outstanding_balance(asset: Asset, calculation_mode: str | None) -> Decimal:
@@ -1361,8 +1364,7 @@ def summary(
     for row in asset_rows:
         asset_type = asset_types_by_id.get(row.asset_type_id)
         calculation_mode = asset_type.calculation_mode if asset_type else None
-        asset_type_name = asset_type.name if asset_type else row.asset_type
-        asset_total += asset_net_worth_contribution(row, calculation_mode, asset_type_name, costs_by_asset.get(row.id, Decimal("0")))
+        asset_total += asset_net_worth_contribution(row, calculation_mode, costs_by_asset.get(row.id, Decimal("0")))
         mortgage_outstanding += asset_outstanding_balance(row, calculation_mode)
     cost_total = db.scalar(select(func.coalesce(func.sum(AssetCost.amount), 0)).where(AssetCost.portfolio_id == portfolio_id))
     portfolio_value = db.scalar(
@@ -1703,15 +1705,15 @@ def _asset_dict(db: Session, row: Asset) -> dict[str, Any]:
     linked = db.get(Asset, row.linked_asset_id) if row.linked_asset_id else None
     calculation_mode = asset_type.calculation_mode if asset_type else None
     asset_type_name = asset_type.name if asset_type else row.asset_type
-    costs_total = db.scalar(select(func.coalesce(func.sum(AssetCost.amount), 0)).where(AssetCost.asset_id == row.id))
+    costs_total = asset_costs_by_id(db, row.portfolio_id).get(row.id, Decimal("0"))
     return model_dict(row) | {
         "owner": owner.name if owner else None,
         "asset_type": asset_type_name,
         "calculation_mode": calculation_mode,
         "computed_interest_plan": computed_interest_plan(row, calculation_mode),
         "costs_czk": json_value(costs_total),
-        "costs_counted_in_value": asset_costs_count_in_value(asset_type_name, calculation_mode),
-        "net_worth_contribution": json_value(asset_net_worth_contribution(row, calculation_mode, asset_type_name, costs_total)),
+        "costs_counted_in_value": asset_costs_count_in_value(calculation_mode),
+        "net_worth_contribution": json_value(asset_net_worth_contribution(row, calculation_mode, costs_total)),
         "linked_asset": linked.name if linked else None,
         "linked_asset_code": linked.code if linked else None,
     }
@@ -1761,8 +1763,8 @@ def assets(
                 "calculation_mode": calculation_mode,
                 "computed_interest_plan": computed_interest_plan(row, calculation_mode),
                 "costs_czk": json_value(costs_total),
-                "costs_counted_in_value": asset_costs_count_in_value(asset_type_name, calculation_mode),
-                "net_worth_contribution": json_value(asset_net_worth_contribution(row, calculation_mode, asset_type_name, costs_total)),
+                "costs_counted_in_value": asset_costs_count_in_value(calculation_mode),
+                "net_worth_contribution": json_value(asset_net_worth_contribution(row, calculation_mode, costs_total)),
                 "linked_asset": linked.name if linked else None,
                 "linked_asset_code": linked.code if linked else None,
             }
