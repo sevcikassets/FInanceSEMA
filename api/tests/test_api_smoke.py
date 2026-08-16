@@ -1742,3 +1742,143 @@ def test_stock_benchmark_returns_history_over_own_daily_statistics_window(client
     # Sorted ascending by date, regardless of the order fetch_yahoo_history returned them in.
     assert [row["date"] for row in body] == ["2026-06-01", "2026-06-30"]
     assert body[0]["close"] == pytest.approx(5300.00)
+
+
+@requires_db
+def test_party_duplicate_candidates_groups_by_normalized_name_with_reference_counts(client, db_session, portfolio_id):
+    """Party.name is UNIQUE, but "Acme s.r.o." and "acme, s.r.o. " (trailing
+    space, different case/punctuation) are two different rows that render
+    identically and silently split whatever they're referenced by - this is
+    the shortlist the admin reviews before merging."""
+    from app.models import Asset, LoanMovement, Party
+
+    dup_a = Party(name="Acme s.r.o.", kind="borrower")
+    dup_b = Party(name="acme,  s.r.o. ", kind="unknown")
+    unrelated = Party(name="Totally Different Co", kind="unknown")
+    db_session.add_all([dup_a, dup_b, unrelated])
+    db_session.commit()
+
+    db_session.add(
+        LoanMovement(portfolio_id=portfolio_id, movement_date=date(2026, 1, 1), lender_id=dup_a.id, borrower_id=unrelated.id, amount=Decimal("1000"))
+    )
+    db_session.add(
+        Asset(portfolio_id=portfolio_id, code="X1", name="Byt X", owner_id=dup_b.id, total_value=Decimal("1"))
+    )
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+
+    response = client.get("/parties/duplicate-candidates", headers=headers)
+    assert response.status_code == 200
+    groups = response.json()
+    matching = [g for g in groups if any(m["id"] == str(dup_a.id) for m in g["members"])]
+    assert len(matching) == 1
+    members_by_id = {m["id"]: m for m in matching[0]["members"]}
+    assert len(members_by_id) == 2
+    assert members_by_id[str(dup_a.id)]["reference_count"] == 1
+    assert members_by_id[str(dup_b.id)]["reference_count"] == 1
+    # "Totally Different Co" has no near-duplicate, so it must not appear in any group.
+    assert all(str(unrelated.id) not in {m["id"] for m in g["members"]} for g in groups)
+
+
+@requires_db
+def test_party_duplicate_candidates_requires_admin(client, db_session, portfolio_id):
+    from app.auth import hash_password
+    from app.models import AppUser
+
+    db_session.add(AppUser(username="viewer4", password_hash=hash_password("s3cret!"), is_active=True, is_admin=False, allowed_agendas=[]))
+    db_session.commit()
+    login = client.post("/auth/login", json={"username": "viewer4", "password": "s3cret!"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    assert client.get("/parties/duplicate-candidates", headers=headers).status_code == 403
+    assert client.post("/parties/merge", headers=headers, json={"keep_id": str(portfolio_id), "remove_ids": []}).status_code == 403
+
+
+@requires_db
+def test_merge_parties_reassigns_every_reference_and_deletes_duplicates(client, db_session, portfolio_id):
+    """End-to-end version of the reported bug: two Party rows for the same
+    real lender/borrower split a debt-overview pair into two rows instead of
+    one - merging must make /loans/balances collapse them back together."""
+    from app.models import Asset, AssetCost, LoanMovement, Party, PortfolioSelfParty
+
+    keep = Party(name="ŠEVČÍK ASSETS, s.r.o.", kind="borrower")
+    dup = Party(name="ševčík assets, s.r.o.", kind="unknown")
+    martin = Party(name="Martin Ševčík", kind="owner")
+    db_session.add_all([keep, dup, martin])
+    db_session.commit()
+
+    db_session.add_all(
+        [
+            LoanMovement(portfolio_id=portfolio_id, movement_date=date(2026, 1, 1), lender_id=martin.id, borrower_id=keep.id, amount=Decimal("1000")),
+            LoanMovement(portfolio_id=portfolio_id, movement_date=date(2026, 2, 1), lender_id=martin.id, borrower_id=dup.id, amount=Decimal("500")),
+            Asset(portfolio_id=portfolio_id, code="A1", name="Test", owner_id=dup.id, total_value=Decimal("1")),
+            AssetCost(portfolio_id=portfolio_id, item="Test cost", payer_id=dup.id, amount=Decimal("10")),
+        ]
+    )
+    db_session.add(PortfolioSelfParty(portfolio_id=portfolio_id, party_id=dup.id))
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+
+    response = client.post("/parties/merge", headers=headers, json={"keep_id": str(keep.id), "remove_ids": [str(dup.id)]})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reassigned_references"] == 4  # 1 loan movement + 1 asset + 1 cost + 1 self-party
+
+    # The API request handled the merge on its own DB session/transaction -
+    # db_session's identity map still holds pre-merge copies, so it must be
+    # told to re-query rather than serve stale cached objects.
+    db_session.expunge_all()
+    assert db_session.get(Party, dup.id) is None
+    assert db_session.query(Asset).filter_by(code="A1").one().owner_id == keep.id
+    assert db_session.query(AssetCost).filter_by(item="Test cost").one().payer_id == keep.id
+
+    balances = client.get(f"/loans/balances?portfolio_id={portfolio_id}", headers=headers).json()
+    matching = [b for b in balances["balances"] if b["lender"] == "Martin Ševčík" and b["borrower"] == "ŠEVČÍK ASSETS, s.r.o."]
+    assert len(matching) == 1
+    assert matching[0]["net_amount"] == pytest.approx(1500)
+    assert matching[0]["movement_count"] == 2
+
+
+@requires_db
+def test_merge_parties_drops_redundant_self_party_row_on_pk_conflict(client, db_session, portfolio_id):
+    """When the SAME portfolio already marks both the duplicate and the
+    canonical Party as a self-party, a plain UPDATE onto keep_id's row would
+    violate PortfolioSelfParty's composite PK - the duplicate's row must be
+    dropped instead of crashing the merge."""
+    from app.models import Party, PortfolioSelfParty
+
+    keep = Party(name="Foo", kind="owner")
+    dup = Party(name="foo ", kind="unknown")
+    db_session.add_all([keep, dup])
+    db_session.commit()
+    db_session.add(PortfolioSelfParty(portfolio_id=portfolio_id, party_id=keep.id))
+    db_session.add(PortfolioSelfParty(portfolio_id=portfolio_id, party_id=dup.id))
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+
+    response = client.post("/parties/merge", headers=headers, json={"keep_id": str(keep.id), "remove_ids": [str(dup.id)]})
+    assert response.status_code == 200
+    db_session.expunge_all()
+    assert db_session.get(Party, dup.id) is None
+    remaining = db_session.query(PortfolioSelfParty).filter_by(portfolio_id=portfolio_id).all()
+    assert len(remaining) == 1
+    assert remaining[0].party_id == keep.id
+
+
+@requires_db
+def test_merge_parties_rejects_keep_id_inside_remove_ids(client, db_session, portfolio_id):
+    from app.models import Party
+
+    party = Party(name="Solo", kind="unknown")
+    db_session.add(party)
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    response = client.post("/parties/merge", headers=headers, json={"keep_id": str(party.id), "remove_ids": [str(party.id)]})
+    assert response.status_code == 400

@@ -1,5 +1,7 @@
 import base64
 import calendar
+import re
+from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import io
@@ -25,7 +27,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlalchemy import delete, desc, func, select, text
+from sqlalchemy import delete, desc, func, select, text, update
 from sqlalchemy.orm import Session
 
 from .auth import (
@@ -1893,6 +1895,114 @@ def list_parties(_: str = Depends(require_admin), db: Session = Depends(get_db))
     e.g. an owner-kind Party as well as a lender/borrower-kind one)."""
     rows = db.scalars(select(Party).order_by(Party.name)).all()
     return [{"id": str(row.id), "name": row.name, "kind": row.kind} for row in rows]
+
+
+def _normalize_party_name(name: str) -> str:
+    """Loose, case/whitespace/punctuation-insensitive key for spotting near-
+    duplicate Party rows. Party.name is UNIQUE at the DB level, so a byte-
+    identical name can never exist twice - but "ŠEVČÍK ASSETS, s.r.o." and
+    "ŠEVČÍK ASSETS, s.r.o. " (trailing space) or a different capitalization
+    are two different rows that render identically, silently splitting the
+    same real-world lender/borrower/owner/payer across loan balances, debt
+    overviews, net-worth totals, etc."""
+    return re.sub(r"[\s.,]+", " ", name.strip().lower()).strip()
+
+
+@app.get("/parties/duplicate-candidates")
+def party_duplicate_candidates(_: str = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    """Groups every Party by _normalize_party_name, returning only groups
+    with more than one member - a shortlist for the admin to review and
+    merge via POST /parties/merge, instead of eyeballing the full party
+    list. Reference counts (how many loans/assets/costs point at each row)
+    help judge which one is the "real" one worth keeping."""
+    rows = db.scalars(select(Party)).all()
+    groups: dict[str, list[Party]] = defaultdict(list)
+    for row in rows:
+        groups[_normalize_party_name(row.name)].append(row)
+    candidate_groups = {key: members for key, members in groups.items() if len(members) > 1}
+    if not candidate_groups:
+        return []
+
+    party_ids = [member.id for members in candidate_groups.values() for member in members]
+    lender_counts = dict(
+        db.execute(select(LoanMovement.lender_id, func.count()).where(LoanMovement.lender_id.in_(party_ids)).group_by(LoanMovement.lender_id)).all()
+    )
+    borrower_counts = dict(
+        db.execute(
+            select(LoanMovement.borrower_id, func.count()).where(LoanMovement.borrower_id.in_(party_ids)).group_by(LoanMovement.borrower_id)
+        ).all()
+    )
+    owner_counts = dict(
+        db.execute(select(Asset.owner_id, func.count()).where(Asset.owner_id.in_(party_ids)).group_by(Asset.owner_id)).all()
+    )
+    payer_counts = dict(
+        db.execute(select(AssetCost.payer_id, func.count()).where(AssetCost.payer_id.in_(party_ids)).group_by(AssetCost.payer_id)).all()
+    )
+
+    def reference_count(party_id: uuid.UUID) -> int:
+        return lender_counts.get(party_id, 0) + borrower_counts.get(party_id, 0) + owner_counts.get(party_id, 0) + payer_counts.get(party_id, 0)
+
+    return [
+        {
+            "key": key,
+            "members": [
+                {"id": str(member.id), "name": member.name, "kind": member.kind, "reference_count": reference_count(member.id)}
+                for member in sorted(members, key=lambda m: reference_count(m.id), reverse=True)
+            ],
+        }
+        for key, members in candidate_groups.items()
+    ]
+
+
+class PartyMergeInput(BaseModel):
+    keep_id: uuid.UUID
+    remove_ids: list[uuid.UUID]
+
+
+@app.post("/parties/merge")
+def merge_parties(payload: PartyMergeInput, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Reassigns every LoanMovement/Asset/AssetCost/PortfolioSelfParty
+    reference from each remove_ids Party onto keep_id, then deletes the
+    now-unreferenced duplicate rows. Fixes the "same name, two different
+    party_ids" issue /parties/duplicate-candidates surfaces - e.g. a debt
+    overview row split in two because half the loan movements point at one
+    near-duplicate Party and half at the other."""
+    if payload.keep_id in payload.remove_ids:
+        raise HTTPException(status_code=400, detail="Cílová osoba/firma nemůže být zároveň mezi slučovanými")
+    if db.get(Party, payload.keep_id) is None:
+        raise HTTPException(status_code=404, detail="Cílová osoba/firma nenalezena")
+    remove_rows = db.scalars(select(Party).where(Party.id.in_(payload.remove_ids))).all()
+    if len(remove_rows) != len(payload.remove_ids):
+        raise HTTPException(status_code=404, detail="Některá slučovaná osoba/firma nenalezena")
+
+    reassigned = 0
+    # portfolio_self_parties has a composite PK (portfolio_id, party_id) - a
+    # straight UPDATE onto keep_id would violate it wherever a portfolio
+    # already marks both the duplicate and keep_id as a self-party, so drop
+    # the now-redundant row there instead of moving it.
+    already_self_portfolios = db.scalars(
+        select(PortfolioSelfParty.portfolio_id).where(PortfolioSelfParty.party_id == payload.keep_id)
+    ).all()
+    for remove_id in payload.remove_ids:
+        reassigned += db.execute(update(LoanMovement).where(LoanMovement.lender_id == remove_id).values(lender_id=payload.keep_id)).rowcount
+        reassigned += db.execute(
+            update(LoanMovement).where(LoanMovement.borrower_id == remove_id).values(borrower_id=payload.keep_id)
+        ).rowcount
+        reassigned += db.execute(update(Asset).where(Asset.owner_id == remove_id).values(owner_id=payload.keep_id)).rowcount
+        reassigned += db.execute(update(AssetCost).where(AssetCost.payer_id == remove_id).values(payer_id=payload.keep_id)).rowcount
+        db.execute(
+            delete(PortfolioSelfParty).where(
+                PortfolioSelfParty.party_id == remove_id, PortfolioSelfParty.portfolio_id.in_(already_self_portfolios)
+            )
+        )
+        reassigned += db.execute(
+            update(PortfolioSelfParty).where(PortfolioSelfParty.party_id == remove_id).values(party_id=payload.keep_id)
+        ).rowcount
+
+    for row in remove_rows:
+        db.delete(row)
+    db.commit()
+    return {"kept": str(payload.keep_id), "removed": [str(r) for r in payload.remove_ids], "reassigned_references": reassigned}
 
 
 @app.get("/parties/payers")

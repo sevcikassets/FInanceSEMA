@@ -1122,6 +1122,10 @@ export default function Page() {
   const [selfPartyIds, setSelfPartyIds] = useState<Set<string>>(() => new Set());
   const [selfPartiesBusy, setSelfPartiesBusy] = useState(false);
   const [selfPartiesStatus, setSelfPartiesStatus] = useState<string | null>(null);
+  const [duplicateParties, setDuplicateParties] = useState<{ key: string; members: Row[] }[]>([]);
+  const [mergeSelection, setMergeSelection] = useState<Record<string, string>>({});
+  const [mergeBusy, setMergeBusy] = useState(false);
+  const [mergeStatus, setMergeStatus] = useState<string | null>(null);
   const [editingAccessUsername, setEditingAccessUsername] = useState<string | null>(null);
   const [accessDraft, setAccessDraft] = useState<Record<string, string[]>>({});
   const [accessBusy, setAccessBusy] = useState(false);
@@ -1437,6 +1441,7 @@ export default function Page() {
       // regardless of kind - not present in `rows` (that tab uses
       // needsPortfolioList/`portfolios`, not the generic rows fetch).
       const needsAllParties = activeTab === "subjects" && Boolean(currentUser?.is_admin);
+      const needsDuplicateParties = needsAllParties;
       const needsEvaluations = activeTab === "evaluations";
       // The costs create/edit form needs the full asset list (for the asset
       // picker) and the cost-category dictionary (for the category picker) -
@@ -1457,6 +1462,7 @@ export default function Page() {
       if (needsAlerts) requests.push(api(withPortfolio("/stocks/alerts")));
       if (needsPortfolioList) requests.push(api("/portfolios"));
       if (needsAllParties) requests.push(api("/parties"));
+      if (needsDuplicateParties) requests.push(api("/parties/duplicate-candidates"));
       if (needsCostExtras) requests.push(api(withPortfolio("/assets")), api(withPortfolio("/assets/cost-categories")));
       if (needsAssetExtras) requests.push(api(withPortfolio("/assets/asset-types")));
       if (needsLoanBalances) requests.push(api(withPortfolio("/loans/balances")));
@@ -1472,6 +1478,19 @@ export default function Page() {
       if (needsAlerts) setAlerts(rest[restIndex++] as Alerts);
       if (needsPortfolioList) setPortfolios(rest[restIndex++] as { id: string; name: string }[]);
       if (needsAllParties) setAllParties(rest[restIndex++] as Row[]);
+      if (needsDuplicateParties) {
+        const groups = rest[restIndex++] as { key: string; members: Row[] }[];
+        setDuplicateParties(groups);
+        setMergeSelection((current) => {
+          const next: Record<string, string> = {};
+          for (const group of groups) {
+            const existing = current[group.key];
+            const stillValid = existing && group.members.some((m) => String(m.id) === existing);
+            next[group.key] = stillValid ? existing : String(group.members[0]?.id || "");
+          }
+          return next;
+        });
+      }
       if (needsCostExtras) {
         setCostAssetsList(rest[restIndex++] as Row[]);
         setCostCategoriesList(rest[restIndex++] as Row[]);
@@ -1807,6 +1826,31 @@ export default function Page() {
       setSelfPartiesStatus(err instanceof Error ? err.message : "Vlastní jména se nepodařilo uložit");
     } finally {
       setSelfPartiesBusy(false);
+    }
+  }
+
+  async function mergeDuplicateGroup(group: { key: string; members: Row[] }) {
+    const keepId = mergeSelection[group.key];
+    if (!keepId) return;
+    const keepName = group.members.find((m) => String(m.id) === keepId)?.name;
+    const removeIds = group.members.filter((m) => String(m.id) !== keepId).map((m) => String(m.id));
+    if (removeIds.length === 0) return;
+    if (
+      !confirmDelete(
+        `sloučit ${removeIds.length} duplicitní záznam(y) do "${String(keepName)}" - všechny odkazy (půjčky, majetek, náklady) se přesunou a duplicity se smažou`,
+      )
+    )
+      return;
+    setMergeBusy(true);
+    setMergeStatus(null);
+    try {
+      await api("/parties/merge", { method: "POST", body: JSON.stringify({ keep_id: keepId, remove_ids: removeIds }) });
+      setMergeStatus(`Sloučeno do "${String(keepName)}".`);
+      await loadAll();
+    } catch (err) {
+      setMergeStatus(err instanceof Error ? err.message : "Sloučení se nezdařilo");
+    } finally {
+      setMergeBusy(false);
     }
   }
 
@@ -3991,6 +4035,39 @@ export default function Page() {
                     Zrušit
                   </button>
                 </div>
+              </div>
+            )}
+            {duplicateParties.length > 0 && (
+              <div className="access-editor">
+                <p>
+                  Duplicitní osoby/firmy: stejné jméno (bez ohledu na velikost písmen, mezery a interpunkci) patří více
+                  než jednomu záznamu - to rozděluje součty (přehled dluhů, majetek...) mezi řádky, které patří dohromady.
+                  Vyber, který záznam zůstane, a slučte do něj ostatní.
+                </p>
+                {mergeStatus && <div className="success-notice">{mergeStatus}</div>}
+                {duplicateParties.map((group) => (
+                  <div className="duplicate-party-group" key={group.key}>
+                    {group.members.map((member) => (
+                      <label className="checkbox-row" key={String(member.id)}>
+                        <input
+                          type="radio"
+                          name={`merge-${group.key}`}
+                          checked={mergeSelection[group.key] === String(member.id)}
+                          onChange={() => setMergeSelection((current) => ({ ...current, [group.key]: String(member.id) }))}
+                        />
+                        {String(member.name)} <span className="field-hint">({String(member.kind)}, použito {String(member.reference_count)}×)</span>
+                      </label>
+                    ))}
+                    <button
+                      type="button"
+                      className="link-button"
+                      onClick={() => mergeDuplicateGroup(group)}
+                      disabled={mergeBusy}
+                    >
+                      Sloučit do vybraného
+                    </button>
+                  </div>
+                ))}
               </div>
             )}
           </section>
