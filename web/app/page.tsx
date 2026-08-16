@@ -31,7 +31,7 @@ import {
   WalletCards,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8010";
 
@@ -1854,6 +1854,114 @@ export default function Page() {
     }
   }
 
+  function renderAccessEditorForm() {
+    return (
+      <div className="security-panel">
+        <div className="access-editor">
+          <p>
+            Přístup uživatele <strong>{editingAccessUsername}</strong>:
+          </p>
+          {portfolios.map((portfolio) => (
+            <div key={portfolio.id} className="access-editor-portfolio">
+              <h4>{portfolio.name}</h4>
+              <div className="permissions-grid">
+                {PORTFOLIO_SCOPED_TABS.map((tab) => (
+                  <label className="checkbox-row" key={tab.id}>
+                    <input
+                      checked={(accessDraft[portfolio.id] || []).includes(tab.id)}
+                      onChange={() => toggleAccessAgenda(portfolio.id, tab.id)}
+                      type="checkbox"
+                    />
+                    {tab.label}
+                  </label>
+                ))}
+              </div>
+            </div>
+          ))}
+          {accessStatus && <div className="success-notice">{accessStatus}</div>}
+          <div className="stock-actions">
+            <button className="action-button" onClick={saveAccessDraft} disabled={accessBusy}>
+              <Save size={16} />
+              <span>Uložit přístup</span>
+            </button>
+            <button type="button" className="link-button" onClick={() => setEditingAccessUsername(null)}>
+              Zrušit
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderUserEditorForm() {
+    return (
+      <div className="access-editor">
+        <p>
+          Úprava uživatele <strong>{editingUserUsername}</strong>:
+        </p>
+        <label>
+          Jméno
+          <input
+            value={editUserDraft.full_name}
+            onChange={(event) => setEditUserDraft((value) => ({ ...value, full_name: event.target.value }))}
+          />
+        </label>
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={editUserDraft.is_admin}
+            onChange={(event) => setEditUserDraft((value) => ({ ...value, is_admin: event.target.checked }))}
+          />
+          Administrátor
+        </label>
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={editUserDraft.is_active}
+            onChange={(event) => setEditUserDraft((value) => ({ ...value, is_active: event.target.checked }))}
+          />
+          Aktivní
+        </label>
+        {!editUserDraft.is_admin && (
+          <div className="permissions-grid">
+            {tabs
+              .filter((tab) => GLOBAL_AGENDAS.has(tab.id))
+              .map((tab) => (
+                <label className="checkbox-row" key={tab.id}>
+                  <input
+                    type="checkbox"
+                    checked={editUserDraft.allowed_agendas.includes(tab.id)}
+                    onChange={() => toggleEditUserAgenda(tab.id)}
+                  />
+                  {tab.label}
+                </label>
+              ))}
+          </div>
+        )}
+        <label>
+          Nové heslo
+          <input
+            type="password"
+            value={editUserDraft.password}
+            onChange={(event) => setEditUserDraft((value) => ({ ...value, password: event.target.value }))}
+            placeholder="Ponechat prázdné = beze změny"
+            autoComplete="new-password"
+          />
+        </label>
+        {editUserStatus && <div className="success-notice">{editUserStatus}</div>}
+        <div className="stock-actions">
+          <button className="action-button" onClick={saveUserEdit} disabled={editUserBusy}>
+            <Save size={16} />
+            <span>Uložit uživatele</span>
+          </button>
+          <button type="button" className="link-button" onClick={() => setEditingUserUsername(null)}>
+            Zrušit
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   function openAccessEditor(row: Row) {
     const username = String(row.username);
     const existing = Array.isArray(row.portfolios) ? (row.portfolios as unknown as PortfolioGrant[]) : [];
@@ -1970,6 +2078,81 @@ export default function Page() {
     }
   }
 
+  function renderCostEditorForm() {
+    return (
+      <div className="access-editor">
+        <p>{editingCostId === "__new__" ? "Nový náklad:" : "Úprava nákladu:"}</p>
+        <form className="cost-form-grid" onSubmit={saveCostDraft}>
+          <label>
+            Majetek
+            <select value={costDraft.asset_id} onChange={(event) => setCostDraft((value) => ({ ...value, asset_id: event.target.value }))}>
+              <option value="">Bez majetku</option>
+              {costAssetsList.map((asset) => (
+                <option value={String(asset.id)} key={String(asset.id)}>
+                  {String(asset.code)} — {String(asset.name)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Datum
+            <input
+              type="date"
+              value={costDraft.cost_date}
+              onChange={(event) => setCostDraft((value) => ({ ...value, cost_date: event.target.value }))}
+            />
+          </label>
+          <label>
+            Položka
+            <input value={costDraft.item} onChange={(event) => setCostDraft((value) => ({ ...value, item: event.target.value }))} required />
+          </label>
+          <label>
+            Kategorie
+            <select value={costDraft.category} onChange={(event) => setCostDraft((value) => ({ ...value, category: event.target.value }))}>
+              <option value="">Bez kategorie</option>
+              {costCategoriesList.map((cat) => (
+                <option value={String(cat.name)} key={String(cat.id)}>
+                  {String(cat.name)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Částka
+            <input
+              type="number"
+              step="0.01"
+              value={costDraft.amount}
+              onChange={(event) => setCostDraft((value) => ({ ...value, amount: event.target.value }))}
+            />
+          </label>
+          <label>
+            Dodavatel
+            <input value={costDraft.supplier} onChange={(event) => setCostDraft((value) => ({ ...value, supplier: event.target.value }))} />
+          </label>
+          <label>
+            Plátce
+            <input value={costDraft.payer} onChange={(event) => setCostDraft((value) => ({ ...value, payer: event.target.value }))} />
+          </label>
+          <label className="cost-form-note">
+            Poznámka
+            <input value={costDraft.note} onChange={(event) => setCostDraft((value) => ({ ...value, note: event.target.value }))} />
+          </label>
+          {costStatus && <div className="success-notice cost-form-note">{costStatus}</div>}
+          <div className="stock-actions cost-form-note">
+            <button className="action-button" type="submit" disabled={costBusy || !costDraft.item.trim()}>
+              <Save size={16} />
+              <span>Uložit náklad</span>
+            </button>
+            <button type="button" className="link-button" onClick={closeCostEditor}>
+              Zrušit
+            </button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+
   function openNewCostForm() {
     setEditingCostId("__new__");
     setCostDraft({ asset_id: "", cost_date: "", item: "", category: "", amount: "", supplier: "", payer: "", note: "" });
@@ -2036,6 +2219,121 @@ export default function Page() {
     } finally {
       setCostBusy(false);
     }
+  }
+
+  function renderTransactionEditorForm() {
+    return (
+      <div className="access-editor">
+        <p>{editingTransactionId === "__new__" ? "Nový pohyb:" : "Úprava pohybu:"}</p>
+        <form className="cost-form-grid" onSubmit={saveTransactionDraft}>
+          <label>
+            Datum
+            <input
+              type="date"
+              value={transactionDraft.traded_on}
+              onChange={(event) => setTransactionDraft((value) => ({ ...value, traded_on: event.target.value }))}
+              required
+            />
+          </label>
+          <label>
+            Typ pohybu
+            <select
+              value={transactionDraft.movement_type}
+              onChange={(event) => setTransactionDraft((value) => ({ ...value, movement_type: event.target.value }))}
+            >
+              <option value="Nákup">Nákup</option>
+              <option value="Prodej">Prodej</option>
+              <option value="Dividenda">Dividenda</option>
+            </select>
+          </label>
+          <label>
+            Cenný papír
+            <input
+              value={transactionDraft.instrument_name}
+              onChange={(event) => setTransactionDraft((value) => ({ ...value, instrument_name: event.target.value }))}
+            />
+          </label>
+          <label>
+            ISIN
+            <input value={transactionDraft.isin} onChange={(event) => setTransactionDraft((value) => ({ ...value, isin: event.target.value }))} />
+          </label>
+          <label>
+            Ticker
+            <input
+              value={transactionDraft.ticker}
+              onChange={(event) => setTransactionDraft((value) => ({ ...value, ticker: event.target.value }))}
+            />
+            <span className="field-hint">Prázdné = dopočítá se z ISIN/názvu, pokud je papír už evidovaný.</span>
+          </label>
+          <label>
+            Trh
+            <input value={transactionDraft.market} onChange={(event) => setTransactionDraft((value) => ({ ...value, market: event.target.value }))} />
+          </label>
+          <label>
+            Počet kusů
+            <input
+              type="number"
+              step="0.000001"
+              value={transactionDraft.quantity}
+              onChange={(event) => setTransactionDraft((value) => ({ ...value, quantity: event.target.value }))}
+            />
+            <span className="field-hint">Znaménko se řídí typem pohybu (prodej se odečte automaticky).</span>
+          </label>
+          <label>
+            Cena za kus (CM)
+            <input
+              type="number"
+              step="0.000001"
+              value={transactionDraft.unit_price_ccy}
+              onChange={(event) => setTransactionDraft((value) => ({ ...value, unit_price_ccy: event.target.value }))}
+            />
+          </label>
+          <label>
+            Celková cena (CM)
+            <input
+              type="number"
+              step="0.01"
+              value={transactionDraft.gross_amount_ccy}
+              onChange={(event) => setTransactionDraft((value) => ({ ...value, gross_amount_ccy: event.target.value }))}
+            />
+          </label>
+          <label>
+            Měna
+            <input
+              value={transactionDraft.currency}
+              onChange={(event) => setTransactionDraft((value) => ({ ...value, currency: event.target.value }))}
+            />
+          </label>
+          <label>
+            Poplatek (CM)
+            <input
+              type="number"
+              step="0.01"
+              value={transactionDraft.fee_ccy}
+              onChange={(event) => setTransactionDraft((value) => ({ ...value, fee_ccy: event.target.value }))}
+            />
+            <span className="field-hint">U dividendy sem patří srážková daň jako záporná hodnota (snižuje čistou částku).</span>
+          </label>
+          <label>
+            Poznámka
+            <input
+              value={transactionDraft.description}
+              onChange={(event) => setTransactionDraft((value) => ({ ...value, description: event.target.value }))}
+            />
+          </label>
+          {transactionStatus && <div className="success-notice cost-form-note">{transactionStatus}</div>}
+          <div className="stock-actions cost-form-note">
+            <button className="action-button" type="submit" disabled={transactionBusy || !transactionDraft.traded_on}>
+              <Save size={16} />
+              <span>Uložit pohyb</span>
+            </button>
+            <button type="button" className="link-button" onClick={closeTransactionEditor}>
+              Zrušit
+            </button>
+          </div>
+        </form>
+      </div>
+    );
   }
 
   function openNewTransactionForm() {
@@ -2125,6 +2423,112 @@ export default function Page() {
     } finally {
       setTransactionBusy(false);
     }
+  }
+
+  function renderLoanEditorForm() {
+    return (
+      <div className="access-editor">
+        <p>{editingLoanId === "__new__" ? "Nový pohyb:" : "Úprava pohybu:"}</p>
+        <form className="cost-form-grid" onSubmit={saveLoanDraft}>
+          <label>
+            Datum
+            <input
+              type="date"
+              value={loanDraft.movement_date}
+              onChange={(event) => setLoanDraft((value) => ({ ...value, movement_date: event.target.value }))}
+              required
+            />
+          </label>
+          <label>
+            Věřitel
+            <input
+              value={loanDraft.lender}
+              onChange={(event) => setLoanDraft((value) => ({ ...value, lender: event.target.value }))}
+              required
+            />
+          </label>
+          <label>
+            Dlužník
+            <input
+              value={loanDraft.borrower}
+              onChange={(event) => setLoanDraft((value) => ({ ...value, borrower: event.target.value }))}
+              required
+            />
+          </label>
+          <label>
+            Částka
+            <input
+              type="number"
+              step="0.01"
+              value={loanDraft.amount}
+              onChange={(event) => setLoanDraft((value) => ({ ...value, amount: event.target.value }))}
+              required
+            />
+          </label>
+          <label>
+            Úroková sazba
+            <input
+              type="number"
+              step="0.0001"
+              value={loanDraft.interest_rate}
+              onChange={(event) => setLoanDraft((value) => ({ ...value, interest_rate: event.target.value }))}
+            />
+          </label>
+          <label>
+            Perioda úroku
+            <input
+              value={loanDraft.interest_period}
+              onChange={(event) => setLoanDraft((value) => ({ ...value, interest_period: event.target.value }))}
+              placeholder="Např. měsíčně"
+            />
+          </label>
+          <label>
+            Plánovaný konec
+            <input
+              type="date"
+              value={loanDraft.planned_end_date}
+              onChange={(event) => setLoanDraft((value) => ({ ...value, planned_end_date: event.target.value }))}
+            />
+          </label>
+          <label>
+            Splaceno k datu
+            <input
+              type="date"
+              value={loanDraft.completed_at}
+              onChange={(event) => setLoanDraft((value) => ({ ...value, completed_at: event.target.value }))}
+            />
+          </label>
+          <label>
+            Označení období
+            <input
+              value={loanDraft.period_label}
+              onChange={(event) => setLoanDraft((value) => ({ ...value, period_label: event.target.value }))}
+            />
+          </label>
+          <label className="cost-form-note">
+            Poznámka
+            <input
+              value={loanDraft.description}
+              onChange={(event) => setLoanDraft((value) => ({ ...value, description: event.target.value }))}
+            />
+          </label>
+          {loanStatus && <div className="success-notice cost-form-note">{loanStatus}</div>}
+          <div className="stock-actions cost-form-note">
+            <button
+              className="action-button"
+              type="submit"
+              disabled={loanBusy || !loanDraft.movement_date || !loanDraft.lender.trim() || !loanDraft.borrower.trim() || !loanDraft.amount.trim()}
+            >
+              <Save size={16} />
+              <span>Uložit pohyb</span>
+            </button>
+            <button type="button" className="link-button" onClick={closeLoanEditor}>
+              Zrušit
+            </button>
+          </div>
+        </form>
+      </div>
+    );
   }
 
   function openNewLoanForm() {
@@ -2606,6 +3010,58 @@ export default function Page() {
     }
   }
 
+  function renderAssetTypeEditorForm() {
+    return (
+      <div className="access-editor">
+        <p>{editingAssetTypeId === "__new__" ? "Nový typ majetku:" : "Úprava typu majetku:"}</p>
+        <form className="cost-form-grid" onSubmit={saveAssetTypeDraft}>
+          <label>
+            Název
+            <input
+              value={newAssetTypeDraft.name}
+              onChange={(event) => setNewAssetTypeDraft((value) => ({ ...value, name: event.target.value }))}
+              required
+            />
+          </label>
+          <label>
+            Jak se počítá
+            <select
+              value={newAssetTypeDraft.calculation_mode}
+              onChange={(event) => setNewAssetTypeDraft((value) => ({ ...value, calculation_mode: event.target.value }))}
+            >
+              <option value="none">Žádný výpočet</option>
+              <option value="debt_interest">Úrok z dluhu (majetek platí úrok, snižuje jmění)</option>
+            </select>
+          </label>
+          <div className="cost-form-note">
+            <span className="field-hint">Povinná pole formuláře majetku pro tento typ:</span>
+            <div className="permissions-grid">
+              {ASSET_REQUIRED_FIELD_CHOICES.map(([field, label]) => (
+                <label className="checkbox-row" key={field}>
+                  <input
+                    type="checkbox"
+                    checked={newAssetTypeDraft.required_fields.includes(field)}
+                    onChange={() => toggleAssetTypeRequiredField(field)}
+                  />
+                  {label}
+                </label>
+              ))}
+            </div>
+          </div>
+          <div className="stock-actions cost-form-note">
+            <button className="action-button" type="submit" disabled={assetTypeBusy || !newAssetTypeDraft.name.trim()}>
+              <Save size={16} />
+              <span>Uložit typ</span>
+            </button>
+            <button type="button" className="link-button" onClick={closeAssetTypeEditor}>
+              Zrušit
+            </button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+
   function openNewAssetTypeForm() {
     setEditingAssetTypeId("__new__");
     setNewAssetTypeDraft({ name: "", calculation_mode: "none", required_fields: [] });
@@ -3053,109 +3509,7 @@ export default function Page() {
                 </button>
               </div>
             </div>
-            {editingLoanId && (
-              <div className="access-editor">
-                <p>{editingLoanId === "__new__" ? "Nový pohyb:" : "Úprava pohybu:"}</p>
-                <form className="cost-form-grid" onSubmit={saveLoanDraft}>
-                  <label>
-                    Datum
-                    <input
-                      type="date"
-                      value={loanDraft.movement_date}
-                      onChange={(event) => setLoanDraft((value) => ({ ...value, movement_date: event.target.value }))}
-                      required
-                    />
-                  </label>
-                  <label>
-                    Věřitel
-                    <input
-                      value={loanDraft.lender}
-                      onChange={(event) => setLoanDraft((value) => ({ ...value, lender: event.target.value }))}
-                      required
-                    />
-                  </label>
-                  <label>
-                    Dlužník
-                    <input
-                      value={loanDraft.borrower}
-                      onChange={(event) => setLoanDraft((value) => ({ ...value, borrower: event.target.value }))}
-                      required
-                    />
-                  </label>
-                  <label>
-                    Částka
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={loanDraft.amount}
-                      onChange={(event) => setLoanDraft((value) => ({ ...value, amount: event.target.value }))}
-                      required
-                    />
-                  </label>
-                  <label>
-                    Úroková sazba
-                    <input
-                      type="number"
-                      step="0.0001"
-                      value={loanDraft.interest_rate}
-                      onChange={(event) => setLoanDraft((value) => ({ ...value, interest_rate: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Perioda úroku
-                    <input
-                      value={loanDraft.interest_period}
-                      onChange={(event) => setLoanDraft((value) => ({ ...value, interest_period: event.target.value }))}
-                      placeholder="Např. měsíčně"
-                    />
-                  </label>
-                  <label>
-                    Plánovaný konec
-                    <input
-                      type="date"
-                      value={loanDraft.planned_end_date}
-                      onChange={(event) => setLoanDraft((value) => ({ ...value, planned_end_date: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Splaceno k datu
-                    <input
-                      type="date"
-                      value={loanDraft.completed_at}
-                      onChange={(event) => setLoanDraft((value) => ({ ...value, completed_at: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Označení období
-                    <input
-                      value={loanDraft.period_label}
-                      onChange={(event) => setLoanDraft((value) => ({ ...value, period_label: event.target.value }))}
-                    />
-                  </label>
-                  <label className="cost-form-note">
-                    Poznámka
-                    <input
-                      value={loanDraft.description}
-                      onChange={(event) => setLoanDraft((value) => ({ ...value, description: event.target.value }))}
-                    />
-                  </label>
-                  {loanStatus && <div className="success-notice cost-form-note">{loanStatus}</div>}
-                  <div className="stock-actions cost-form-note">
-                    <button
-                      className="action-button"
-                      type="submit"
-                      disabled={loanBusy || !loanDraft.movement_date || !loanDraft.lender.trim() || !loanDraft.borrower.trim() || !loanDraft.amount.trim()}
-                    >
-                      <Save size={16} />
-                      <span>Uložit pohyb</span>
-                    </button>
-                    <button type="button" className="link-button" onClick={closeLoanEditor}>
-                      Zrušit
-                    </button>
-                  </div>
-                </form>
-              </div>
-            )}
+            {editingLoanId === "__new__" && renderLoanEditorForm()}
             {loanBalances && (
               <div className="loan-balances">
                 <div className="panel-header">
@@ -3355,97 +3709,7 @@ export default function Page() {
                 </select>
               </label>
             </div>
-            {editingCostId && (
-              <div className="access-editor">
-                <p>{editingCostId === "__new__" ? "Nový náklad:" : "Úprava nákladu:"}</p>
-                <form className="cost-form-grid" onSubmit={saveCostDraft}>
-                  <label>
-                    Majetek
-                    <select
-                      value={costDraft.asset_id}
-                      onChange={(event) => setCostDraft((value) => ({ ...value, asset_id: event.target.value }))}
-                    >
-                      <option value="">Bez majetku</option>
-                      {costAssetsList.map((asset) => (
-                        <option value={String(asset.id)} key={String(asset.id)}>
-                          {String(asset.code)} — {String(asset.name)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    Datum
-                    <input
-                      type="date"
-                      value={costDraft.cost_date}
-                      onChange={(event) => setCostDraft((value) => ({ ...value, cost_date: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Položka
-                    <input
-                      value={costDraft.item}
-                      onChange={(event) => setCostDraft((value) => ({ ...value, item: event.target.value }))}
-                      required
-                    />
-                  </label>
-                  <label>
-                    Kategorie
-                    <select
-                      value={costDraft.category}
-                      onChange={(event) => setCostDraft((value) => ({ ...value, category: event.target.value }))}
-                    >
-                      <option value="">Bez kategorie</option>
-                      {costCategoriesList.map((cat) => (
-                        <option value={String(cat.name)} key={String(cat.id)}>
-                          {String(cat.name)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    Částka
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={costDraft.amount}
-                      onChange={(event) => setCostDraft((value) => ({ ...value, amount: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Dodavatel
-                    <input
-                      value={costDraft.supplier}
-                      onChange={(event) => setCostDraft((value) => ({ ...value, supplier: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Plátce
-                    <input
-                      value={costDraft.payer}
-                      onChange={(event) => setCostDraft((value) => ({ ...value, payer: event.target.value }))}
-                    />
-                  </label>
-                  <label className="cost-form-note">
-                    Poznámka
-                    <input
-                      value={costDraft.note}
-                      onChange={(event) => setCostDraft((value) => ({ ...value, note: event.target.value }))}
-                    />
-                  </label>
-                  {costStatus && <div className="success-notice cost-form-note">{costStatus}</div>}
-                  <div className="stock-actions cost-form-note">
-                    <button className="action-button" type="submit" disabled={costBusy || !costDraft.item.trim()}>
-                      <Save size={16} />
-                      <span>Uložit náklad</span>
-                    </button>
-                    <button type="button" className="link-button" onClick={closeCostEditor}>
-                      Zrušit
-                    </button>
-                  </div>
-                </form>
-              </div>
-            )}
+            {editingCostId === "__new__" && renderCostEditorForm()}
           </section>
         )}
 
@@ -3471,7 +3735,8 @@ export default function Page() {
               {rows
                 .filter((row) => typeof row.name === "string")
                 .map((row) => (
-                  <div className="portfolio-row" key={String(row.id)}>
+                  <Fragment key={String(row.id)}>
+                  <div className="portfolio-row">
                     <span>
                       {String(row.name)}
                       {row.calculation_mode === "debt_interest" && <span className="type-badge"> úrok z dluhu</span>}
@@ -3494,58 +3759,12 @@ export default function Page() {
                       </>
                     )}
                   </div>
+                  {editingAssetTypeId === String(row.id) && currentUser?.is_admin && renderAssetTypeEditorForm()}
+                  </Fragment>
                 ))}
               {rows.length === 0 && <p className="alert-empty">Zatím žádné typy.</p>}
             </div>
-            {editingAssetTypeId && currentUser?.is_admin && (
-              <div className="access-editor">
-                <p>{editingAssetTypeId === "__new__" ? "Nový typ majetku:" : "Úprava typu majetku:"}</p>
-                <form className="cost-form-grid" onSubmit={saveAssetTypeDraft}>
-                  <label>
-                    Název
-                    <input
-                      value={newAssetTypeDraft.name}
-                      onChange={(event) => setNewAssetTypeDraft((value) => ({ ...value, name: event.target.value }))}
-                      required
-                    />
-                  </label>
-                  <label>
-                    Jak se počítá
-                    <select
-                      value={newAssetTypeDraft.calculation_mode}
-                      onChange={(event) => setNewAssetTypeDraft((value) => ({ ...value, calculation_mode: event.target.value }))}
-                    >
-                      <option value="none">Žádný výpočet</option>
-                      <option value="debt_interest">Úrok z dluhu (majetek platí úrok, snižuje jmění)</option>
-                    </select>
-                  </label>
-                  <div className="cost-form-note">
-                    <span className="field-hint">Povinná pole formuláře majetku pro tento typ:</span>
-                    <div className="permissions-grid">
-                      {ASSET_REQUIRED_FIELD_CHOICES.map(([field, label]) => (
-                        <label className="checkbox-row" key={field}>
-                          <input
-                            type="checkbox"
-                            checked={newAssetTypeDraft.required_fields.includes(field)}
-                            onChange={() => toggleAssetTypeRequiredField(field)}
-                          />
-                          {label}
-                        </label>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="stock-actions cost-form-note">
-                    <button className="action-button" type="submit" disabled={assetTypeBusy || !newAssetTypeDraft.name.trim()}>
-                      <Save size={16} />
-                      <span>Uložit typ</span>
-                    </button>
-                    <button type="button" className="link-button" onClick={closeAssetTypeEditor}>
-                      Zrušit
-                    </button>
-                  </div>
-                </form>
-              </div>
-            )}
+            {editingAssetTypeId === "__new__" && currentUser?.is_admin && renderAssetTypeEditorForm()}
           </section>
         )}
 
@@ -3841,7 +4060,8 @@ export default function Page() {
                     // for whatever shape the previous tab's rows had.
                     .filter((row) => typeof row.username === "string")
                     .map((row) => (
-                      <div className="portfolio-row" key={String(row.username)}>
+                      <Fragment key={String(row.username)}>
+                      <div className="portfolio-row">
                         <span>{String(row.username)}</span>
                         <button type="button" className="link-button" onClick={() => openUserEditor(row)}>
                           Upravit
@@ -3852,110 +4072,10 @@ export default function Page() {
                           </button>
                         )}
                       </div>
+                      {editingUserUsername === String(row.username) && renderUserEditorForm()}
+                      {editingAccessUsername === String(row.username) && renderAccessEditorForm()}
+                      </Fragment>
                     ))}
-                </div>
-                {editingUserUsername && (
-                  <div className="access-editor">
-                    <p>
-                      Úprava uživatele <strong>{editingUserUsername}</strong>:
-                    </p>
-                    <label>
-                      Jméno
-                      <input
-                        value={editUserDraft.full_name}
-                        onChange={(event) => setEditUserDraft((value) => ({ ...value, full_name: event.target.value }))}
-                      />
-                    </label>
-                    <label className="checkbox-row">
-                      <input
-                        type="checkbox"
-                        checked={editUserDraft.is_admin}
-                        onChange={(event) => setEditUserDraft((value) => ({ ...value, is_admin: event.target.checked }))}
-                      />
-                      Administrátor
-                    </label>
-                    <label className="checkbox-row">
-                      <input
-                        type="checkbox"
-                        checked={editUserDraft.is_active}
-                        onChange={(event) => setEditUserDraft((value) => ({ ...value, is_active: event.target.checked }))}
-                      />
-                      Aktivní
-                    </label>
-                    {!editUserDraft.is_admin && (
-                      <div className="permissions-grid">
-                        {tabs
-                          .filter((tab) => GLOBAL_AGENDAS.has(tab.id))
-                          .map((tab) => (
-                            <label className="checkbox-row" key={tab.id}>
-                              <input
-                                type="checkbox"
-                                checked={editUserDraft.allowed_agendas.includes(tab.id)}
-                                onChange={() => toggleEditUserAgenda(tab.id)}
-                              />
-                              {tab.label}
-                            </label>
-                          ))}
-                      </div>
-                    )}
-                    <label>
-                      Nové heslo
-                      <input
-                        type="password"
-                        value={editUserDraft.password}
-                        onChange={(event) => setEditUserDraft((value) => ({ ...value, password: event.target.value }))}
-                        placeholder="Ponechat prázdné = beze změny"
-                        autoComplete="new-password"
-                      />
-                    </label>
-                    {editUserStatus && <div className="success-notice">{editUserStatus}</div>}
-                    <div className="stock-actions">
-                      <button className="action-button" onClick={saveUserEdit} disabled={editUserBusy}>
-                        <Save size={16} />
-                        <span>Uložit uživatele</span>
-                      </button>
-                      <button type="button" className="link-button" onClick={() => setEditingUserUsername(null)}>
-                        Zrušit
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {currentUser?.is_admin && editingAccessUsername && (
-              <div className="security-panel">
-                <div className="access-editor">
-                  <p>
-                    Přístup uživatele <strong>{editingAccessUsername}</strong>:
-                  </p>
-                  {portfolios.map((portfolio) => (
-                    <div key={portfolio.id} className="access-editor-portfolio">
-                      <h4>{portfolio.name}</h4>
-                      <div className="permissions-grid">
-                        {PORTFOLIO_SCOPED_TABS.map((tab) => (
-                          <label className="checkbox-row" key={tab.id}>
-                            <input
-                              checked={(accessDraft[portfolio.id] || []).includes(tab.id)}
-                              onChange={() => toggleAccessAgenda(portfolio.id, tab.id)}
-                              type="checkbox"
-                            />
-                            {tab.label}
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-                  ))}
-                  {accessStatus && <div className="success-notice">{accessStatus}</div>}
-                  <div className="stock-actions">
-                    <button className="action-button" onClick={saveAccessDraft} disabled={accessBusy}>
-                      <Save size={16} />
-                      <span>Uložit přístup</span>
-                    </button>
-                    <button type="button" className="link-button" onClick={() => setEditingAccessUsername(null)}>
-                      Zrušit
-                    </button>
-                  </div>
                 </div>
               </div>
             )}
@@ -4387,126 +4507,7 @@ export default function Page() {
                 </button>
               </div>
             )}
-            {activeTab === "transactions" && editingTransactionId && (
-              <div className="access-editor">
-                <p>{editingTransactionId === "__new__" ? "Nový pohyb:" : "Úprava pohybu:"}</p>
-                <form className="cost-form-grid" onSubmit={saveTransactionDraft}>
-                  <label>
-                    Datum
-                    <input
-                      type="date"
-                      value={transactionDraft.traded_on}
-                      onChange={(event) => setTransactionDraft((value) => ({ ...value, traded_on: event.target.value }))}
-                      required
-                    />
-                  </label>
-                  <label>
-                    Typ pohybu
-                    <select
-                      value={transactionDraft.movement_type}
-                      onChange={(event) => setTransactionDraft((value) => ({ ...value, movement_type: event.target.value }))}
-                    >
-                      <option value="Nákup">Nákup</option>
-                      <option value="Prodej">Prodej</option>
-                      <option value="Dividenda">Dividenda</option>
-                    </select>
-                  </label>
-                  <label>
-                    Cenný papír
-                    <input
-                      value={transactionDraft.instrument_name}
-                      onChange={(event) => setTransactionDraft((value) => ({ ...value, instrument_name: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    ISIN
-                    <input
-                      value={transactionDraft.isin}
-                      onChange={(event) => setTransactionDraft((value) => ({ ...value, isin: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Ticker
-                    <input
-                      value={transactionDraft.ticker}
-                      onChange={(event) => setTransactionDraft((value) => ({ ...value, ticker: event.target.value }))}
-                    />
-                    <span className="field-hint">Prázdné = dopočítá se z ISIN/názvu, pokud je papír už evidovaný.</span>
-                  </label>
-                  <label>
-                    Trh
-                    <input
-                      value={transactionDraft.market}
-                      onChange={(event) => setTransactionDraft((value) => ({ ...value, market: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Počet kusů
-                    <input
-                      type="number"
-                      step="0.000001"
-                      value={transactionDraft.quantity}
-                      onChange={(event) => setTransactionDraft((value) => ({ ...value, quantity: event.target.value }))}
-                    />
-                    <span className="field-hint">Znaménko se řídí typem pohybu (prodej se odečte automaticky).</span>
-                  </label>
-                  <label>
-                    Cena za kus (CM)
-                    <input
-                      type="number"
-                      step="0.000001"
-                      value={transactionDraft.unit_price_ccy}
-                      onChange={(event) => setTransactionDraft((value) => ({ ...value, unit_price_ccy: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Celková cena (CM)
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={transactionDraft.gross_amount_ccy}
-                      onChange={(event) => setTransactionDraft((value) => ({ ...value, gross_amount_ccy: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Měna
-                    <input
-                      value={transactionDraft.currency}
-                      onChange={(event) => setTransactionDraft((value) => ({ ...value, currency: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Poplatek (CM)
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={transactionDraft.fee_ccy}
-                      onChange={(event) => setTransactionDraft((value) => ({ ...value, fee_ccy: event.target.value }))}
-                    />
-                    <span className="field-hint">
-                      U dividendy sem patří srážková daň jako záporná hodnota (snižuje čistou částku).
-                    </span>
-                  </label>
-                  <label>
-                    Poznámka
-                    <input
-                      value={transactionDraft.description}
-                      onChange={(event) => setTransactionDraft((value) => ({ ...value, description: event.target.value }))}
-                    />
-                  </label>
-                  {transactionStatus && <div className="success-notice cost-form-note">{transactionStatus}</div>}
-                  <div className="stock-actions cost-form-note">
-                    <button className="action-button" type="submit" disabled={transactionBusy || !transactionDraft.traded_on}>
-                      <Save size={16} />
-                      <span>Uložit pohyb</span>
-                    </button>
-                    <button type="button" className="link-button" onClick={closeTransactionEditor}>
-                      Zrušit
-                    </button>
-                  </div>
-                </form>
-              </div>
-            )}
+            {activeTab === "transactions" && editingTransactionId === "__new__" && renderTransactionEditorForm()}
             <div className="mini-grids">
               <div>
                 <h3>Pohyby</h3>
@@ -4712,10 +4713,15 @@ export default function Page() {
                     : isLoanMonthSummary
                       ? expandedLoanMonths.has(monthKey)
                       : false;
+                const rowKey = String(row.id || row.ticker || row.stat_date || row.month_key || row.year_key || row.period_label || index);
+                const isEditingThisRow =
+                  (activeTab === "costs" && editingCostId === String(row.id)) ||
+                  (activeTab === "loans" && editingLoanId === String(row.id)) ||
+                  (activeTab === "transactions" && editingTransactionId === String(row.id));
                 return (
+                  <Fragment key={rowKey}>
                   <tr
                     className={`${String(row.row_kind || "")}${isClickableSummary ? " clickable-row" : ""}`}
-                    key={String(row.id || row.ticker || row.stat_date || row.month_key || row.year_key || row.period_label || index)}
                     onClick={handleRowClick}
                   >
                     {(columns[activeTab] || []).map((col, colIndex) => (
@@ -4837,6 +4843,18 @@ export default function Page() {
                       </td>
                     ))}
                   </tr>
+                  {isEditingThisRow && (
+                    <tr className="inline-edit-row">
+                      <td colSpan={(columns[activeTab] || []).length}>
+                        {activeTab === "costs"
+                          ? renderCostEditorForm()
+                          : activeTab === "loans"
+                            ? renderLoanEditorForm()
+                            : renderTransactionEditorForm()}
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 );
               })}
             </tbody>

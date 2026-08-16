@@ -1464,6 +1464,12 @@ td.numeric-cell {
   font-variant-numeric: tabular-nums;
 }
 
+tr.inline-edit-row td {
+  white-space: normal;
+  background: #f8fafb;
+  padding: 16px;
+}
+
 tr.summary td,
 tr.year-summary td {
   background: #eaf3f1;
