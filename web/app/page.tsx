@@ -1088,6 +1088,7 @@ export default function Page() {
   const [patriaText, setPatriaText] = useState("");
   const [patriaImportOpen, setPatriaImportOpen] = useState(false);
   const [transactionFilter, setTransactionFilter] = useState("");
+  const [stockSummaryOpen, setStockSummaryOpen] = useState(false);
   const [stockActionStatus, setStockActionStatus] = useState<string | null>(null);
   const [stockBusy, setStockBusy] = useState(false);
   const [historyTicker, setHistoryTicker] = useState("");
@@ -2388,9 +2389,8 @@ export default function Page() {
     setTransactionStatus(null);
   }
 
-  function openTransactionEditor(row: Row) {
-    setEditingTransactionId(String(row.id));
-    setTransactionDraft({
+  function transactionDraftFromRow(row: Row) {
+    return {
       traded_on: row.traded_on ? String(row.traded_on) : "",
       movement_type: row.movement_type ? String(row.movement_type) : "Nákup",
       instrument_name: row.instrument_name ? String(row.instrument_name) : "",
@@ -2403,7 +2403,22 @@ export default function Page() {
       currency: row.currency ? String(row.currency) : "CZK",
       fee_ccy: row.fee_ccy != null ? String(row.fee_ccy) : "",
       description: row.description ? String(row.description) : "",
-    });
+    };
+  }
+
+  function openTransactionEditor(row: Row) {
+    setEditingTransactionId(String(row.id));
+    setTransactionDraft(transactionDraftFromRow(row));
+    setTransactionStatus(null);
+  }
+
+  // "Kopírovat": prefills the add-transaction form with this row's data but
+  // targets a brand new record (editingTransactionId="__new__") rather than
+  // updating it - a quick way to enter a similar transaction (e.g. a
+  // recurring dividend) without retyping every field.
+  function duplicateTransactionAsTemplate(row: Row) {
+    setEditingTransactionId("__new__");
+    setTransactionDraft(transactionDraftFromRow(row));
     setTransactionStatus(null);
   }
 
@@ -4508,6 +4523,9 @@ export default function Page() {
                 <h2>Akciový souhrn</h2>
                 <p>Přehled je zatím počítaný z importovaných excelových dat.</p>
               </div>
+              <button type="button" className="link-button" onClick={() => setStockSummaryOpen((value) => !value)}>
+                {stockSummaryOpen ? "Skrýt souhrn" : "Zobrazit souhrn"}
+              </button>
             </div>
             {activeTab === "transactions" && (
               <div className="patria-import">
@@ -4552,32 +4570,34 @@ export default function Page() {
                 </label>
               </div>
             )}
-            <div className="mini-grids">
-              <div>
-                <h3>Pohyby</h3>
-                {stockOverview.movements.map((row) => (
-                  <p key={String(row.movement_type)}>
-                    <span>{String(row.movement_type || "Bez typu")}</span>
-                    <strong>{formatValue("count", row.count)}</strong>
-                  </p>
-                ))}
-              </div>
-              <div>
-                <h3>Měny</h3>
-                <div className="currency-summary-header">
-                  <span>Měna</span>
-                  <span>Cizí měna</span>
-                  <span>CZK</span>
+            {stockSummaryOpen && (
+              <div className="mini-grids">
+                <div>
+                  <h3>Pohyby</h3>
+                  {stockOverview.movements.map((row) => (
+                    <p key={String(row.movement_type)}>
+                      <span>{String(row.movement_type || "Bez typu")}</span>
+                      <strong>{formatValue("count", row.count)}</strong>
+                    </p>
+                  ))}
                 </div>
-                {stockOverview.currencies.map((row) => (
-                  <p className="currency-summary-row" key={String(row.currency)}>
-                    <span>{String(row.currency || "Bez měny")}</span>
-                    <strong>{formatValue("amount_ccy", row.amount_ccy)}</strong>
-                    <strong>{formatValue("amount_czk", row.amount_czk)}</strong>
-                  </p>
-                ))}
+                <div>
+                  <h3>Měny</h3>
+                  <div className="currency-summary-header">
+                    <span>Měna</span>
+                    <span>Cizí měna</span>
+                    <span>CZK</span>
+                  </div>
+                  {stockOverview.currencies.map((row) => (
+                    <p className="currency-summary-row" key={String(row.currency)}>
+                      <span>{String(row.currency || "Bez měny")}</span>
+                      <strong>{formatValue("amount_ccy", row.amount_ccy)}</strong>
+                      <strong>{formatValue("amount_czk", row.amount_czk)}</strong>
+                    </p>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
           </section>
         )}
 
@@ -4855,6 +4875,9 @@ export default function Page() {
                           <div className="cost-row-actions" onClick={(event) => event.stopPropagation()}>
                             <button type="button" className="link-button" onClick={() => openTransactionEditor(row)}>
                               Upravit
+                            </button>
+                            <button type="button" className="link-button" onClick={() => duplicateTransactionAsTemplate(row)}>
+                              Kopírovat
                             </button>
                             <button
                               type="button"
