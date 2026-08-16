@@ -307,12 +307,13 @@ def computed_interest_plan(asset: Asset, calculation_mode: str | None) -> dict[s
     return {str(year): json_value(value) for year, value in sorted(projection.items())}
 
 
-# Types whose displayed "Hodnota" is already a whole-asset market/appraisal
-# figure - adding accumulated AssetCost spending on top would double-count.
-# Any other type (a future "Auto", "Sbírka", ...) has no such external
-# valuation, so money actually spent on it is the best available signal of
-# how much of the family's wealth is tied up in it.
-REAL_ESTATE_TYPE_NAMES = {"byt", "nemovitost"}
+# "Nemovitost" is the one type whose displayed "Hodnota" is already a
+# whole-property market/appraisal figure - adding accumulated AssetCost
+# spending on top would double-count. Every other type (Byt, Stavba, a
+# future "Auto", "Sbírka", ...) has no such external valuation, so money
+# actually spent on it is the best available signal of how much of the
+# family's wealth is tied up in it.
+REAL_ESTATE_TYPE_NAMES = {"nemovitost"}
 
 
 def asset_costs_count_in_value(asset_type_name: str | None, calculation_mode: str | None) -> bool:
