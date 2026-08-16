@@ -142,6 +142,8 @@ def amortization_schedule(
     start_date: date | None,
     loan_years: Decimal | float | None = None,
     end_date: date | None = None,
+    first_payment_date: date | None = None,
+    first_payment_amount: Decimal | float | None = None,
 ) -> list[SchedulePeriod]:
     """Full monthly payment schedule for a fixed-payment loan: one row per
     payment period with the payment split into principal/interest and the
@@ -151,6 +153,16 @@ def amortization_schedule(
     (a standard fixed-payment ordinary annuity), just returned period-by-
     period instead of summed per calendar year. Missing inputs return an
     empty list, matching project_annual_interest's contract.
+
+    first_payment_date/first_payment_amount override the very first payment
+    when it differs from the regular ones - a common real mortgage shape,
+    where a prorated interest-only payment covers the gap between drawdown
+    and the first regular installment date. When both are given, that first
+    payment counts entirely as interest (it doesn't reduce the principal),
+    and the remaining nper-1 payments are re-amortized over the still-full
+    principal, dated from first_payment_date onward rather than start_date,
+    since that's when the regular monthly cadence actually begins. Omitting
+    either leaves the schedule exactly as before (a single uniform annuity).
     """
     if not pv or not interest_rate or not start_date:
         return []
@@ -160,18 +172,44 @@ def amortization_schedule(
 
     principal_value = float(pv)
     rate = monthly_rate(float(interest_rate))
-    payment = principal_value / nper if rate == 0 else principal_value * rate / (1 - (1 + rate) ** -nper)
 
     schedule: list[SchedulePeriod] = []
     balance = principal_value
-    for period in range(1, nper + 1):
+    remaining_periods = nper
+    anchor_date = start_date
+    period_offset = 0
+
+    if first_payment_date and first_payment_amount:
+        first_payment = float(first_payment_amount)
+        schedule.append(
+            {
+                "period": 1,
+                "date": first_payment_date,
+                "payment": Decimal(str(round(first_payment, 2))).quantize(TWO_PLACES, rounding=ROUND_HALF_UP),
+                "principal": Decimal("0.00"),
+                "interest": Decimal(str(round(first_payment, 2))).quantize(TWO_PLACES, rounding=ROUND_HALF_UP),
+                "balance": Decimal(str(round(balance, 2))).quantize(TWO_PLACES, rounding=ROUND_HALF_UP),
+            }
+        )
+        remaining_periods = nper - 1
+        anchor_date = first_payment_date
+        period_offset = 1
+        if remaining_periods <= 0:
+            return schedule
+
+    payment = (
+        principal_value / remaining_periods
+        if rate == 0
+        else principal_value * rate / (1 - (1 + rate) ** -remaining_periods)
+    )
+    for offset in range(1, remaining_periods + 1):
         interest = balance * rate if rate else 0.0
         principal = payment - interest
         balance -= principal
         schedule.append(
             {
-                "period": period,
-                "date": add_months(start_date, period),
+                "period": period_offset + offset,
+                "date": add_months(anchor_date, offset),
                 "payment": Decimal(str(round(payment, 2))).quantize(TWO_PLACES, rounding=ROUND_HALF_UP),
                 "principal": Decimal(str(round(principal, 2))).quantize(TWO_PLACES, rounding=ROUND_HALF_UP),
                 "interest": Decimal(str(round(interest, 2))).quantize(TWO_PLACES, rounding=ROUND_HALF_UP),
@@ -179,3 +217,24 @@ def amortization_schedule(
             }
         )
     return schedule
+
+
+def annual_interest_from_schedule(
+    schedule: Iterable[SchedulePeriod], years: Iterable[int] = DEFAULT_PROJECTION_YEARS
+) -> dict[int, Decimal]:
+    """Sums a monthly amortization_schedule()'s interest into calendar years.
+
+    Used instead of project_annual_interest's closed-form CUMIPMT-style calc
+    whenever a first-payment override makes the schedule non-uniform - that
+    closed form assumes every period lands exactly one calendar month after
+    the last (a pure function of loan_years/borrowed_from), which no longer
+    holds once the first payment has its own independent real date.
+    """
+    allowed_years = set(years)
+    totals: dict[int, Decimal] = {}
+    for period in schedule:
+        year = period["date"].year
+        if year not in allowed_years:
+            continue
+        totals[year] = totals.get(year, Decimal("0")) + period["interest"]
+    return {year: value.quantize(TWO_PLACES, rounding=ROUND_HALF_UP) for year, value in totals.items()}

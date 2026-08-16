@@ -153,6 +153,12 @@ class Asset(Base):
     borrowed_to: Mapped[date | None] = mapped_column(Date)
     interest_rate: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
     loan_years: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    # Optional override for a first payment that differs from the regular
+    # amortization schedule (e.g. a prorated interest-only payment covering
+    # the gap between drawdown and the first regular installment date). Set
+    # together or not at all - see amortization_schedule() in loan_calc.py.
+    first_payment_date: Mapped[date | None] = mapped_column(Date)
+    first_payment_amount: Mapped[Decimal | None] = mapped_column(Numeric(16, 2))
     fixed_until: Mapped[date | None] = mapped_column(Date)
     payment: Mapped[Decimal | None] = mapped_column(Numeric(16, 2))
     annual_interest_plan: Mapped[dict] = mapped_column(JSONB, default=dict)

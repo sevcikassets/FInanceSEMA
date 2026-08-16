@@ -1158,6 +1158,8 @@ export default function Page() {
     borrowed_to: "",
     interest_rate: "",
     loan_years: "",
+    first_payment_date: "",
+    first_payment_amount: "",
     fixed_until: "",
     payment: "",
   });
@@ -2129,6 +2131,8 @@ export default function Page() {
       borrowed_to: "",
       interest_rate: "",
       loan_years: "",
+      first_payment_date: "",
+      first_payment_amount: "",
       fixed_until: "",
       payment: "",
     });
@@ -2151,6 +2155,8 @@ export default function Page() {
       borrowed_to: row.borrowed_to ? String(row.borrowed_to) : "",
       interest_rate: row.interest_rate != null ? String(row.interest_rate) : "",
       loan_years: row.loan_years != null ? String(row.loan_years) : "",
+      first_payment_date: row.first_payment_date ? String(row.first_payment_date) : "",
+      first_payment_amount: row.first_payment_amount != null ? String(row.first_payment_amount) : "",
       fixed_until: row.fixed_until ? String(row.fixed_until) : "",
       payment: row.payment != null ? String(row.payment) : "",
     });
@@ -2181,6 +2187,8 @@ export default function Page() {
         borrowed_to: assetDraft.borrowed_to || null,
         interest_rate: assetDraft.interest_rate.trim() ? Number(assetDraft.interest_rate) : null,
         loan_years: assetDraft.loan_years.trim() ? Number(assetDraft.loan_years) : null,
+        first_payment_date: assetDraft.first_payment_date || null,
+        first_payment_amount: assetDraft.first_payment_amount.trim() ? Number(assetDraft.first_payment_amount) : null,
         fixed_until: assetDraft.fixed_until || null,
         payment: assetDraft.payment.trim() ? Number(assetDraft.payment) : null,
       };
@@ -4151,6 +4159,26 @@ export default function Page() {
                           type="date"
                           value={assetDraft.borrowed_to}
                           onChange={(event) => setAssetDraft((value) => ({ ...value, borrowed_to: event.target.value }))}
+                        />
+                      </label>
+                      <label>
+                        Datum první splátky
+                        <input
+                          type="date"
+                          value={assetDraft.first_payment_date}
+                          onChange={(event) => setAssetDraft((value) => ({ ...value, first_payment_date: event.target.value }))}
+                        />
+                        <span className="field-hint">
+                          Vyplňte jen pokud se první splátka liší od ostatních (bude počítána jako čistý úrok).
+                        </span>
+                      </label>
+                      <label>
+                        Výše první splátky
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={assetDraft.first_payment_amount}
+                          onChange={(event) => setAssetDraft((value) => ({ ...value, first_payment_amount: event.target.value }))}
                         />
                       </label>
                       <label>

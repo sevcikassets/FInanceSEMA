@@ -51,7 +51,7 @@ from .excel_import import (
     move_zapujcka_assets_to_loans,
     split_debt_assets_into_linked_liability,
 )
-from .loan_calc import amortization_schedule, project_annual_interest
+from .loan_calc import amortization_schedule, annual_interest_from_schedule, project_annual_interest
 from .models import (
     AppUser,
     Asset,
@@ -213,6 +213,8 @@ class AssetInput(BaseModel):
     borrowed_to: date | None = None
     interest_rate: Decimal | None = None
     loan_years: Decimal | None = None
+    first_payment_date: date | None = None
+    first_payment_amount: Decimal | None = None
     fixed_until: date | None = None
     payment: Decimal | None = None
 
@@ -252,13 +254,29 @@ def computed_interest_plan(asset: Asset, calculation_mode: str | None) -> dict[s
     N+1-querying AssetType per row."""
     if calculation_mode != "debt_interest":
         return {}
-    projection = project_annual_interest(
-        borrowed_amount=asset.borrowed_amount,
-        interest_rate=asset.interest_rate,
-        borrowed_from=asset.borrowed_from,
-        loan_years=asset.loan_years,
-        borrowed_to=asset.borrowed_to,
-    )
+    if asset.first_payment_date and asset.first_payment_amount:
+        # The closed-form CUMIPMT-style calc in project_annual_interest
+        # assumes every payment lands exactly one calendar month after the
+        # last - it can't represent an irregular first payment, so fall back
+        # to summing the actual per-period schedule instead.
+        schedule = amortization_schedule(
+            pv=asset.borrowed_amount,
+            interest_rate=asset.interest_rate,
+            start_date=asset.borrowed_from,
+            loan_years=asset.loan_years,
+            end_date=asset.borrowed_to,
+            first_payment_date=asset.first_payment_date,
+            first_payment_amount=asset.first_payment_amount,
+        )
+        projection = annual_interest_from_schedule(schedule)
+    else:
+        projection = project_annual_interest(
+            borrowed_amount=asset.borrowed_amount,
+            interest_rate=asset.interest_rate,
+            borrowed_from=asset.borrowed_from,
+            loan_years=asset.loan_years,
+            borrowed_to=asset.borrowed_to,
+        )
     return {str(year): json_value(value) for year, value in sorted(projection.items())}
 
 
@@ -292,6 +310,8 @@ def amortization_interest_in_period(
     loan_years: Decimal | None,
     end_date: date | None,
     period: str,
+    first_payment_date: date | None = None,
+    first_payment_amount: Decimal | None = None,
 ) -> Decimal:
     """Interest accrued within a single "YYYY-MM" period, via the same
     amortization_schedule() used by the payment-schedule endpoints - an
@@ -299,7 +319,15 @@ def amortization_interest_in_period(
     Missing inputs (no rate/term) yield an empty schedule, contributing 0 -
     same "missing inputs -> nothing" contract amortization_schedule already
     has, no special-casing needed here."""
-    schedule = amortization_schedule(pv=pv, interest_rate=interest_rate, start_date=start_date, loan_years=loan_years, end_date=end_date)
+    schedule = amortization_schedule(
+        pv=pv,
+        interest_rate=interest_rate,
+        start_date=start_date,
+        loan_years=loan_years,
+        end_date=end_date,
+        first_payment_date=first_payment_date,
+        first_payment_amount=first_payment_amount,
+    )
     return sum((p["interest"] for p in schedule if p["date"].strftime("%Y-%m") == period), Decimal("0"))
 
 
@@ -363,7 +391,14 @@ def classify_loan_interest(
         if asset_type is None or asset_type.calculation_mode != "debt_interest":
             continue
         interest = amortization_interest_in_period(
-            asset.borrowed_amount, asset.interest_rate, asset.borrowed_from, asset.loan_years, asset.borrowed_to, period
+            asset.borrowed_amount,
+            asset.interest_rate,
+            asset.borrowed_from,
+            asset.loan_years,
+            asset.borrowed_to,
+            period,
+            first_payment_date=asset.first_payment_date,
+            first_payment_amount=asset.first_payment_amount,
         )
         if interest == 0:
             continue
@@ -856,6 +891,11 @@ def ensure_schema_upgrades() -> None:
         # already ran the migration above once, so they need their own ALTER.
         conn.execute(text("ALTER TABLE monthly_evaluations ADD COLUMN IF NOT EXISTS stock_income_czk NUMERIC(20, 2) NOT NULL DEFAULT 0"))
         conn.execute(text("ALTER TABLE monthly_evaluations ADD COLUMN IF NOT EXISTS stock_expense_czk NUMERIC(20, 2) NOT NULL DEFAULT 0"))
+
+        # --- Hypotéka first-payment override (a prorated interest-only first
+        # payment, when it differs from the regular amortization schedule).
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS first_payment_date DATE"))
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS first_payment_amount NUMERIC(16, 2)"))
 
     # The data-shape migration below (moving rows, splitting one row into
     # two, copying several fields) is simpler and far less error-prone as
@@ -1624,6 +1664,8 @@ def create_asset(
         borrowed_to=payload.borrowed_to,
         interest_rate=payload.interest_rate,
         loan_years=payload.loan_years,
+        first_payment_date=payload.first_payment_date,
+        first_payment_amount=payload.first_payment_amount,
         fixed_until=payload.fixed_until,
         payment=payload.payment,
     )
@@ -1666,6 +1708,8 @@ def update_asset(
     row.borrowed_to = payload.borrowed_to
     row.interest_rate = payload.interest_rate
     row.loan_years = payload.loan_years
+    row.first_payment_date = payload.first_payment_date
+    row.first_payment_amount = payload.first_payment_amount
     row.fixed_until = payload.fixed_until
     row.payment = payload.payment
     db.commit()
@@ -1727,6 +1771,8 @@ def asset_payment_schedule(
         start_date=asset.borrowed_from,
         loan_years=asset.loan_years,
         end_date=asset.borrowed_to,
+        first_payment_date=asset.first_payment_date,
+        first_payment_amount=asset.first_payment_amount,
     )
     return [
         {
