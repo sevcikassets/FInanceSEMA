@@ -2370,8 +2370,15 @@ export default function Page() {
         body: JSON.stringify({ text: patriaText }),
       });
       setPatriaText("");
+      const rejected: Row[] = Array.isArray(result.rejected) ? result.rejected : [];
+      const rejectedSuffix =
+        rejected.length > 0
+          ? ` Nenaimportováno (${rejected.length}): ${rejected
+              .map((row) => `${String(row.instrument_name || "?")} – ${String(row.reason || "neznámý důvod")}`)
+              .join("; ")}`
+          : "";
       setStockActionStatus(
-        `Patria import: načteno ${result.parsed}, uloženo ${result.inserted}, duplicit přeskočeno ${result.skipped_duplicates}.`,
+        `Patria import: načteno ${result.parsed}, uloženo ${result.inserted}, duplicit přeskočeno ${result.skipped_duplicates}.${rejectedSuffix}`,
       );
       await loadAll();
     } catch (err) {

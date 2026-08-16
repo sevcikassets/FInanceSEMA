@@ -87,6 +87,32 @@ def test_parse_patria_text_ignores_incomplete_trailing_lines():
     assert parse_patria_text(text) == []
 
 
+def test_parse_patria_text_handles_double_tab_spacer_columns():
+    # Patria's own web export copy-pastes each column as value+empty-spacer
+    # (two tabs between every field, including a trailing pair) - this used
+    # to silently misalign every field one column early/late, e.g. an ISIN
+    # landing in the "currency" slot, which then crashed the DB insert.
+    text = (
+        "Datum obchodu\t\tPočet kusů\t\tSměr\t\tNázev cenného papíru\t\tProvize\t\tTyp pokynu\t\tTrh\t\tProtistrana\n"
+        "Datum vypořádání\t\tCena za kus\t\tAUV\t\tISIN\t\tPoplatek trhu\t\tCelková cena\t\tMěna\t\t\n"
+        "\t\t\t\t\t\t\t\t\t\t\t\t\t\t\n"
+        "12.08.2026 16:33:19\t\t1,00\t\tNákup\t\tSPDR USA S/C VALUE\t\t5,15\t\tLimit\t\tXETR\t\t\n"
+        "14.08.2026\t\t82,40\t\t0,00\t\tIE00BSPLC413\t\t0,00\t\t87,55\t\tEUR\t\t\n"
+    )
+    trades = parse_patria_text(text)
+    assert len(trades) == 1
+    trade = trades[0]
+    assert trade.traded_on == date(2026, 8, 12)
+    assert trade.quantity == Decimal("1")
+    assert trade.movement_type == "Nákup"
+    assert trade.instrument_name == "SPDR USA S/C VALUE"
+    assert trade.market == "XETR"
+    assert trade.unit_price_ccy == Decimal("82.40")
+    assert trade.isin == "IE00BSPLC413"
+    assert trade.currency == "EUR"
+    assert trade.gross_amount_ccy == Decimal("87.55")
+
+
 def test_extract_quote_reads_chart_endpoint_shape():
     # /v8/finance/chart response shape
     payload = {"chart": {"result": [{"meta": {"regularMarketPrice": 123.45, "currency": "USD"}}]}}

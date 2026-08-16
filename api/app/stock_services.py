@@ -156,7 +156,13 @@ def ticker_from_existing_data(db: Session, isin: str | None, name: str | None, m
 
 
 def parse_patria_text(text: str) -> list[PatriaTrade]:
-    lines = [line for line in text.splitlines() if line.strip()]
+    # Patria's own web export copy-pastes each column as two tab-separated
+    # cells (a value cell plus an empty spacer cell - a rendering quirk of
+    # its table, not a real extra column). Collapsing repeated tabs to one
+    # before splitting handles that transparently; a plain single-tab paste
+    # (e.g. hand-built TSV, or the older format this parser originally
+    # targeted) is unaffected since it has no repeated tabs to collapse.
+    lines = [re.sub(r"\t+", "\t", line) for line in text.splitlines() if line.strip()]
     trades: list[PatriaTrade] = []
     index = 0
     while index + 1 < len(lines):
@@ -181,6 +187,12 @@ def parse_patria_text(text: str) -> list[PatriaTrade]:
         else:
             quantity = abs(quantity)
 
+        if quantity == ZERO:
+            # A real trade always moves a nonzero number of shares - zero here
+            # means the two lines didn't actually line up with the expected
+            # columns (e.g. an unrecognised export format), not a valid trade.
+            continue
+
         unit_price = decimal_or_zero(second[offset + 1])
         total = decimal_or_zero(second[offset + 5])
         if total == ZERO:
@@ -203,11 +215,34 @@ def parse_patria_text(text: str) -> list[PatriaTrade]:
     return trades
 
 
+# Mirrors StockTransaction's own column limits - a malformed paste (unexpected
+# column layout, e.g. an ISIN landing in the currency field) must be reported
+# and skipped, not crash the whole batch on insert like a StringDataRightTruncation
+# from Postgres would (which the browser then only ever sees as an opaque
+# "network error", since the unhandled 500 has no CORS header on it).
+PATRIA_FIELD_LIMITS = {"instrument_name": 255, "isin": 32, "market": 32, "currency": 8}
+
+
 def import_patria_trades(db: Session, portfolio_id: uuid.UUID, text: str) -> dict[str, Any]:
     trades = parse_patria_text(text)
     inserted = 0
     skipped = 0
+    rejected: list[dict[str, str]] = []
     for trade in trades:
+        oversized = [
+            field
+            for field, limit in PATRIA_FIELD_LIMITS.items()
+            if getattr(trade, field) and len(getattr(trade, field)) > limit
+        ]
+        if oversized:
+            rejected.append(
+                {
+                    "traded_on": trade.traded_on.isoformat(),
+                    "instrument_name": trade.instrument_name or "?",
+                    "reason": f"Řádek neodpovídá očekávanému formátu exportu (sloupec {', '.join(oversized)})",
+                }
+            )
+            continue
         duplicate = db.scalar(
             select(StockTransaction)
             .where(
@@ -248,7 +283,12 @@ def import_patria_trades(db: Session, portfolio_id: uuid.UUID, text: str) -> dic
         )
         inserted += 1
     db.commit()
-    return {"parsed": len(trades), "inserted": inserted, "skipped_duplicates": skipped}
+    return {
+        "parsed": len(trades),
+        "inserted": inserted,
+        "skipped_duplicates": skipped,
+        "rejected": rejected,
+    }
 
 
 # Yahoo's chart endpoint blocks requests whose User-Agent doesn't look like a
