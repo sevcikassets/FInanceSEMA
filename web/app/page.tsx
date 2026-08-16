@@ -180,7 +180,6 @@ const NON_TABLE_TABS = new Set([
   "categories",
   "asset_types",
   "payers",
-  "evaluations",
 ]);
 
 // "rates" (shared CNB exchange-rate history), "users" (user management) and
@@ -197,6 +196,16 @@ const columns: Record<string, string[]> = {
   assets: ["code", "owner", "asset_type", "name", "total_value", "own_funds", "borrowed_amount", "interest_rate"],
   costs: ["cost_date", "asset", "payer", "supplier", "category", "item", "amount", "actions"],
   loans: ["period_label", "lender", "borrower", "amount", "interest_rate", "planned_end_date", "description", "actions"],
+  evaluations: [
+    "period_label",
+    "interest_received_czk",
+    "interest_paid_czk",
+    "unrealized_profit_delta_czk",
+    "realized_profit_czk",
+    "dividends_czk",
+    "expense_czk",
+    "income_czk",
+  ],
   transactions: [
     "traded_on",
     "instrument_type",
@@ -314,6 +323,13 @@ const labels: Record<string, string> = {
   borrower: "Dlužník",
   planned_end_date: "Plán konec",
   description: "Popis",
+  interest_received_czk: "Úroky přijaté",
+  interest_paid_czk: "Úroky zaplacené",
+  unrealized_profit_delta_czk: "Nereal. zisk",
+  realized_profit_czk: "Realiz. zisk",
+  dividends_czk: "Dividendy",
+  expense_czk: "Výdaje",
+  income_czk: "Příjmy",
   traded_on: "Datum",
   instrument_type: "Typ",
   movement_type: "Pohyb",
@@ -874,7 +890,12 @@ function formatSignedProfit(value: number) {
   return "0";
 }
 
-const signedProfitColumns = new Set(["unrealized_profit_czk", "daily_profit_czk"]);
+const signedProfitColumns = new Set([
+  "unrealized_profit_czk",
+  "daily_profit_czk",
+  "realized_profit_czk",
+  "unrealized_profit_delta_czk",
+]);
 
 // Sledování akcie (ticker price-history) table: fixed 2 decimal places
 // everywhere, blank cells instead of "0" for missing/zero data (matches the
@@ -1023,6 +1044,67 @@ function buildLoanRows(rows: Row[], expandedYears: Set<string>, expandedMonths: 
   return result;
 }
 
+// Money actually moving in/out this month - stock buys/sells plus every
+// per-asset cash flow - mirrors "Pohyby hotovosti"'s own total, shown as
+// single Výdaje/Příjmy columns on the table row instead of a separate table.
+function evaluationIncome(evaluation: Evaluation) {
+  return evaluation.stock_income_czk + evaluation.asset_cashflows.reduce((total, cashflow) => total + cashflow.income_czk, 0);
+}
+
+function evaluationExpense(evaluation: Evaluation) {
+  return evaluation.stock_expense_czk + evaluation.asset_cashflows.reduce((total, cashflow) => total + cashflow.expense_czk, 0);
+}
+
+type EvaluationSumField = "interest_received_czk" | "interest_paid_czk" | "realized_profit_czk" | "unrealized_profit_delta_czk" | "dividends_czk";
+
+function buildEvaluationRows(evaluations: Evaluation[], expandedYears: Set<string>) {
+  const byYear = new Map<string, Evaluation[]>();
+  for (const evaluation of evaluations) {
+    const year = evaluation.period.slice(0, 4);
+    const group = byYear.get(year) || [];
+    group.push(evaluation);
+    byYear.set(year, group);
+  }
+
+  const sumField = (evals: Evaluation[], field: EvaluationSumField) => evals.reduce((total, row) => total + row[field], 0);
+
+  const result: Row[] = [];
+  for (const [year, yearRows] of [...byYear.entries()].sort((a, b) => b[0].localeCompare(a[0]))) {
+    result.push({
+      row_kind: "year-summary",
+      year_key: year,
+      period_label: `Rok ${year}`,
+      interest_received_czk: sumField(yearRows, "interest_received_czk"),
+      interest_paid_czk: sumField(yearRows, "interest_paid_czk"),
+      unrealized_profit_delta_czk: sumField(yearRows, "unrealized_profit_delta_czk"),
+      realized_profit_czk: sumField(yearRows, "realized_profit_czk"),
+      dividends_czk: sumField(yearRows, "dividends_czk"),
+      expense_czk: yearRows.reduce((total, row) => total + evaluationExpense(row), 0),
+      income_czk: yearRows.reduce((total, row) => total + evaluationIncome(row), 0),
+    });
+    if (!expandedYears.has(year)) continue;
+
+    const sortedRows = [...yearRows].sort((a, b) => b.period.localeCompare(a.period));
+    for (const evaluation of sortedRows) {
+      result.push({
+        row_kind: "detail",
+        id: evaluation.id,
+        year_key: year,
+        period: evaluation.period,
+        period_label: monthLabel(`${evaluation.period}-01`),
+        interest_received_czk: evaluation.interest_received_czk,
+        interest_paid_czk: evaluation.interest_paid_czk,
+        unrealized_profit_delta_czk: evaluation.unrealized_profit_delta_czk,
+        realized_profit_czk: evaluation.realized_profit_czk,
+        dividends_czk: evaluation.dividends_czk,
+        expense_czk: evaluationExpense(evaluation),
+        income_czk: evaluationIncome(evaluation),
+      });
+    }
+  }
+  return result;
+}
+
 export default function Page() {
   const [token, setToken] = useState<string | null>(null);
   const [username, setUsername] = useState("admin");
@@ -1074,8 +1156,12 @@ export default function Page() {
   const [showSettledLoans, setShowSettledLoans] = useState(false);
   const [evaluations, setEvaluations] = useState<Evaluation[]>([]);
   const [evaluationPeriod, setEvaluationPeriod] = useState(new Date().toISOString().slice(0, 7));
+  // Empty = single-period compute (the common case); set only when the user
+  // wants to recompute a whole range in one action instead of one month at a time.
+  const [evaluationPeriodTo, setEvaluationPeriodTo] = useState("");
   const [evaluationBusy, setEvaluationBusy] = useState(false);
   const [evaluationStatus, setEvaluationStatus] = useState<string | null>(null);
+  const [expandedEvaluationYears, setExpandedEvaluationYears] = useState<Set<string>>(() => new Set());
   const [expandedEvaluations, setExpandedEvaluations] = useState<Set<string>>(() => new Set());
   const [expandedInterestRows, setExpandedInterestRows] = useState<Set<string>>(() => new Set());
   const [interestDetailCache, setInterestDetailCache] = useState<Record<string, { received: Row[]; paid: Row[] }>>({});
@@ -1265,13 +1351,15 @@ export default function Page() {
         ? buildCostRows(rows, costAssetFilter, showCostDetail)
         : activeTab === "loans"
           ? buildLoanRows(rows, expandedLoanYears, expandedLoanMonths)
-          : activeTab === "transactions" && transactionFilter.trim()
-            ? rows.filter((row) => {
-                const needle = transactionFilter.trim().toLowerCase();
-                return [row.instrument_name, row.ticker, row.isin, row.movement_type, row.description]
-                  .some((field) => String(field || "").toLowerCase().includes(needle));
-              })
-            : rows;
+          : activeTab === "evaluations"
+            ? buildEvaluationRows(evaluations, expandedEvaluationYears)
+            : activeTab === "transactions" && transactionFilter.trim()
+              ? rows.filter((row) => {
+                  const needle = transactionFilter.trim().toLowerCase();
+                  return [row.instrument_name, row.ticker, row.isin, row.movement_type, row.description]
+                    .some((field) => String(field || "").toLowerCase().includes(needle));
+                })
+              : rows;
   const chartData = useMemo(() => {
     if (activeTab !== "charts") return [];
     return [...rows]
@@ -1347,6 +1435,18 @@ export default function Page() {
         next.delete(monthKey);
       } else {
         next.add(monthKey);
+      }
+      return next;
+    });
+  }
+
+  function toggleEvaluationYear(year: string) {
+    setExpandedEvaluationYears((current) => {
+      const next = new Set(current);
+      if (next.has(year)) {
+        next.delete(year);
+      } else {
+        next.add(year);
       }
       return next;
     });
@@ -2667,9 +2767,24 @@ export default function Page() {
     event.preventDefault();
     setEvaluationBusy(true);
     setEvaluationStatus(null);
+    const isRange = Boolean(evaluationPeriodTo) && evaluationPeriodTo !== evaluationPeriod;
     try {
-      await api(withPortfolio(`/evaluations/compute?period=${evaluationPeriod}`), { method: "POST" });
-      setExpandedEvaluations((current) => new Set(current).add(evaluationPeriod));
+      if (isRange) {
+        const result = (await api(
+          withPortfolio(`/evaluations/compute?period_from=${evaluationPeriod}&period_to=${evaluationPeriodTo}`),
+          { method: "POST" },
+        )) as { computed_periods: string[] };
+        setExpandedEvaluationYears((current) => {
+          const next = new Set(current);
+          for (const period of result.computed_periods) next.add(period.slice(0, 4));
+          return next;
+        });
+        setEvaluationStatus(`Přepočteno ${result.computed_periods.length} období.`);
+      } else {
+        await api(withPortfolio(`/evaluations/compute?period=${evaluationPeriod}`), { method: "POST" });
+        setExpandedEvaluationYears((current) => new Set(current).add(evaluationPeriod.slice(0, 4)));
+        setExpandedEvaluations((current) => new Set(current).add(evaluationPeriod));
+      }
       await loadAll();
     } catch (err) {
       setEvaluationStatus(err instanceof Error ? err.message : "Vyhodnocení se nepodařilo spočítat");
@@ -2708,6 +2823,95 @@ export default function Page() {
     } finally {
       setInterestDetailBusy(null);
     }
+  }
+
+  // The rich per-month breakdown shown when a Vyhodnocení table row is
+  // expanded - same content the old card-list body used to show inline,
+  // just re-homed under the table row instead of a standalone card.
+  function renderEvaluationDetail(evaluation: Evaluation) {
+    const stockDataStale = Boolean(evaluation.stock_data_as_of) && evaluation.stock_data_as_of!.slice(0, 7) < evaluation.period;
+    return (
+      <div className="evaluation-detail">
+        {stockDataStale && (
+          <p className="field-hint">
+            Data o akciích jsou aktuální k {evaluation.stock_data_as_of} - pro přesnost tohoto měsíce nejdřív přepočítej portfolio akcií.
+          </p>
+        )}
+        <div className="mini-grids">
+          <div>
+            <h3>Výsledkové operace</h3>
+            <InterestLine
+              label="Úroky přijaté"
+              amount={evaluation.interest_received_czk}
+              expanded={expandedInterestRows.has(`${evaluation.id}:received`)}
+              detail={interestDetailCache[evaluation.id]?.received}
+              busy={interestDetailBusy === evaluation.id}
+              onToggle={() => toggleInterestDetail(evaluation.id, "received")}
+            />
+            <InterestLine
+              label="Úroky zaplacené"
+              amount={evaluation.interest_paid_czk}
+              expanded={expandedInterestRows.has(`${evaluation.id}:paid`)}
+              detail={interestDetailCache[evaluation.id]?.paid}
+              busy={interestDetailBusy === evaluation.id}
+              onToggle={() => toggleInterestDetail(evaluation.id, "paid")}
+            />
+            <p>
+              <span>Realizovaný zisk/ztráta akcie</span>
+              <strong className={evaluation.realized_profit_czk >= 0 ? "positive" : "negative"}>
+                {money(evaluation.realized_profit_czk)}
+              </strong>
+            </p>
+            <p>
+              <span>Nerealizovaný zisk/ztráta akcie (změna)</span>
+              <strong className={evaluation.unrealized_profit_delta_czk >= 0 ? "positive" : "negative"}>
+                {money(evaluation.unrealized_profit_delta_czk)}
+              </strong>
+            </p>
+            <p>
+              <span>Dividendy</span>
+              <strong>{money(evaluation.dividends_czk)}</strong>
+            </p>
+          </div>
+        </div>
+        <h3>Pohyby hotovosti</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Položka</th>
+              <th>Příjmy</th>
+              <th>Výdaje</th>
+              <th>Čistý pohyb</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(evaluation.stock_income_czk !== 0 || evaluation.stock_expense_czk !== 0) && (
+              <tr>
+                <td>Akcie (nákupy/prodeje)</td>
+                <td className="numeric-cell">{money(evaluation.stock_income_czk)}</td>
+                <td className="numeric-cell">{money(evaluation.stock_expense_czk)}</td>
+                <td className="numeric-cell">{money(evaluation.stock_income_czk - evaluation.stock_expense_czk)}</td>
+              </tr>
+            )}
+            {evaluation.asset_cashflows.map((cashflow) => (
+              <tr key={cashflow.asset_id || "none"}>
+                <td>{cashflow.asset_code ? `${cashflow.asset_code} — ${cashflow.asset_name}` : cashflow.asset_name}</td>
+                <td className="numeric-cell">{money(cashflow.income_czk)}</td>
+                <td className="numeric-cell">{money(cashflow.expense_czk)}</td>
+                <td className="numeric-cell">{money(cashflow.income_czk - cashflow.expense_czk)}</td>
+              </tr>
+            ))}
+            {evaluation.asset_cashflows.length === 0 && evaluation.stock_income_czk === 0 && evaluation.stock_expense_czk === 0 && (
+              <tr>
+                <td colSpan={4} className="alert-empty">
+                  Žádné pohyby v tomto měsíci.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    );
   }
 
   // Bypasses the shared api() helper on purpose - it always forces
@@ -3479,7 +3683,7 @@ export default function Page() {
               <h1>{active.label}</h1>
               <p>
                 {summary
-                  ? `${activeTab === "transactions" ? tableRows.length : rows.length} záznamů v aktuálním pohledu`
+                  ? `${activeTab === "transactions" || activeTab === "evaluations" ? tableRows.length : rows.length} záznamů v aktuálním pohledu`
                   : "Čekám na importovaná data"}
               </p>
             </div>
@@ -3582,134 +3786,37 @@ export default function Page() {
         )}
 
         {activeTab === "evaluations" && (
-          <section className="work-panel">
+          <section className="work-panel compact-panel">
             <div className="panel-header">
               <div>
                 <h2>Vyhodnocení</h2>
                 <p>
                   Měsíční přehled výsledkových operací a pohybů hotovosti u jednotlivých majetků. Počítá se na
-                  vyžádání a ukládá se - nepočítá se znovu při každém zobrazení.
+                  vyžádání a ukládá se - nepočítá se znovu při každém zobrazení. Klikni na řádek měsíce pro
+                  zobrazení detailu.
                 </p>
               </div>
             </div>
             <form className="rate-form" onSubmit={computeEvaluation}>
               <label>
-                Měsíc
+                Měsíc od
                 <input type="month" value={evaluationPeriod} onChange={(event) => setEvaluationPeriod(event.target.value)} />
+              </label>
+              <label>
+                Měsíc do (nepovinné)
+                <input
+                  type="month"
+                  value={evaluationPeriodTo}
+                  onChange={(event) => setEvaluationPeriodTo(event.target.value)}
+                  placeholder={evaluationPeriod}
+                />
               </label>
               <button className="action-button" type="submit" disabled={evaluationBusy}>
                 <Calculator size={16} />
-                <span>{evaluationBusy ? "Počítám…" : "Vypočítat"}</span>
+                <span>{evaluationBusy ? "Počítám…" : evaluationPeriodTo && evaluationPeriodTo !== evaluationPeriod ? "Přepočítat období" : "Vypočítat"}</span>
               </button>
             </form>
             {evaluationStatus && <div className="notice">{evaluationStatus}</div>}
-            <div className="evaluation-list">
-              {evaluations.map((evaluation) => {
-                const expanded = expandedEvaluations.has(evaluation.period);
-                const net =
-                  evaluation.interest_received_czk -
-                  evaluation.interest_paid_czk +
-                  evaluation.realized_profit_czk +
-                  evaluation.unrealized_profit_delta_czk +
-                  evaluation.dividends_czk;
-                const stockDataStale = Boolean(evaluation.stock_data_as_of) && evaluation.stock_data_as_of!.slice(0, 7) < evaluation.period;
-                return (
-                  <div className="evaluation-card" key={evaluation.id}>
-                    <button type="button" className="evaluation-card-header" onClick={() => toggleEvaluation(evaluation.period)}>
-                      {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-                      <span>{monthLabel(`${evaluation.period}-01`)}</span>
-                      <span className={net >= 0 ? "positive" : "negative"}>{money(net)}</span>
-                    </button>
-                    {expanded && (
-                      <div className="evaluation-card-body">
-                        {stockDataStale && (
-                          <p className="field-hint">
-                            Data o akciích jsou aktuální k {evaluation.stock_data_as_of} - pro přesnost tohoto měsíce
-                            nejdřív přepočítej portfolio akcií.
-                          </p>
-                        )}
-                        <div className="mini-grids">
-                          <div>
-                            <h3>Výsledkové operace</h3>
-                            <InterestLine
-                              label="Úroky přijaté"
-                              amount={evaluation.interest_received_czk}
-                              expanded={expandedInterestRows.has(`${evaluation.id}:received`)}
-                              detail={interestDetailCache[evaluation.id]?.received}
-                              busy={interestDetailBusy === evaluation.id}
-                              onToggle={() => toggleInterestDetail(evaluation.id, "received")}
-                            />
-                            <InterestLine
-                              label="Úroky zaplacené"
-                              amount={evaluation.interest_paid_czk}
-                              expanded={expandedInterestRows.has(`${evaluation.id}:paid`)}
-                              detail={interestDetailCache[evaluation.id]?.paid}
-                              busy={interestDetailBusy === evaluation.id}
-                              onToggle={() => toggleInterestDetail(evaluation.id, "paid")}
-                            />
-                            <p>
-                              <span>Realizovaný zisk/ztráta akcie</span>
-                              <strong className={evaluation.realized_profit_czk >= 0 ? "positive" : "negative"}>
-                                {money(evaluation.realized_profit_czk)}
-                              </strong>
-                            </p>
-                            <p>
-                              <span>Nerealizovaný zisk/ztráta akcie (změna)</span>
-                              <strong className={evaluation.unrealized_profit_delta_czk >= 0 ? "positive" : "negative"}>
-                                {money(evaluation.unrealized_profit_delta_czk)}
-                              </strong>
-                            </p>
-                            <p>
-                              <span>Dividendy</span>
-                              <strong>{money(evaluation.dividends_czk)}</strong>
-                            </p>
-                          </div>
-                        </div>
-                        <h3>Pohyby hotovosti</h3>
-                        <table>
-                          <thead>
-                            <tr>
-                              <th>Položka</th>
-                              <th>Příjmy</th>
-                              <th>Výdaje</th>
-                              <th>Čistý pohyb</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {(evaluation.stock_income_czk !== 0 || evaluation.stock_expense_czk !== 0) && (
-                              <tr>
-                                <td>Akcie (nákupy/prodeje)</td>
-                                <td className="numeric-cell">{money(evaluation.stock_income_czk)}</td>
-                                <td className="numeric-cell">{money(evaluation.stock_expense_czk)}</td>
-                                <td className="numeric-cell">{money(evaluation.stock_income_czk - evaluation.stock_expense_czk)}</td>
-                              </tr>
-                            )}
-                            {evaluation.asset_cashflows.map((cashflow) => (
-                              <tr key={cashflow.asset_id || "none"}>
-                                <td>{cashflow.asset_code ? `${cashflow.asset_code} — ${cashflow.asset_name}` : cashflow.asset_name}</td>
-                                <td className="numeric-cell">{money(cashflow.income_czk)}</td>
-                                <td className="numeric-cell">{money(cashflow.expense_czk)}</td>
-                                <td className="numeric-cell">{money(cashflow.income_czk - cashflow.expense_czk)}</td>
-                              </tr>
-                            ))}
-                            {evaluation.asset_cashflows.length === 0 &&
-                              evaluation.stock_income_czk === 0 &&
-                              evaluation.stock_expense_czk === 0 && (
-                                <tr>
-                                  <td colSpan={4} className="alert-empty">
-                                    Žádné pohyby v tomto měsíci.
-                                  </td>
-                                </tr>
-                              )}
-                          </tbody>
-                        </table>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-              {evaluations.length === 0 && <p className="alert-empty">Zatím žádná vyhodnocení - vyber měsíc a klikni na Vypočítat.</p>}
-            </div>
           </section>
         )}
 
@@ -4757,28 +4864,41 @@ export default function Page() {
                 const isStatSummary = activeTab === "stats" && row.row_kind === "summary";
                 const isLoanYearSummary = activeTab === "loans" && row.row_kind === "year-summary";
                 const isLoanMonthSummary = activeTab === "loans" && row.row_kind === "month-summary";
-                const isClickableSummary = isStatSummary || isLoanYearSummary || isLoanMonthSummary;
+                const isEvaluationYearSummary = activeTab === "evaluations" && row.row_kind === "year-summary";
+                const isEvaluationMonthRow = activeTab === "evaluations" && row.row_kind === "detail";
+                const isClickableSummary =
+                  isStatSummary || isLoanYearSummary || isLoanMonthSummary || isEvaluationYearSummary || isEvaluationMonthRow;
                 const monthKey = String(row.month_key || "");
                 const yearKey = String(row.year_key || "");
+                const periodKey = String(row.period || "");
                 const handleRowClick = isStatSummary
                   ? () => toggleStatMonth(monthKey)
                   : isLoanYearSummary
                     ? () => toggleLoanYear(yearKey)
                     : isLoanMonthSummary
                       ? () => toggleLoanMonth(monthKey)
-                      : undefined;
+                      : isEvaluationYearSummary
+                        ? () => toggleEvaluationYear(yearKey)
+                        : isEvaluationMonthRow
+                          ? () => toggleEvaluation(periodKey)
+                          : undefined;
                 const summaryExpanded = isStatSummary
                   ? expandedStatMonths.has(monthKey)
                   : isLoanYearSummary
                     ? expandedLoanYears.has(yearKey)
                     : isLoanMonthSummary
                       ? expandedLoanMonths.has(monthKey)
-                      : false;
+                      : isEvaluationYearSummary
+                        ? expandedEvaluationYears.has(yearKey)
+                        : isEvaluationMonthRow
+                          ? expandedEvaluations.has(periodKey)
+                          : false;
                 const rowKey = String(row.id || row.ticker || row.stat_date || row.month_key || row.year_key || row.period_label || index);
                 const isEditingThisRow =
                   (activeTab === "costs" && editingCostId === String(row.id)) ||
                   (activeTab === "loans" && editingLoanId === String(row.id)) ||
                   (activeTab === "transactions" && editingTransactionId === String(row.id));
+                const evaluationDetail = isEvaluationMonthRow && summaryExpanded ? evaluations.find((item) => item.id === row.id) : undefined;
                 return (
                   <Fragment key={rowKey}>
                   <tr
@@ -4893,7 +5013,7 @@ export default function Page() {
                             </button>
                           </div>
                         ) : isClickableSummary && colIndex === 0 ? (
-                          <span className={`stat-month-toggle${isLoanMonthSummary ? " nested-toggle" : ""}`}>
+                          <span className={`stat-month-toggle${isLoanMonthSummary || isEvaluationMonthRow ? " nested-toggle" : ""}`}>
                             {summaryExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                             {formatValue(col, row[col])}
                           </span>
@@ -4920,9 +5040,21 @@ export default function Page() {
                       </td>
                     </tr>
                   )}
+                  {evaluationDetail && (
+                    <tr className="inline-edit-row">
+                      <td colSpan={(columns[activeTab] || []).length}>{renderEvaluationDetail(evaluationDetail)}</td>
+                    </tr>
+                  )}
                   </Fragment>
                 );
               })}
+              {activeTab === "evaluations" && tableRows.length === 0 && (
+                <tr>
+                  <td colSpan={(columns[activeTab] || []).length} className="alert-empty">
+                    Zatím žádná vyhodnocení - vyber měsíc a klikni na Vypočítat.
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </section>

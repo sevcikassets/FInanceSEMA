@@ -1077,51 +1077,13 @@ nav button:hover {
   flex: 1;
 }
 
-.evaluation-list {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin-top: 14px;
-}
-
-.evaluation-card {
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  overflow: hidden;
-}
-
-.evaluation-card-header {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  border: none;
-  background: #f8fafb;
-  padding: 12px 14px;
-  font-size: 14px;
-  font-weight: 600;
-  cursor: pointer;
-  text-align: left;
-}
-
-.evaluation-card-header:hover {
-  background: #eef2f4;
-}
-
-.evaluation-card-header span:first-of-type {
-  flex: 1;
-  font-weight: 500;
-  color: var(--ink);
-}
-
-.evaluation-card-body {
-  padding: 14px;
+.evaluation-detail {
   display: flex;
   flex-direction: column;
   gap: 14px;
 }
 
-.evaluation-card-body h3 {
+.evaluation-detail h3 {
   margin: 0 0 8px;
   font-size: 14px;
 }

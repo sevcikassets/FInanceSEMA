@@ -1364,15 +1364,51 @@ def summary(
     }
 
 
+def iter_periods(start: str, end: str) -> list[str]:
+    """Every "YYYY-MM" period from start to end inclusive, swapping the two
+    first if given in the wrong order (lenient - the two month pickers in
+    the UI don't enforce which one is earlier)."""
+    start_year, start_month = int(start[:4]), int(start[5:7])
+    end_year, end_month = int(end[:4]), int(end[5:7])
+    if (start_year, start_month) > (end_year, end_month):
+        start_year, start_month, end_year, end_month = end_year, end_month, start_year, start_month
+    periods = []
+    year, month = start_year, start_month
+    while (year, month) <= (end_year, end_month):
+        periods.append(f"{year:04d}-{month:02d}")
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return periods
+
+
+MAX_EVALUATION_RANGE_MONTHS = 60
+
+
 @app.post("/evaluations/compute")
 def compute_evaluation(
-    period: str | None = Query(None, description='"YYYY-MM", defaults to the current month'),
+    period: str | None = Query(None, description='"YYYY-MM" - single period, defaults to the current month'),
+    period_from: str | None = Query(None, description='"YYYY-MM" - start of a range to compute in one call'),
+    period_to: str | None = Query(None, description='"YYYY-MM" - end of the range (inclusive); defaults to period_from'),
     portfolio_id: uuid.UUID = Depends(require_portfolio_access("evaluations")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    period = period or date.today().strftime("%Y-%m")
-    evaluation = compute_monthly_evaluation(db, portfolio_id, period)
-    return _evaluation_dict(db, evaluation)
+    if period_from:
+        periods = iter_periods(period_from, period_to or period_from)
+    else:
+        periods = [period or date.today().strftime("%Y-%m")]
+    if len(periods) > MAX_EVALUATION_RANGE_MONTHS:
+        raise HTTPException(status_code=400, detail=f"Rozsah je moc velký - najednou lze spočítat nejvýš {MAX_EVALUATION_RANGE_MONTHS} měsíců")
+    evaluations = [compute_monthly_evaluation(db, portfolio_id, p) for p in periods]
+    # A single period (the pre-existing, still-default behaviour) returns the
+    # evaluation body directly, same shape as before this endpoint could
+    # compute a range - every existing caller (including tests) depends on
+    # that. A multi-period range instead returns a small summary, since the
+    # caller's next step is always just re-fetching the list via GET /evaluations.
+    if len(evaluations) == 1:
+        return _evaluation_dict(db, evaluations[0])
+    return {"computed_periods": periods, "count": len(evaluations)}
 
 
 def _evaluation_dict(db: Session, evaluation: MonthlyEvaluation) -> dict[str, Any]:

@@ -309,3 +309,72 @@ def test_evaluation_interest_detail_matches_aggregate_and_excludes_correctly(cli
         f"/evaluations/{evaluation['id']}/interest-detail", headers=headers, params={"portfolio_id": str(other_portfolio.id)}
     )
     assert wrong_scope.status_code == 404
+
+
+@requires_db
+def test_evaluation_compute_range_computes_every_period_and_returns_summary(client, db_session, portfolio_id):
+    """period_from/period_to lets one call recompute several months at once
+    instead of clicking "Vypočítat" one period at a time - each period gets
+    its own stored MonthlyEvaluation row, and the response is a small
+    computed_periods/count summary rather than a single evaluation body
+    (there's no single "the" evaluation to return for a range)."""
+    from app.models import MonthlyEvaluation
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    response = client.post("/evaluations/compute", headers=headers, params={**params, "period_from": "2024-08", "period_to": "2024-10"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["computed_periods"] == ["2024-08", "2024-09", "2024-10"]
+    assert body["count"] == 3
+
+    stored = (
+        db_session.query(MonthlyEvaluation)
+        .filter(MonthlyEvaluation.portfolio_id == portfolio_id, MonthlyEvaluation.period.in_(["2024-08", "2024-09", "2024-10"]))
+        .all()
+    )
+    assert {row.period for row in stored} == {"2024-08", "2024-09", "2024-10"}
+
+
+@requires_db
+def test_evaluation_compute_range_swaps_reversed_from_to(client, db_session, portfolio_id):
+    """The UI has two independent month pickers with no ordering constraint -
+    a range given backwards must still compute the same periods, not an
+    empty or nonsensical set."""
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    response = client.post("/evaluations/compute", headers=headers, params={**params, "period_from": "2024-12", "period_to": "2024-11"})
+    assert response.status_code == 200
+    assert response.json()["computed_periods"] == ["2024-11", "2024-12"]
+
+
+@requires_db
+def test_evaluation_compute_range_over_limit_rejected(client, db_session, portfolio_id):
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    response = client.post("/evaluations/compute", headers=headers, params={**params, "period_from": "2020-01", "period_to": "2025-06"})
+    assert response.status_code == 400
+
+
+@requires_db
+def test_evaluation_compute_single_period_still_returns_evaluation_body(client, db_session, portfolio_id):
+    """Backward compatibility: computing exactly one period (whether via the
+    plain "period" param or a period_from/period_to range collapsing to one
+    month) must still return the evaluation dict directly, not the range
+    summary shape - existing callers extract fields straight off the body."""
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    response = client.post("/evaluations/compute", headers=headers, params={**params, "period_from": "2024-09", "period_to": "2024-09"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["period"] == "2024-09"
+    assert "id" in body
+    assert "asset_cashflows" in body
