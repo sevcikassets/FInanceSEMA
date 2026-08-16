@@ -553,6 +553,11 @@ def recalculate_stocks(
     daily_buys: dict[date, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
     daily_invested: dict[date, Decimal] = defaultdict(Decimal)
     daily_dividends: dict[date, Decimal] = defaultdict(Decimal)
+    # Realized gain/loss booked at the moment of each "sell" - proceeds minus
+    # the average-cost basis removed (see the sell branch below). Same daily-
+    # flow shape as daily_dividends; unlike unrealized profit this is exact,
+    # not mark-to-market, so no historical price lookups are needed for it.
+    daily_realized_profit: dict[date, Decimal] = defaultdict(Decimal)
     # Signed quantity change per ticker per day - needed to reconstruct how many
     # shares were actually held on any given historical day, so they can be
     # valued at that day's price.
@@ -609,7 +614,10 @@ def recalculate_stocks(
             old_quantity = position["quantity"]
             if old_quantity:
                 average_cost = position["invested_czk"] / old_quantity
-                position["invested_czk"] -= abs(quantity) * average_cost
+                cost_basis_removed = abs(quantity) * average_cost
+                position["invested_czk"] -= cost_basis_removed
+                if traded_on:
+                    daily_realized_profit[traded_on] += amount_czk - cost_basis_removed
             position["quantity"] += quantity
             if traded_on:
                 ticker_qty_events[ticker][traded_on] += quantity
@@ -654,20 +662,24 @@ def recalculate_stocks(
     total_czk = ZERO
     invested_total = ZERO
     dividends_total = ZERO
-    stat_dates = sorted(buy_dates | set(daily_dividends))
+    realized_profit_total = ZERO
+    stat_dates = sorted(buy_dates | set(daily_dividends) | set(daily_realized_profit))
     if stat_dates:
         start_date = stat_dates[0]
         end_date = max(date.today(), stat_dates[-1])
         # Only working days (Po-Pa) are filled in - AkcieStatistika.bas never
         # generates weekend rows ("Pridat vsechny pracovni dny (Po-Pa)"), no
-        # trading happens then anyway. A real transaction/dividend that did
-        # land on a weekend still gets its row, exactly like the VBA (it never
-        # filters out actual data, only the synthetic empty fill days).
+        # trading happens then anyway. A real transaction/dividend/sell that
+        # did land on a weekend still gets its row, exactly like the VBA (it
+        # never filters out actual data, only the synthetic empty fill days).
         calendar_dates = [
             candidate
             for offset in range((end_date - start_date).days + 1)
             for candidate in [start_date + timedelta(days=offset)]
-            if candidate.weekday() < 5 or candidate in buy_dates or candidate in daily_dividends
+            if candidate.weekday() < 5
+            or candidate in buy_dates
+            or candidate in daily_dividends
+            or candidate in daily_realized_profit
         ]
     else:
         calendar_dates = []
@@ -753,6 +765,7 @@ def recalculate_stocks(
         total_czk += bought_czk
         invested_total += daily_invested[stat_date]
         dividends_total += daily_dividends[stat_date]
+        realized_profit_total += daily_realized_profit[stat_date]
         eur_rate = rate_for_day(db, "EUR", stat_date)
         usd_rate = rate_for_day(db, "USD", stat_date)
         eur_in_czk = total_eur * eur_rate
@@ -833,6 +846,8 @@ def recalculate_stocks(
                 unrealized_profit_czk=unrealized,
                 dividends=daily_dividends[stat_date],
                 dividends_total=dividends_total,
+                realized_profit_czk=daily_realized_profit[stat_date],
+                realized_profit_total_czk=realized_profit_total,
                 profit_pct=(
                     ((total_value_czk + dividends_total - invested_total) / invested_total) if invested_total else None
                 ),

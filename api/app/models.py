@@ -49,6 +49,22 @@ class PortfolioAccess(Base):
     allowed_agendas: Mapped[list] = mapped_column(JSONB, default=list)
 
 
+class PortfolioSelfParty(Base):
+    """Which Party identities count as "us" for a Subjekt - e.g. a Subjekt
+    tracking one family's combined finances might have both the person and
+    their own company marked here. Used only by the Vyhodnocení (monthly
+    evaluation) report to classify a LoanMovement's interest as received
+    (we're the lender), paid (we're the borrower), or excluded entirely (an
+    internal transfer between two of our own identities, or a loan between
+    two external parties that isn't really this Subjekt's business even if
+    it happens to be recorded under it)."""
+
+    __tablename__ = "portfolio_self_parties"
+
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), primary_key=True)
+    party_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("parties.id"), primary_key=True)
+
+
 class AppUser(Base):
     __tablename__ = "app_users"
 
@@ -316,6 +332,55 @@ class DailyStatistic(Base):
     unrealized_profit_czk: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
     dividends: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
     dividends_total: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
+    # Realized gain/loss (average-cost method) booked on "sell" transactions
+    # that day, and the cumulative running total since the first transaction
+    # - same daily-flow + cumulative-snapshot shape as dividends/
+    # dividends_total above. Unlike unrealized_profit_czk (mark-to-market),
+    # this never changes retroactively for a given day once computed.
+    realized_profit_czk: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
+    realized_profit_total_czk: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
     profit_pct: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
     daily_profit_czk: Mapped[Decimal | None] = mapped_column(Numeric(20, 2))
     alerts: Mapped[str | None] = mapped_column(Text)
+
+
+class MonthlyEvaluation(Base):
+    """Stored monthly P&L (Vyhodnocení) for one Subjekt/period - computed
+    on demand via POST /evaluations/compute and upserted by
+    (portfolio_id, period), not recomputed on every read. Interest received/
+    paid come from LoanMovement rows classified via PortfolioSelfParty (see
+    that model) plus Hypotéka-typed Assets (always "paid"); the stock
+    figures come from DailyStatistic (realized_profit_czk summed across the
+    period, unrealized_profit_czk diffed period-start to period-end,
+    dividends summed)."""
+
+    __tablename__ = "monthly_evaluations"
+    __table_args__ = (UniqueConstraint("portfolio_id", "period", name="uq_monthly_evaluations_portfolio_period"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), index=True)
+    period: Mapped[str] = mapped_column(String(7))  # "YYYY-MM"
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    interest_received_czk: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0)
+    interest_paid_czk: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0)
+    realized_profit_czk: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0)
+    unrealized_profit_delta_czk: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0)
+    dividends_czk: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0)
+
+
+class MonthlyEvaluationAssetCashflow(Base):
+    """Per-Asset income/expense breakdown (pohyby hotovosti) for one
+    MonthlyEvaluation, from AssetCost.amount (already signed - positive is
+    an expense, negative is income, e.g. a scrap-metal sale). asset_id is
+    NULL for the "unlinked costs" bucket (AssetCost rows never matched to
+    an Asset). Fully replaced (delete+reinsert under one evaluation_id) on
+    every recompute, not accumulated."""
+
+    __tablename__ = "monthly_evaluation_asset_cashflows"
+    __table_args__ = (UniqueConstraint("evaluation_id", "asset_id", name="uq_monthly_eval_asset_cashflow"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    evaluation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("monthly_evaluations.id"), index=True)
+    asset_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("assets.id"))
+    income_czk: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0)
+    expense_czk: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0)

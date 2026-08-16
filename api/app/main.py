@@ -1,5 +1,6 @@
 import base64
-from datetime import date, datetime, timedelta
+import calendar
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import io
 import json
@@ -60,10 +61,13 @@ from .models import (
     DailyStatistic,
     ExchangeRate,
     LoanMovement,
+    MonthlyEvaluation,
+    MonthlyEvaluationAssetCashflow,
     Party,
     Portfolio,
     PortfolioAccess,
     PortfolioPosition,
+    PortfolioSelfParty,
     StockTransaction,
     WatchlistStock,
 )
@@ -220,6 +224,10 @@ class PortfolioAccessInput(BaseModel):
     grants: list[PortfolioAccessGrant] = []
 
 
+class SelfPartiesInput(BaseModel):
+    party_ids: list[uuid.UUID] = []
+
+
 def json_value(value: Any) -> Any:
     if isinstance(value, Decimal):
         return float(value)
@@ -273,6 +281,123 @@ def loan_movement_interest_plan(movement: LoanMovement) -> dict[str, Any]:
         borrowed_to=movement.planned_end_date,
     )
     return {str(year): json_value(value) for year, value in sorted(projection.items())}
+
+
+def amortization_interest_in_period(
+    pv: Decimal | None,
+    interest_rate: Decimal | None,
+    start_date: date | None,
+    loan_years: Decimal | None,
+    end_date: date | None,
+    period: str,
+) -> Decimal:
+    """Interest accrued within a single "YYYY-MM" period, via the same
+    amortization_schedule() used by the payment-schedule endpoints - an
+    exact period-by-period breakdown, not an annual/12 approximation.
+    Missing inputs (no rate/term) yield an empty schedule, contributing 0 -
+    same "missing inputs -> nothing" contract amortization_schedule already
+    has, no special-casing needed here."""
+    schedule = amortization_schedule(pv=pv, interest_rate=interest_rate, start_date=start_date, loan_years=loan_years, end_date=end_date)
+    return sum((p["interest"] for p in schedule if p["date"].strftime("%Y-%m") == period), Decimal("0"))
+
+
+def period_bounds(period: str) -> tuple[date, date]:
+    """(first day, last day) of a "YYYY-MM" period."""
+    year, month = int(period[:4]), int(period[5:7])
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, 1), date(year, month, last_day)
+
+
+def compute_monthly_evaluation(db: Session, portfolio_id: uuid.UUID, period: str) -> MonthlyEvaluation:
+    """Computes and upserts the Vyhodnocení for one Subjekt/period - see
+    MonthlyEvaluation's docstring in models.py for what each figure means.
+    Idempotent: rerunning for the same period overwrites that period's row
+    and fully replaces its MonthlyEvaluationAssetCashflow children, it never
+    accumulates across reruns."""
+    period_start, period_end = period_bounds(period)
+
+    self_party_ids = {
+        row.party_id for row in db.scalars(select(PortfolioSelfParty).where(PortfolioSelfParty.portfolio_id == portfolio_id)).all()
+    }
+
+    interest_received = Decimal("0")
+    interest_paid = Decimal("0")
+    for movement in db.scalars(select(LoanMovement).where(LoanMovement.portfolio_id == portfolio_id)).all():
+        lender_is_self = movement.lender_id in self_party_ids
+        borrower_is_self = movement.borrower_id in self_party_ids
+        if lender_is_self == borrower_is_self:
+            continue  # both self (internal transfer) or neither (not this Subjekt's business) -> excluded
+        interest = amortization_interest_in_period(
+            movement.amount, movement.interest_rate, movement.movement_date, None, movement.planned_end_date, period
+        )
+        if lender_is_self:
+            interest_received += interest
+        else:
+            interest_paid += interest
+
+    asset_types = {t.id: t for t in db.scalars(select(AssetType).where(AssetType.portfolio_id == portfolio_id)).all()}
+    for asset in db.scalars(select(Asset).where(Asset.portfolio_id == portfolio_id)).all():
+        asset_type = asset_types.get(asset.asset_type_id)
+        if asset_type is None or asset_type.calculation_mode != "debt_interest":
+            continue
+        interest_paid += amortization_interest_in_period(
+            asset.borrowed_amount, asset.interest_rate, asset.borrowed_from, asset.loan_years, asset.borrowed_to, period
+        )
+
+    realized_profit = db.scalar(
+        select(func.coalesce(func.sum(DailyStatistic.realized_profit_czk), 0))
+        .where(DailyStatistic.portfolio_id == portfolio_id, DailyStatistic.stat_date.between(period_start, period_end))
+    )
+    dividends = db.scalar(
+        select(func.coalesce(func.sum(DailyStatistic.dividends), 0))
+        .where(DailyStatistic.portfolio_id == portfolio_id, DailyStatistic.stat_date.between(period_start, period_end))
+    )
+    unrealized_end = db.scalar(
+        select(DailyStatistic.unrealized_profit_czk)
+        .where(DailyStatistic.portfolio_id == portfolio_id, DailyStatistic.stat_date <= period_end)
+        .order_by(desc(DailyStatistic.stat_date))
+        .limit(1)
+    )
+    unrealized_before = db.scalar(
+        select(DailyStatistic.unrealized_profit_czk)
+        .where(DailyStatistic.portfolio_id == portfolio_id, DailyStatistic.stat_date < period_start)
+        .order_by(desc(DailyStatistic.stat_date))
+        .limit(1)
+    )
+    unrealized_delta = (unrealized_end or Decimal("0")) - (unrealized_before or Decimal("0"))
+
+    evaluation = db.scalar(
+        select(MonthlyEvaluation).where(MonthlyEvaluation.portfolio_id == portfolio_id, MonthlyEvaluation.period == period)
+    )
+    if evaluation is None:
+        evaluation = MonthlyEvaluation(portfolio_id=portfolio_id, period=period)
+        db.add(evaluation)
+    evaluation.interest_received_czk = interest_received
+    evaluation.interest_paid_czk = interest_paid
+    evaluation.realized_profit_czk = realized_profit
+    evaluation.unrealized_profit_delta_czk = unrealized_delta
+    evaluation.dividends_czk = dividends
+    evaluation.computed_at = datetime.now(timezone.utc)
+    db.flush()
+
+    db.execute(delete(MonthlyEvaluationAssetCashflow).where(MonthlyEvaluationAssetCashflow.evaluation_id == evaluation.id))
+    cashflow_rows = db.execute(
+        select(
+            AssetCost.asset_id,
+            func.coalesce(func.sum(func.greatest(AssetCost.amount, 0)), 0).label("expense"),
+            func.coalesce(-func.sum(func.least(AssetCost.amount, 0)), 0).label("income"),
+        )
+        .where(AssetCost.portfolio_id == portfolio_id, AssetCost.cost_date.between(period_start, period_end))
+        .group_by(AssetCost.asset_id)
+    ).all()
+    for asset_id, expense, income in cashflow_rows:
+        db.add(
+            MonthlyEvaluationAssetCashflow(
+                evaluation_id=evaluation.id, asset_id=asset_id, income_czk=income, expense_czk=expense
+            )
+        )
+    db.commit()
+    return evaluation
 
 
 DEFAULT_ALERT_THRESHOLD_PCT = Decimal("10")
@@ -657,6 +782,17 @@ def ensure_schema_upgrades() -> None:
                 text(f"ALTER TABLE assets ADD CONSTRAINT {linked_asset_fk_name} FOREIGN KEY (linked_asset_id) REFERENCES assets (id)")
             )
 
+        # --- Vyhodnocení (monthly evaluation): realized-gain tracking on the
+        # pre-existing daily_statistics table. portfolio_self_parties/
+        # monthly_evaluations/monthly_evaluation_asset_cashflows are brand-new
+        # tables, create_all handles them - no manual DDL, and no backfill
+        # loop either: realized profit fills in automatically the next time
+        # "Přepočítat portfolio" runs (it always rebuilds daily_statistics
+        # from scratch), and MonthlyEvaluation rows only ever come from an
+        # explicit POST /evaluations/compute call.
+        conn.execute(text("ALTER TABLE daily_statistics ADD COLUMN IF NOT EXISTS realized_profit_czk NUMERIC(20, 2)"))
+        conn.execute(text("ALTER TABLE daily_statistics ADD COLUMN IF NOT EXISTS realized_profit_total_czk NUMERIC(20, 2)"))
+
     # The data-shape migration below (moving rows, splitting one row into
     # two, copying several fields) is simpler and far less error-prone as
     # ORM object manipulation than hand-written INSERT/UPDATE/DELETE SQL -
@@ -937,6 +1073,41 @@ def rename_portfolio(
     return portfolio_dict(row)
 
 
+def _portfolio_self_parties_dict(db: Session, portfolio_id: uuid.UUID) -> list[dict[str, Any]]:
+    party_ids = {row.party_id for row in db.scalars(select(PortfolioSelfParty).where(PortfolioSelfParty.portfolio_id == portfolio_id)).all()}
+    if not party_ids:
+        return []
+    parties = db.scalars(select(Party).where(Party.id.in_(party_ids)).order_by(Party.name)).all()
+    return [{"id": str(p.id), "name": p.name} for p in parties]
+
+
+@app.get("/portfolios/{portfolio_id}/self-parties")
+def list_portfolio_self_parties(
+    portfolio_id: uuid.UUID, _: str = Depends(require_admin), db: Session = Depends(get_db)
+) -> list[dict[str, Any]]:
+    if db.get(Portfolio, portfolio_id) is None:
+        raise HTTPException(status_code=404, detail="Subjekt nenalezen")
+    return _portfolio_self_parties_dict(db, portfolio_id)
+
+
+@app.put("/portfolios/{portfolio_id}/self-parties")
+def set_portfolio_self_parties(
+    portfolio_id: uuid.UUID, payload: SelfPartiesInput, _: str = Depends(require_admin), db: Session = Depends(get_db)
+) -> list[dict[str, Any]]:
+    """Bulk-replaces which Party identities count as "us" for this Subjekt -
+    used only by the Vyhodnocení report to classify loan interest as
+    received/paid vs. excluded. See PortfolioSelfParty's docstring."""
+    if db.get(Portfolio, portfolio_id) is None:
+        raise HTTPException(status_code=404, detail="Subjekt nenalezen")
+    valid_party_ids = {row.id for row in db.scalars(select(Party)).all()}
+    db.execute(delete(PortfolioSelfParty).where(PortfolioSelfParty.portfolio_id == portfolio_id))
+    for party_id in payload.party_ids:
+        if party_id in valid_party_ids:
+            db.add(PortfolioSelfParty(portfolio_id=portfolio_id, party_id=party_id))
+    db.commit()
+    return _portfolio_self_parties_dict(db, portfolio_id)
+
+
 @app.put("/users/{target_username}/portfolio-access")
 def set_user_portfolio_access(
     target_username: str, payload: PortfolioAccessInput, _: str = Depends(require_admin), db: Session = Depends(get_db)
@@ -1012,6 +1183,50 @@ def summary(
             "exchange_rates": db.scalar(select(func.count()).select_from(ExchangeRate)),
         },
     }
+
+
+@app.post("/evaluations/compute")
+def compute_evaluation(
+    period: str | None = Query(None, description='"YYYY-MM", defaults to the current month'),
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("evaluations")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    period = period or date.today().strftime("%Y-%m")
+    evaluation = compute_monthly_evaluation(db, portfolio_id, period)
+    return _evaluation_dict(db, evaluation)
+
+
+def _evaluation_dict(db: Session, evaluation: MonthlyEvaluation) -> dict[str, Any]:
+    assets_by_id = {a.id: a for a in db.scalars(select(Asset).where(Asset.portfolio_id == evaluation.portfolio_id)).all()}
+    cashflows = db.scalars(
+        select(MonthlyEvaluationAssetCashflow).where(MonthlyEvaluationAssetCashflow.evaluation_id == evaluation.id)
+    ).all()
+    latest_stat_date = db.scalar(
+        select(func.max(DailyStatistic.stat_date)).where(DailyStatistic.portfolio_id == evaluation.portfolio_id)
+    )
+    return model_dict(evaluation) | {
+        "stock_data_as_of": latest_stat_date.isoformat() if latest_stat_date else None,
+        "asset_cashflows": [
+            {
+                "asset_id": str(row.asset_id) if row.asset_id else None,
+                "asset_code": assets_by_id[row.asset_id].code if row.asset_id in assets_by_id else None,
+                "asset_name": assets_by_id[row.asset_id].name if row.asset_id in assets_by_id else "Bez majetku",
+                "income_czk": json_value(row.income_czk),
+                "expense_czk": json_value(row.expense_czk),
+            }
+            for row in cashflows
+        ],
+    }
+
+
+@app.get("/evaluations")
+def list_evaluations(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("evaluations")), db: Session = Depends(get_db)
+) -> list[dict[str, Any]]:
+    evaluations = db.scalars(
+        select(MonthlyEvaluation).where(MonthlyEvaluation.portfolio_id == portfolio_id).order_by(desc(MonthlyEvaluation.period))
+    ).all()
+    return [_evaluation_dict(db, evaluation) for evaluation in evaluations]
 
 
 @app.get("/loans/movements")
@@ -1509,6 +1724,15 @@ def delete_asset_type(type_id: uuid.UUID, _: str = Depends(require_admin), db: S
     db.delete(row)
     db.commit()
     return {"status": "deleted"}
+
+
+@app.get("/parties")
+def list_parties(_: str = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    """Every Party regardless of kind - admin-only, used by the Subjekty
+    tab's "Vlastní jména" picker (PortfolioSelfParty can reference any kind,
+    e.g. an owner-kind Party as well as a lender/borrower-kind one)."""
+    rows = db.scalars(select(Party).order_by(Party.name)).all()
+    return [{"id": str(row.id), "name": row.name, "kind": row.kind} for row in rows]
 
 
 @app.get("/parties/payers")

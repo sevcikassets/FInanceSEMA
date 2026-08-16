@@ -17,6 +17,7 @@ ALL_AGENDAS = [
     "costs",
     "categories",
     "loans",
+    "evaluations",
     "transactions",
     "watchlist",
     "stats",

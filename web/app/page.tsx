@@ -19,6 +19,7 @@ import {
   Menu,
   PanelLeftClose,
   PanelLeftOpen,
+  PieChart,
   RefreshCw,
   Save,
   Settings as SettingsIcon,
@@ -71,6 +72,25 @@ type LoanBalances = {
   total_outstanding: number;
 };
 
+type Evaluation = {
+  id: string;
+  period: string;
+  computed_at: string;
+  interest_received_czk: number;
+  interest_paid_czk: number;
+  realized_profit_czk: number;
+  unrealized_profit_delta_czk: number;
+  dividends_czk: number;
+  stock_data_as_of: string | null;
+  asset_cashflows: {
+    asset_id: string | null;
+    asset_code: string | null;
+    asset_name: string;
+    income_czk: number;
+    expense_czk: number;
+  }[];
+};
+
 type TickerHistoryResult = {
   ticker: string;
   currency: string | null;
@@ -113,6 +133,7 @@ const tabs = [
   { id: "costs", label: "Náklady", icon: WalletCards, endpoint: "/assets/costs" },
   { id: "categories", label: "Kategorie nákladů", icon: Tag, endpoint: "/assets/cost-categories" },
   { id: "loans", label: "Půjčky", icon: Coins, endpoint: "/loans/movements" },
+  { id: "evaluations", label: "Vyhodnocení", icon: PieChart, endpoint: "/evaluations" },
   { id: "transactions", label: "Transakce", icon: FileSpreadsheet, endpoint: "/stocks/transactions" },
   { id: "watchlist", label: "Sledované", icon: ListChecks, endpoint: "/stocks/watchlist" },
   { id: "stats", label: "Denní statistika", icon: ShieldCheck, endpoint: "/stocks/statistics" },
@@ -132,6 +153,7 @@ const tabs = [
 const navGroups = [
   { label: "Majetek", items: ["assets", "asset_types", "payers", "costs", "categories"] },
   { label: "Půjčky", items: ["loans"] },
+  { label: "Vyhodnocení", items: ["evaluations"] },
   { label: "Akcie", items: ["transactions", "watchlist", "stats", "portfolio", "history", "alerts", "charts"] },
   { label: "Nastavení", items: ["rates", "subjects", "users", "settings"] },
 ];
@@ -145,7 +167,18 @@ const tabsById = Object.fromEntries(tabs.map((tab) => [tab.id, tab]));
 const STOCK_OVERVIEW_TABS = ["transactions", "watchlist", "portfolio"];
 
 // Tabs that render their own custom panel instead of the generic data table.
-const NON_TABLE_TABS = new Set(["assets", "history", "alerts", "charts", "settings", "subjects", "categories", "asset_types", "payers"]);
+const NON_TABLE_TABS = new Set([
+  "assets",
+  "history",
+  "alerts",
+  "charts",
+  "settings",
+  "subjects",
+  "categories",
+  "asset_types",
+  "payers",
+  "evaluations",
+]);
 
 // "rates" (shared CNB exchange-rate history), "users" (user management) and
 // "subjects" (Subjekt management) apply app-wide and stay governed by
@@ -973,6 +1006,11 @@ export default function Page() {
   const [loanStatus, setLoanStatus] = useState<string | null>(null);
   const [loanBalances, setLoanBalances] = useState<LoanBalances | null>(null);
   const [showSettledLoans, setShowSettledLoans] = useState(false);
+  const [evaluations, setEvaluations] = useState<Evaluation[]>([]);
+  const [evaluationPeriod, setEvaluationPeriod] = useState(new Date().toISOString().slice(0, 7));
+  const [evaluationBusy, setEvaluationBusy] = useState(false);
+  const [evaluationStatus, setEvaluationStatus] = useState<string | null>(null);
+  const [expandedEvaluations, setExpandedEvaluations] = useState<Set<string>>(() => new Set());
   const [showCostDetail, setShowCostDetail] = useState(true);
   const [costAssetFilter, setCostAssetFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -1010,6 +1048,11 @@ export default function Page() {
   const [portfolioStatus, setPortfolioStatus] = useState<string | null>(null);
   const [renamingPortfolioId, setRenamingPortfolioId] = useState<string | null>(null);
   const [renamePortfolioName, setRenamePortfolioName] = useState("");
+  const [editingSelfPartiesPortfolioId, setEditingSelfPartiesPortfolioId] = useState<string | null>(null);
+  const [allParties, setAllParties] = useState<Row[]>([]);
+  const [selfPartyIds, setSelfPartyIds] = useState<Set<string>>(() => new Set());
+  const [selfPartiesBusy, setSelfPartiesBusy] = useState(false);
+  const [selfPartiesStatus, setSelfPartiesStatus] = useState<string | null>(null);
   const [editingAccessUsername, setEditingAccessUsername] = useState<string | null>(null);
   const [accessDraft, setAccessDraft] = useState<Record<string, string[]>>({});
   const [accessBusy, setAccessBusy] = useState(false);
@@ -1268,10 +1311,15 @@ export default function Page() {
       // ("/stocks/alerts", "/auth/me") returns a single object, not an array
       // - stuffing that into `rows` used to crash every unconditional
       // `rows.map` elsewhere (e.g. costAssets) as soon as you opened the tab.
-      const needsRows = activeTab !== "alerts" && activeTab !== "settings" && activeTab !== "subjects";
+      const needsRows = activeTab !== "alerts" && activeTab !== "settings" && activeTab !== "subjects" && activeTab !== "evaluations";
       // Both "users" (per-user Subjekt-access editor) and "subjects" (create/
       // rename Subjekty themselves) need the full Subjekt list.
       const needsPortfolioList = (activeTab === "users" || activeTab === "subjects") && Boolean(currentUser?.is_admin);
+      // The Subjekty tab's "Vlastní jména" picker needs every Party
+      // regardless of kind - not present in `rows` (that tab uses
+      // needsPortfolioList/`portfolios`, not the generic rows fetch).
+      const needsAllParties = activeTab === "subjects" && Boolean(currentUser?.is_admin);
+      const needsEvaluations = activeTab === "evaluations";
       // The costs create/edit form needs the full asset list (for the asset
       // picker) and the cost-category dictionary (for the category picker) -
       // neither is present in `rows` while on the "costs" tab, since that's
@@ -1289,9 +1337,11 @@ export default function Page() {
       if (needsStockOverview) requests.push(api(withPortfolio("/stocks/overview")));
       if (needsAlerts) requests.push(api(withPortfolio("/stocks/alerts")));
       if (needsPortfolioList) requests.push(api("/portfolios"));
+      if (needsAllParties) requests.push(api("/parties"));
       if (needsCostExtras) requests.push(api(withPortfolio("/assets")), api(withPortfolio("/assets/cost-categories")));
       if (needsAssetExtras) requests.push(api(withPortfolio("/assets/asset-types")));
       if (needsLoanBalances) requests.push(api(withPortfolio("/loans/balances")));
+      if (needsEvaluations) requests.push(api(withPortfolio("/evaluations")));
       const [summaryData, ...rest] = await Promise.all(requests);
       if (latestLoadRequestRef.current !== requestId) return;
       setSummary(summaryData as Summary | null);
@@ -1301,6 +1351,7 @@ export default function Page() {
       if (needsStockOverview) setStockOverview(rest[restIndex++] as StockOverview);
       if (needsAlerts) setAlerts(rest[restIndex++] as Alerts);
       if (needsPortfolioList) setPortfolios(rest[restIndex++] as { id: string; name: string }[]);
+      if (needsAllParties) setAllParties(rest[restIndex++] as Row[]);
       if (needsCostExtras) {
         setCostAssetsList(rest[restIndex++] as Row[]);
         setCostCategoriesList(rest[restIndex++] as Row[]);
@@ -1309,6 +1360,7 @@ export default function Page() {
         setAssetTypesList(rest[restIndex++] as Row[]);
       }
       if (needsLoanBalances) setLoanBalances(rest[restIndex++] as LoanBalances);
+      if (needsEvaluations) setEvaluations(rest[restIndex++] as Evaluation[]);
     } catch (err) {
       if (latestLoadRequestRef.current !== requestId) return;
       setError(err instanceof Error ? err.message : "Nepodařilo se načíst data");
@@ -1600,6 +1652,43 @@ export default function Page() {
     }
   }
 
+  async function openSelfPartiesEditor(portfolioId: string) {
+    setEditingSelfPartiesPortfolioId(portfolioId);
+    setSelfPartiesStatus(null);
+    try {
+      const current = (await api(`/portfolios/${portfolioId}/self-parties`)) as Row[];
+      setSelfPartyIds(new Set(current.map((party) => String(party.id))));
+    } catch (err) {
+      setSelfPartiesStatus(err instanceof Error ? err.message : "Nepodařilo se načíst vlastní jména");
+    }
+  }
+
+  function toggleSelfParty(partyId: string) {
+    setSelfPartyIds((current) => {
+      const next = new Set(current);
+      if (next.has(partyId)) next.delete(partyId);
+      else next.add(partyId);
+      return next;
+    });
+  }
+
+  async function saveSelfParties() {
+    if (!editingSelfPartiesPortfolioId) return;
+    setSelfPartiesBusy(true);
+    setSelfPartiesStatus(null);
+    try {
+      await api(`/portfolios/${editingSelfPartiesPortfolioId}/self-parties`, {
+        method: "PUT",
+        body: JSON.stringify({ party_ids: [...selfPartyIds] }),
+      });
+      setEditingSelfPartiesPortfolioId(null);
+    } catch (err) {
+      setSelfPartiesStatus(err instanceof Error ? err.message : "Vlastní jména se nepodařilo uložit");
+    } finally {
+      setSelfPartiesBusy(false);
+    }
+  }
+
   function openAccessEditor(row: Row) {
     const username = String(row.username);
     const existing = Array.isArray(row.portfolios) ? (row.portfolios as unknown as PortfolioGrant[]) : [];
@@ -1865,6 +1954,30 @@ export default function Page() {
     } finally {
       setLoanBusy(false);
     }
+  }
+
+  async function computeEvaluation(event: React.FormEvent) {
+    event.preventDefault();
+    setEvaluationBusy(true);
+    setEvaluationStatus(null);
+    try {
+      await api(withPortfolio(`/evaluations/compute?period=${evaluationPeriod}`), { method: "POST" });
+      setExpandedEvaluations((current) => new Set(current).add(evaluationPeriod));
+      await loadAll();
+    } catch (err) {
+      setEvaluationStatus(err instanceof Error ? err.message : "Vyhodnocení se nepodařilo spočítat");
+    } finally {
+      setEvaluationBusy(false);
+    }
+  }
+
+  function toggleEvaluation(period: string) {
+    setExpandedEvaluations((current) => {
+      const next = new Set(current);
+      if (next.has(period)) next.delete(period);
+      else next.add(period);
+      return next;
+    });
   }
 
   // Bypasses the shared api() helper on purpose - it always forces
@@ -2617,6 +2730,120 @@ export default function Page() {
           </section>
         )}
 
+        {activeTab === "evaluations" && (
+          <section className="work-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Vyhodnocení</h2>
+                <p>
+                  Měsíční přehled výsledkových operací a pohybů hotovosti u jednotlivých majetků. Počítá se na
+                  vyžádání a ukládá se - nepočítá se znovu při každém zobrazení.
+                </p>
+              </div>
+            </div>
+            <form className="rate-form" onSubmit={computeEvaluation}>
+              <label>
+                Měsíc
+                <input type="month" value={evaluationPeriod} onChange={(event) => setEvaluationPeriod(event.target.value)} />
+              </label>
+              <button className="action-button" type="submit" disabled={evaluationBusy}>
+                <Calculator size={16} />
+                <span>{evaluationBusy ? "Počítám…" : "Vypočítat"}</span>
+              </button>
+            </form>
+            {evaluationStatus && <div className="notice">{evaluationStatus}</div>}
+            <div className="evaluation-list">
+              {evaluations.map((evaluation) => {
+                const expanded = expandedEvaluations.has(evaluation.period);
+                const net =
+                  evaluation.interest_received_czk -
+                  evaluation.interest_paid_czk +
+                  evaluation.realized_profit_czk +
+                  evaluation.unrealized_profit_delta_czk +
+                  evaluation.dividends_czk;
+                const stockDataStale = Boolean(evaluation.stock_data_as_of) && evaluation.stock_data_as_of!.slice(0, 7) < evaluation.period;
+                return (
+                  <div className="evaluation-card" key={evaluation.id}>
+                    <button type="button" className="evaluation-card-header" onClick={() => toggleEvaluation(evaluation.period)}>
+                      {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                      <span>{monthLabel(`${evaluation.period}-01`)}</span>
+                      <span className={net >= 0 ? "positive" : "negative"}>{money(net)}</span>
+                    </button>
+                    {expanded && (
+                      <div className="evaluation-card-body">
+                        {stockDataStale && (
+                          <p className="field-hint">
+                            Data o akciích jsou aktuální k {evaluation.stock_data_as_of} - pro přesnost tohoto měsíce
+                            nejdřív přepočítej portfolio akcií.
+                          </p>
+                        )}
+                        <div className="mini-grids">
+                          <div>
+                            <h3>Výsledkové operace</h3>
+                            <p>
+                              <span>Úroky přijaté</span>
+                              <strong>{money(evaluation.interest_received_czk)}</strong>
+                            </p>
+                            <p>
+                              <span>Úroky zaplacené</span>
+                              <strong>{money(evaluation.interest_paid_czk)}</strong>
+                            </p>
+                            <p>
+                              <span>Realizovaný zisk/ztráta akcie</span>
+                              <strong className={evaluation.realized_profit_czk >= 0 ? "positive" : "negative"}>
+                                {money(evaluation.realized_profit_czk)}
+                              </strong>
+                            </p>
+                            <p>
+                              <span>Nerealizovaný zisk/ztráta akcie (změna)</span>
+                              <strong className={evaluation.unrealized_profit_delta_czk >= 0 ? "positive" : "negative"}>
+                                {money(evaluation.unrealized_profit_delta_czk)}
+                              </strong>
+                            </p>
+                            <p>
+                              <span>Dividendy</span>
+                              <strong>{money(evaluation.dividends_czk)}</strong>
+                            </p>
+                          </div>
+                        </div>
+                        <h3>Pohyby hotovosti podle majetku</h3>
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>Majetek</th>
+                              <th>Příjmy</th>
+                              <th>Výdaje</th>
+                              <th>Čistý pohyb</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {evaluation.asset_cashflows.map((cashflow) => (
+                              <tr key={cashflow.asset_id || "none"}>
+                                <td>{cashflow.asset_code ? `${cashflow.asset_code} — ${cashflow.asset_name}` : cashflow.asset_name}</td>
+                                <td className="numeric-cell">{money(cashflow.income_czk)}</td>
+                                <td className="numeric-cell">{money(cashflow.expense_czk)}</td>
+                                <td className="numeric-cell">{money(cashflow.income_czk - cashflow.expense_czk)}</td>
+                              </tr>
+                            ))}
+                            {evaluation.asset_cashflows.length === 0 && (
+                              <tr>
+                                <td colSpan={4} className="alert-empty">
+                                  Žádné náklady v tomto měsíci.
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {evaluations.length === 0 && <p className="alert-empty">Zatím žádná vyhodnocení - vyber měsíc a klikni na Vypočítat.</p>}
+            </div>
+          </section>
+        )}
+
         {activeTab === "costs" && (
           <section className="work-panel compact-panel">
             <div className="panel-header">
@@ -3264,6 +3491,9 @@ export default function Page() {
                     <button type="button" className="link-button" onClick={() => startRenamingPortfolio(portfolio)}>
                       Přejmenovat
                     </button>
+                    <button type="button" className="link-button" onClick={() => openSelfPartiesEditor(portfolio.id)}>
+                      Vlastní jména
+                    </button>
                   </div>
                 ),
               )}
@@ -3278,6 +3508,37 @@ export default function Page() {
                 <span>Vytvořit subjekt</span>
               </button>
             </form>
+            {editingSelfPartiesPortfolioId && (
+              <div className="access-editor">
+                <p>
+                  Vlastní jména subjektu <strong>{portfolios.find((p) => p.id === editingSelfPartiesPortfolioId)?.name}</strong>:
+                  jména označená zde se ve Vyhodnocení počítají jako "my" - půjčka mezi dvěma vlastními jmény se vynechá
+                  (vnitřní přesun), půjčka kde ani jedna strana není vlastní jméno se také vynechá.
+                </p>
+                <div className="permissions-grid">
+                  {allParties.map((party) => (
+                    <label className="checkbox-row" key={String(party.id)}>
+                      <input
+                        type="checkbox"
+                        checked={selfPartyIds.has(String(party.id))}
+                        onChange={() => toggleSelfParty(String(party.id))}
+                      />
+                      {String(party.name)}
+                    </label>
+                  ))}
+                </div>
+                {selfPartiesStatus && <div className="success-notice">{selfPartiesStatus}</div>}
+                <div className="stock-actions">
+                  <button className="action-button" onClick={saveSelfParties} disabled={selfPartiesBusy}>
+                    <Save size={16} />
+                    <span>Uložit vlastní jména</span>
+                  </button>
+                  <button type="button" className="link-button" onClick={() => setEditingSelfPartiesPortfolioId(null)}>
+                    Zrušit
+                  </button>
+                </div>
+              </div>
+            )}
           </section>
         )}
 
