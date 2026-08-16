@@ -74,6 +74,7 @@ from .models import (
 from .stock_services import (
     build_ticker_history,
     compute_alerts,
+    fetch_yahoo_history,
     import_patria_trades,
     movement_is_buy,
     movement_is_sell,
@@ -2290,6 +2291,31 @@ def stock_statistics(
         select(DailyStatistic).where(DailyStatistic.portfolio_id == portfolio_id).order_by(desc(DailyStatistic.stat_date)).limit(200)
     ).all()
     return [model_dict(row) for row in rows]
+
+
+@app.get("/stocks/benchmark")
+def stock_benchmark(
+    ticker: str = "^GSPC",
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("charts")),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Historical closing prices for a benchmark ticker (default S&P 500),
+    over the same window as /stocks/statistics (its most recent 200 days) -
+    lets the Grafy tab plot portfolio profit % against an index without the
+    frontend needing to know anything about Yahoo Finance."""
+    stat_dates = db.scalars(
+        select(DailyStatistic.stat_date)
+        .where(DailyStatistic.portfolio_id == portfolio_id)
+        .order_by(desc(DailyStatistic.stat_date))
+        .limit(200)
+    ).all()
+    if not stat_dates:
+        return []
+    history = fetch_yahoo_history(ticker, min(stat_dates), max(stat_dates))
+    return [
+        {"date": point_date.isoformat(), "close": json_value(point_close)}
+        for point_date, point_close in sorted(history.get("points") or [])
+    ]
 
 
 @app.get("/stocks/overview")

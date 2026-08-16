@@ -814,6 +814,10 @@ function money(value: number) {
   return new Intl.NumberFormat("cs-CZ", { style: "currency", currency: "CZK", maximumFractionDigits: 0 }).format(value || 0);
 }
 
+function chartPercent(value: number) {
+  return new Intl.NumberFormat("cs-CZ", { style: "percent", maximumFractionDigits: 1 }).format(value || 0);
+}
+
 function rateForCurrency(latestRates: LatestRates | null, currency: string) {
   return latestRates?.rates.find((rate) => String(rate.currency) === currency)?.rate_to_czk ?? null;
 }
@@ -1036,6 +1040,7 @@ export default function Page() {
   const [latestRates, setLatestRates] = useState<LatestRates | null>(null);
   const [stockOverview, setStockOverview] = useState<StockOverview | null>(null);
   const [alerts, setAlerts] = useState<Alerts | null>(null);
+  const [benchmark, setBenchmark] = useState<Row[]>([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [expandedStatMonths, setExpandedStatMonths] = useState<Set<string>>(() => new Set());
@@ -1258,8 +1263,38 @@ export default function Page() {
         total_value_czk: numberValue(row.total_value_czk),
         unrealized_profit_czk: numberValue(row.unrealized_profit_czk),
         dividends_total: numberValue(row.dividends_total),
+        profit_pct: numberValue(row.profit_pct),
       }));
   }, [rows, activeTab]);
+
+  // Portfolio profit % (already computed server-side, DailyStatistic.profit_pct)
+  // against the S&P 500's own % change over the same window - both rebased to
+  // 0% at the first day the portfolio chart shows, so they're readable as
+  // "which one grew faster from here", not two independent absolute levels.
+  const profitComparisonData = useMemo(() => {
+    if (activeTab !== "charts" || chartData.length === 0) return [];
+    const benchmarkPoints = benchmark
+      .map((row) => ({ date: String(row.date || ""), close: numberValue(row.close) }))
+      .filter((point) => point.date && point.close)
+      .sort((a, b) => a.date.localeCompare(b.date));
+    function priceAtOrBefore(targetDate: string): number | null {
+      let result: number | null = null;
+      for (const point of benchmarkPoints) {
+        if (point.date > targetDate) break;
+        result = point.close;
+      }
+      return result;
+    }
+    const basePrice = priceAtOrBefore(chartData[0].date);
+    return chartData.map((point) => {
+      const price = priceAtOrBefore(point.date);
+      return {
+        date: point.date,
+        profit_pct: point.profit_pct,
+        sp500_pct: basePrice && price ? price / basePrice - 1 : 0,
+      };
+    });
+  }, [chartData, benchmark, activeTab]);
 
   function toggleStatMonth(monthKey: string) {
     setExpandedStatMonths((current) => {
@@ -1407,6 +1442,7 @@ export default function Page() {
       // is needed for it - see "Plátci", which manages cost payers instead.
       const needsAssetExtras = activeTab === "assets";
       const needsLoanBalances = activeTab === "loans";
+      const needsBenchmark = activeTab === "charts";
       const requests: Promise<unknown>[] = [activePortfolioId ? api(withPortfolio("/summary")) : Promise.resolve(null)];
       if (needsRows) requests.push(api(withPortfolio(active.endpoint)));
       if (activeTab === "rates") requests.push(api("/rates/latest"));
@@ -1418,6 +1454,7 @@ export default function Page() {
       if (needsAssetExtras) requests.push(api(withPortfolio("/assets/asset-types")));
       if (needsLoanBalances) requests.push(api(withPortfolio("/loans/balances")));
       if (needsEvaluations) requests.push(api(withPortfolio("/evaluations")));
+      if (needsBenchmark) requests.push(api(withPortfolio("/stocks/benchmark")));
       const [summaryData, ...rest] = await Promise.all(requests);
       if (latestLoadRequestRef.current !== requestId) return;
       setSummary(summaryData as Summary | null);
@@ -1437,6 +1474,7 @@ export default function Page() {
       }
       if (needsLoanBalances) setLoanBalances(rest[restIndex++] as LoanBalances);
       if (needsEvaluations) setEvaluations(rest[restIndex++] as Evaluation[]);
+      if (needsBenchmark) setBenchmark(rest[restIndex++] as Row[]);
     } catch (err) {
       if (latestLoadRequestRef.current !== requestId) return;
       setError(err instanceof Error ? err.message : "Nepodařilo se načíst data");
@@ -2220,6 +2258,180 @@ export default function Page() {
     } finally {
       setCostAttachmentBusy(null);
     }
+  }
+
+  function renderAssetEditorForm() {
+    return (
+      <div className="access-editor">
+        <p>{editingAssetId === "__new__" ? "Nový majetek:" : "Úprava majetku:"}</p>
+        <form className="cost-form-grid" onSubmit={saveAssetDraft}>
+          <label>
+            Kód
+            <input value={assetDraft.code} onChange={(event) => setAssetDraft((value) => ({ ...value, code: event.target.value }))} required />
+          </label>
+          <label>
+            Název
+            <input value={assetDraft.name} onChange={(event) => setAssetDraft((value) => ({ ...value, name: event.target.value }))} required />
+          </label>
+          <label>
+            Vlastník
+            <input value={assetDraft.owner} onChange={(event) => setAssetDraft((value) => ({ ...value, owner: event.target.value }))} />
+          </label>
+          <label>
+            Typ majetku
+            <select
+              value={assetDraft.asset_type_id}
+              onChange={(event) => setAssetDraft((value) => ({ ...value, asset_type_id: event.target.value }))}
+            >
+              <option value="">Bez typu</option>
+              {assetTypesList.map((type) => (
+                <option value={String(type.id)} key={String(type.id)}>
+                  {String(type.name)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Hodnota
+            <input
+              type="number"
+              step="0.01"
+              value={assetDraft.total_value}
+              onChange={(event) => setAssetDraft((value) => ({ ...value, total_value: event.target.value }))}
+            />
+          </label>
+          <label>
+            Vlastní zdroje
+            <input
+              type="number"
+              step="0.01"
+              value={assetDraft.own_funds}
+              onChange={(event) => setAssetDraft((value) => ({ ...value, own_funds: event.target.value }))}
+            />
+          </label>
+          {(assetTypeById(assetDraft.asset_type_id, assetTypesList)?.calculation_mode === "debt_interest" ||
+            assetDraft.linked_asset_id ||
+            assetDraft.borrowed_amount ||
+            assetDraft.interest_rate) && (
+            <>
+              <label>
+                Navázaný majetek (financuje)
+                <select
+                  value={assetDraft.linked_asset_id}
+                  onChange={(event) => setAssetDraft((value) => ({ ...value, linked_asset_id: event.target.value }))}
+                >
+                  <option value="">Bez vazby</option>
+                  {rows
+                    .filter((row) => String(row.id) !== editingAssetId)
+                    .map((row) => (
+                      <option value={String(row.id)} key={String(row.id)}>
+                        {String(row.code)} — {String(row.name)}
+                      </option>
+                    ))}
+                </select>
+              </label>
+              <label>
+                Výše úvěru
+                <input
+                  type="number"
+                  step="0.01"
+                  value={assetDraft.borrowed_amount}
+                  onChange={(event) => setAssetDraft((value) => ({ ...value, borrowed_amount: event.target.value }))}
+                />
+              </label>
+              <label>
+                Úroková sazba
+                <input
+                  type="number"
+                  step="0.0001"
+                  value={assetDraft.interest_rate}
+                  onChange={(event) => setAssetDraft((value) => ({ ...value, interest_rate: event.target.value }))}
+                />
+              </label>
+              <label>
+                Délka úvěru (roky)
+                <input
+                  type="number"
+                  step="0.5"
+                  value={assetDraft.loan_years}
+                  onChange={(event) => setAssetDraft((value) => ({ ...value, loan_years: event.target.value }))}
+                />
+              </label>
+              <label>
+                Datum čerpání
+                <input
+                  type="date"
+                  value={assetDraft.borrowed_from}
+                  onChange={(event) => setAssetDraft((value) => ({ ...value, borrowed_from: event.target.value }))}
+                />
+              </label>
+              <label>
+                Datum splacení
+                <input
+                  type="date"
+                  value={assetDraft.borrowed_to}
+                  onChange={(event) => setAssetDraft((value) => ({ ...value, borrowed_to: event.target.value }))}
+                />
+              </label>
+              <label>
+                Datum první splátky
+                <input
+                  type="date"
+                  value={assetDraft.first_payment_date}
+                  onChange={(event) => setAssetDraft((value) => ({ ...value, first_payment_date: event.target.value }))}
+                />
+                <span className="field-hint">
+                  Vyplňte jen pokud se první splátka liší od ostatních (bude počítána jako čistý úrok).
+                </span>
+              </label>
+              <label>
+                Výše první splátky
+                <input
+                  type="number"
+                  step="0.01"
+                  value={assetDraft.first_payment_amount}
+                  onChange={(event) => setAssetDraft((value) => ({ ...value, first_payment_amount: event.target.value }))}
+                />
+              </label>
+              <label>
+                Věřitel
+                <input
+                  value={assetDraft.lender_name}
+                  onChange={(event) => setAssetDraft((value) => ({ ...value, lender_name: event.target.value }))}
+                />
+              </label>
+              <label>
+                Fixace do
+                <input
+                  type="date"
+                  value={assetDraft.fixed_until}
+                  onChange={(event) => setAssetDraft((value) => ({ ...value, fixed_until: event.target.value }))}
+                />
+              </label>
+              <label>
+                Splátka
+                <input
+                  type="number"
+                  step="0.01"
+                  value={assetDraft.payment}
+                  onChange={(event) => setAssetDraft((value) => ({ ...value, payment: event.target.value }))}
+                />
+              </label>
+            </>
+          )}
+          {assetStatus && <div className="success-notice cost-form-note">{assetStatus}</div>}
+          <div className="stock-actions cost-form-note">
+            <button className="action-button" type="submit" disabled={assetBusy || !assetDraft.code.trim() || !assetDraft.name.trim()}>
+              <Save size={16} />
+              <span>Uložit majetek</span>
+            </button>
+            <button type="button" className="link-button" onClick={closeAssetEditor}>
+              Zrušit
+            </button>
+          </div>
+        </form>
+      </div>
+    );
   }
 
   function openNewAssetForm() {
@@ -4263,6 +4475,17 @@ export default function Page() {
                   formatValue={money}
                   large
                 />
+                <PortfolioChart
+                  title="Zisk portfolia (%) vs S&P 500"
+                  mode="lines"
+                  data={profitComparisonData}
+                  series={[
+                    { key: "profit_pct", label: "Portfolio", color: "#2a78d6" },
+                    { key: "sp500_pct", label: "S&P 500", color: "#eb6834" },
+                  ]}
+                  formatValue={chartPercent}
+                  large
+                />
               </div>
             )}
           </section>
@@ -4279,177 +4502,7 @@ export default function Page() {
                 <span>+ Přidat majetek</span>
               </button>
             </div>
-            {editingAssetId && (
-              <div className="access-editor">
-                <p>{editingAssetId === "__new__" ? "Nový majetek:" : "Úprava majetku:"}</p>
-                <form className="cost-form-grid" onSubmit={saveAssetDraft}>
-                  <label>
-                    Kód
-                    <input value={assetDraft.code} onChange={(event) => setAssetDraft((value) => ({ ...value, code: event.target.value }))} required />
-                  </label>
-                  <label>
-                    Název
-                    <input value={assetDraft.name} onChange={(event) => setAssetDraft((value) => ({ ...value, name: event.target.value }))} required />
-                  </label>
-                  <label>
-                    Vlastník
-                    <input value={assetDraft.owner} onChange={(event) => setAssetDraft((value) => ({ ...value, owner: event.target.value }))} />
-                  </label>
-                  <label>
-                    Typ majetku
-                    <select
-                      value={assetDraft.asset_type_id}
-                      onChange={(event) => setAssetDraft((value) => ({ ...value, asset_type_id: event.target.value }))}
-                    >
-                      <option value="">Bez typu</option>
-                      {assetTypesList.map((type) => (
-                        <option value={String(type.id)} key={String(type.id)}>
-                          {String(type.name)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    Hodnota
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={assetDraft.total_value}
-                      onChange={(event) => setAssetDraft((value) => ({ ...value, total_value: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Vlastní zdroje
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={assetDraft.own_funds}
-                      onChange={(event) => setAssetDraft((value) => ({ ...value, own_funds: event.target.value }))}
-                    />
-                  </label>
-                  {(assetTypeById(assetDraft.asset_type_id, assetTypesList)?.calculation_mode === "debt_interest" ||
-                    assetDraft.linked_asset_id ||
-                    assetDraft.borrowed_amount ||
-                    assetDraft.interest_rate) && (
-                    <>
-                      <label>
-                        Navázaný majetek (financuje)
-                        <select
-                          value={assetDraft.linked_asset_id}
-                          onChange={(event) => setAssetDraft((value) => ({ ...value, linked_asset_id: event.target.value }))}
-                        >
-                          <option value="">Bez vazby</option>
-                          {rows
-                            .filter((row) => String(row.id) !== editingAssetId)
-                            .map((row) => (
-                              <option value={String(row.id)} key={String(row.id)}>
-                                {String(row.code)} — {String(row.name)}
-                              </option>
-                            ))}
-                        </select>
-                      </label>
-                      <label>
-                        Výše úvěru
-                        <input
-                          type="number"
-                          step="0.01"
-                          value={assetDraft.borrowed_amount}
-                          onChange={(event) => setAssetDraft((value) => ({ ...value, borrowed_amount: event.target.value }))}
-                        />
-                      </label>
-                      <label>
-                        Úroková sazba
-                        <input
-                          type="number"
-                          step="0.0001"
-                          value={assetDraft.interest_rate}
-                          onChange={(event) => setAssetDraft((value) => ({ ...value, interest_rate: event.target.value }))}
-                        />
-                      </label>
-                      <label>
-                        Délka úvěru (roky)
-                        <input
-                          type="number"
-                          step="0.5"
-                          value={assetDraft.loan_years}
-                          onChange={(event) => setAssetDraft((value) => ({ ...value, loan_years: event.target.value }))}
-                        />
-                      </label>
-                      <label>
-                        Datum čerpání
-                        <input
-                          type="date"
-                          value={assetDraft.borrowed_from}
-                          onChange={(event) => setAssetDraft((value) => ({ ...value, borrowed_from: event.target.value }))}
-                        />
-                      </label>
-                      <label>
-                        Datum splacení
-                        <input
-                          type="date"
-                          value={assetDraft.borrowed_to}
-                          onChange={(event) => setAssetDraft((value) => ({ ...value, borrowed_to: event.target.value }))}
-                        />
-                      </label>
-                      <label>
-                        Datum první splátky
-                        <input
-                          type="date"
-                          value={assetDraft.first_payment_date}
-                          onChange={(event) => setAssetDraft((value) => ({ ...value, first_payment_date: event.target.value }))}
-                        />
-                        <span className="field-hint">
-                          Vyplňte jen pokud se první splátka liší od ostatních (bude počítána jako čistý úrok).
-                        </span>
-                      </label>
-                      <label>
-                        Výše první splátky
-                        <input
-                          type="number"
-                          step="0.01"
-                          value={assetDraft.first_payment_amount}
-                          onChange={(event) => setAssetDraft((value) => ({ ...value, first_payment_amount: event.target.value }))}
-                        />
-                      </label>
-                      <label>
-                        Věřitel
-                        <input
-                          value={assetDraft.lender_name}
-                          onChange={(event) => setAssetDraft((value) => ({ ...value, lender_name: event.target.value }))}
-                        />
-                      </label>
-                      <label>
-                        Fixace do
-                        <input
-                          type="date"
-                          value={assetDraft.fixed_until}
-                          onChange={(event) => setAssetDraft((value) => ({ ...value, fixed_until: event.target.value }))}
-                        />
-                      </label>
-                      <label>
-                        Splátka
-                        <input
-                          type="number"
-                          step="0.01"
-                          value={assetDraft.payment}
-                          onChange={(event) => setAssetDraft((value) => ({ ...value, payment: event.target.value }))}
-                        />
-                      </label>
-                    </>
-                  )}
-                  {assetStatus && <div className="success-notice cost-form-note">{assetStatus}</div>}
-                  <div className="stock-actions cost-form-note">
-                    <button className="action-button" type="submit" disabled={assetBusy || !assetDraft.code.trim() || !assetDraft.name.trim()}>
-                      <Save size={16} />
-                      <span>Uložit majetek</span>
-                    </button>
-                    <button type="button" className="link-button" onClick={closeAssetEditor}>
-                      Zrušit
-                    </button>
-                  </div>
-                </form>
-              </div>
-            )}
+            {editingAssetId === "__new__" && renderAssetEditorForm()}
             {rows.map((asset) => (
               <article className="asset-agenda" key={String(asset.id || asset.code)}>
                 <header>
@@ -4514,6 +4567,7 @@ export default function Page() {
                   </div>
                 )}
                 {assetSchedule?.forId === String(asset.id) && <PaymentScheduleTable rows={assetSchedule.rows} />}
+                {editingAssetId === String(asset.id) && renderAssetEditorForm()}
               </article>
             ))}
           </section>

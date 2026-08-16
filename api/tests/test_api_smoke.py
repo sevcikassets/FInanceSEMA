@@ -1700,3 +1700,45 @@ def test_stock_transaction_write_requires_transactions_agenda_grant(client, db_s
         "/stocks/transactions", headers=headers, params=params, json={"traded_on": "2026-06-05", "movement_type": "Nákup"},
     )
     assert response.status_code == 403
+
+
+@requires_db
+def test_stock_benchmark_returns_history_over_own_daily_statistics_window(client, db_session, portfolio_id, monkeypatch):
+    """The Grafy tab's S&P 500 overlay needs a price series spanning the same
+    window /stocks/statistics charts (its most recent 200 days) - assert the
+    endpoint derives that window from DailyStatistic and hands it straight to
+    fetch_yahoo_history, and returns [] gracefully with no statistics yet."""
+    from app import main
+    from app.models import DailyStatistic
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    empty = client.get("/stocks/benchmark", headers=headers, params=params)
+    assert empty.status_code == 200
+    assert empty.json() == []
+
+    for day in (date(2026, 6, 1), date(2026, 6, 15), date(2026, 6, 30)):
+        db_session.add(DailyStatistic(portfolio_id=portfolio_id, stat_date=day))
+    db_session.commit()
+
+    captured = {}
+
+    def fake_history(ticker, date_from, date_to):
+        captured["ticker"] = ticker
+        captured["date_from"] = date_from
+        captured["date_to"] = date_to
+        return {"currency": "USD", "points": [(date(2026, 6, 30), Decimal("5500.12")), (date(2026, 6, 1), Decimal("5300.00"))]}
+
+    monkeypatch.setattr(main, "fetch_yahoo_history", fake_history)
+
+    response = client.get("/stocks/benchmark", headers=headers, params=params)
+    assert response.status_code == 200
+    body = response.json()
+    assert captured["ticker"] == "^GSPC"
+    assert captured["date_from"] == date(2026, 6, 1)
+    assert captured["date_to"] == date(2026, 6, 30)
+    # Sorted ascending by date, regardless of the order fetch_yahoo_history returned them in.
+    assert [row["date"] for row in body] == ["2026-06-01", "2026-06-30"]
+    assert body[0]["close"] == pytest.approx(5300.00)
