@@ -1086,6 +1086,8 @@ export default function Page() {
   const [rateCurrency, setRateCurrency] = useState("EUR");
   const [rateValue, setRateValue] = useState("");
   const [patriaText, setPatriaText] = useState("");
+  const [patriaImportOpen, setPatriaImportOpen] = useState(false);
+  const [transactionFilter, setTransactionFilter] = useState("");
   const [stockActionStatus, setStockActionStatus] = useState<string | null>(null);
   const [stockBusy, setStockBusy] = useState(false);
   const [historyTicker, setHistoryTicker] = useState("");
@@ -1261,7 +1263,13 @@ export default function Page() {
         ? buildCostRows(rows, costAssetFilter, showCostDetail)
         : activeTab === "loans"
           ? buildLoanRows(rows, expandedLoanYears, expandedLoanMonths)
-          : rows;
+          : activeTab === "transactions" && transactionFilter.trim()
+            ? rows.filter((row) => {
+                const needle = transactionFilter.trim().toLowerCase();
+                return [row.instrument_name, row.ticker, row.isin, row.movement_type, row.description]
+                  .some((field) => String(field || "").toLowerCase().includes(needle));
+              })
+            : rows;
   const chartData = useMemo(() => {
     if (activeTab !== "charts") return [];
     return [...rows]
@@ -3453,7 +3461,11 @@ export default function Page() {
             </button>
             <div>
               <h1>{active.label}</h1>
-              <p>{summary ? `${rows.length} záznamů v aktuálním pohledu` : "Čekám na importovaná data"}</p>
+              <p>
+                {summary
+                  ? `${activeTab === "transactions" ? tableRows.length : rows.length} záznamů v aktuálním pohledu`
+                  : "Čekám na importovaná data"}
+              </p>
             </div>
           </div>
           <div className="topbar-actions">
@@ -4499,24 +4511,47 @@ export default function Page() {
             </div>
             {activeTab === "transactions" && (
               <div className="patria-import">
-                <label>
-                  Import Patria
-                  <textarea
-                    value={patriaText}
-                    onChange={(event) => setPatriaText(event.target.value)}
-                    placeholder="Vložte zkopírovaný dvouřádkový export obchodů z Patrie"
-                  />
-                </label>
-                <button className="action-button" onClick={importPatriaTrades} disabled={stockBusy || !patriaText.trim()}>
-                  <Download size={16} />
-                  <span>Importovat Patria</span>
-                </button>
-                <button className="action-button" onClick={openNewTransactionForm}>
-                  <span>+ Přidat pohyb ručně</span>
-                </button>
+                <div className="stock-actions">
+                  <button className="action-button" onClick={() => setPatriaImportOpen((value) => !value)}>
+                    <Download size={16} />
+                    <span>{patriaImportOpen ? "Skrýt import Patria" : "Import Patria"}</span>
+                  </button>
+                  <button className="action-button" onClick={openNewTransactionForm}>
+                    <span>+ Přidat pohyb ručně</span>
+                  </button>
+                </div>
+                {patriaImportOpen && (
+                  <>
+                    <label>
+                      Import Patria
+                      <textarea
+                        value={patriaText}
+                        onChange={(event) => setPatriaText(event.target.value)}
+                        placeholder="Vložte zkopírovaný dvouřádkový export obchodů z Patrie"
+                        autoFocus
+                      />
+                    </label>
+                    <button className="action-button" onClick={importPatriaTrades} disabled={stockBusy || !patriaText.trim()}>
+                      <Download size={16} />
+                      <span>Importovat Patria</span>
+                    </button>
+                  </>
+                )}
               </div>
             )}
             {activeTab === "transactions" && editingTransactionId === "__new__" && renderTransactionEditorForm()}
+            {activeTab === "transactions" && (
+              <div className="filter-row">
+                <label>
+                  Filtr
+                  <input
+                    value={transactionFilter}
+                    onChange={(event) => setTransactionFilter(event.target.value)}
+                    placeholder="Ticker, název, ISIN, typ pohybu…"
+                  />
+                </label>
+              </div>
+            )}
             <div className="mini-grids">
               <div>
                 <h3>Pohyby</h3>
