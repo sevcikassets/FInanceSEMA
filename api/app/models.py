@@ -350,6 +350,35 @@ class DailyStatistic(Base):
     alerts: Mapped[str | None] = mapped_column(Text)
 
 
+class DailyAlertLog(Base):
+    """Daily snapshot of the Upozornění tab's watchlist-limit and portfolio-
+    drawdown alerts (the "daily movers" category already has its own history
+    via DailyStatistic.alerts, see stock_services.compute_alerts) - captured
+    once per day so past alerts can be looked up retroactively, mirroring
+    how the original Excel workbook logged both categories every day.
+    Written by stock_services.snapshot_daily_alerts, called after a price
+    refresh or full recalculate; upserted by (portfolio_id, stat_date,
+    alert_type, ticker) so re-running either action the same day overwrites
+    that day's rows rather than duplicating them. `detail` holds whichever
+    figures are specific to alert_type ("current_price"/"limit_price"/
+    "currency" for "watchlist_limit", "profit_pct"/"profit_czk"/
+    "market_value_czk" for "drawdown") - already-JSON-safe plain numbers,
+    not Decimal."""
+
+    __tablename__ = "daily_alert_logs"
+    __table_args__ = (
+        UniqueConstraint("portfolio_id", "stat_date", "alert_type", "ticker", name="uq_daily_alert_logs_portfolio_date_type_ticker"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), index=True)
+    stat_date: Mapped[date] = mapped_column(Date, index=True)
+    alert_type: Mapped[str] = mapped_column(String(32))
+    ticker: Mapped[str] = mapped_column(String(64))
+    name: Mapped[str | None] = mapped_column(String(255))
+    detail: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
 class MonthlyEvaluation(Base):
     """Stored monthly P&L (Vyhodnocení) for one Subjekt/period - computed
     on demand via POST /evaluations/compute and upserted by

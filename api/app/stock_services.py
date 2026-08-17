@@ -14,10 +14,10 @@ from typing import Any
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-from sqlalchemy import desc, select
+from sqlalchemy import delete, desc, select
 from sqlalchemy.orm import Session
 
-from .models import DailyStatistic, ExchangeRate, PortfolioPosition, StockTransaction, TickerDescription, WatchlistStock
+from .models import DailyAlertLog, DailyStatistic, ExchangeRate, PortfolioPosition, StockTransaction, TickerDescription, WatchlistStock
 
 
 ZERO = Decimal("0")
@@ -542,6 +542,53 @@ def compute_alerts(db: Session, portfolio_id: uuid.UUID, threshold_pct: Decimal 
         "daily_movers": daily_movers,
         "daily_movers_as_of": latest_stat.stat_date.isoformat() if latest_stat is not None else None,
     }
+
+
+def snapshot_daily_alerts(db: Session, portfolio_id: uuid.UUID, threshold_pct: Decimal | float = Decimal("10")) -> None:
+    """Persists today's watchlist-limit-breach and portfolio-drawdown alerts
+    (see compute_alerts - "daily movers" already has its own history via
+    DailyStatistic.alerts, so it's not duplicated here) as DailyAlertLog
+    rows, so past alerts can be looked up retroactively - the original Excel
+    workbook logged both categories every day, this is the same idea.
+    Called after a price refresh or full recalculate, whichever the user
+    actually ran; upserts today's rows (delete-then-insert), so running
+    either action again the same day overwrites rather than duplicates.
+    Caller is responsible for committing."""
+    alerts = compute_alerts(db, portfolio_id, threshold_pct=threshold_pct)
+    today = date.today()
+    db.execute(
+        delete(DailyAlertLog).where(
+            DailyAlertLog.portfolio_id == portfolio_id,
+            DailyAlertLog.stat_date == today,
+            DailyAlertLog.alert_type.in_(["watchlist_limit", "drawdown"]),
+        )
+    )
+    for item in alerts["watchlist_limit_breaches"]:
+        db.add(
+            DailyAlertLog(
+                portfolio_id=portfolio_id,
+                stat_date=today,
+                alert_type="watchlist_limit",
+                ticker=item["ticker"],
+                name=item["name"],
+                detail={"current_price": item["current_price"], "limit_price": item["limit_price"], "currency": item["currency"]},
+            )
+        )
+    for item in alerts["portfolio_drawdowns"]:
+        db.add(
+            DailyAlertLog(
+                portfolio_id=portfolio_id,
+                stat_date=today,
+                alert_type="drawdown",
+                ticker=item["ticker"],
+                name=item["name"],
+                detail={
+                    "profit_pct": item["profit_pct"],
+                    "profit_czk": item["profit_czk"],
+                    "market_value_czk": item["market_value_czk"],
+                },
+            )
+        )
 
 
 def movement_is_buy(value: str | None) -> bool:
