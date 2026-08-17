@@ -343,7 +343,7 @@ def test_recalculate_endpoint_returns_proper_error_instead_of_bare_crash(client,
     which the TestClient (and a real browser) can read the body of."""
     from app import main
 
-    def boom(db, portfolio_id, dry_run=False, date_from=None, threshold_pct=None):
+    def boom(db, portfolio_id, dry_run=False, date_from=None, threshold_pct=None, drop_threshold_pct=None):
         raise RuntimeError("simulated crash deep in the recalculation")
 
     monkeypatch.setattr(main, "recalculate_stocks", boom)
@@ -631,6 +631,89 @@ def test_recalculate_stocks_computes_alerts_column(db_session, portfolio_id, mon
     assert day3_row is not None
     assert "TEST (D:+30.0%)" in day3_row.alerts
     assert "Chybí cena: NODATA" in day3_row.alerts
+
+
+@requires_db
+def test_recalculate_stocks_computes_historical_drawdown_alerts(db_session, portfolio_id, monkeypatch):
+    """Matches the original Excel workbook's "T:" alert: a position down more
+    than drop_threshold_pct versus its OWN cost basis AS OF THAT SPECIFIC
+    DAY - not just today's live state (previously nothing like this existed
+    for past days at all, only the "D:" day-over-day mover)."""
+    from app import stock_services
+    from app.models import DailyStatistic, StockTransaction
+
+    day1 = date(2024, 2, 5)  # Monday - bought here, no drop yet
+    day2 = date(2024, 2, 6)  # flat
+    day3 = date(2024, 2, 7)  # price falls to 70 - a 30% drawdown vs the 100 cost basis
+
+    db_session.add(
+        StockTransaction(
+            portfolio_id=portfolio_id, traded_on=day1, movement_type="Nákup", instrument_name="Test Corp", ticker="TEST",
+            quantity=Decimal("10"), unit_price_ccy=Decimal("100"), gross_amount_ccy=Decimal("1000"), currency="CZK",
+            amount_czk=Decimal("1000"),
+        )
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        stock_services, "fetch_yahoo_history", lambda ticker, date_from, date_to: {
+            "currency": "CZK", "points": [(day1, Decimal("100")), (day2, Decimal("100")), (day3, Decimal("70"))]
+        }
+    )
+
+    stock_services.recalculate_stocks(db_session, portfolio_id, dry_run=False, threshold_pct=Decimal("999"), drop_threshold_pct=Decimal("10"))
+
+    day1_row = db_session.get(DailyStatistic, (portfolio_id, day1))
+    assert day1_row.alerts is None  # bought at cost, no drawdown yet
+
+    day3_row = db_session.get(DailyStatistic, (portfolio_id, day3))
+    assert "TEST (T:-30.0%)" in day3_row.alerts
+
+
+@requires_db
+def test_recalculate_stocks_computes_historical_watchlist_alerts(db_session, portfolio_id, monkeypatch):
+    """Matches the original Excel workbook's "L:" alert: a watched ticker at
+    or below its limit price on a given historical day - including a ticker
+    that's only ever watched, never actually bought (previously such a
+    ticker had no Yahoo history fetched at all, so this could never work)."""
+    from app import stock_services
+    from app.models import DailyStatistic, StockTransaction, WatchlistStock
+
+    day1 = date(2024, 3, 4)  # Monday
+    day2 = date(2024, 3, 5)  # WATCH dips to/below its limit here
+    day3 = date(2024, 3, 6)  # back above the limit
+
+    # A real transaction is needed just to give recalculate_stocks something
+    # to build calendar_dates from - WATCH itself is never bought.
+    db_session.add(
+        StockTransaction(
+            portfolio_id=portfolio_id, traded_on=day1, movement_type="Nákup", instrument_name="Anchor Corp", ticker="ANCHOR",
+            quantity=Decimal("1"), unit_price_ccy=Decimal("10"), gross_amount_ccy=Decimal("10"), currency="CZK",
+            amount_czk=Decimal("10"),
+        )
+    )
+    db_session.add(
+        WatchlistStock(portfolio_id=portfolio_id, watched_on=day1, name="Watched Corp", ticker="WATCH", limit_price=Decimal("50"))
+    )
+    db_session.commit()
+
+    def fake_history(ticker, date_from, date_to):
+        if ticker == "WATCH":
+            return {"currency": "CZK", "points": [(day1, Decimal("60")), (day2, Decimal("48")), (day3, Decimal("55"))]}
+        return {"currency": "CZK", "points": [(day1, Decimal("10")), (day2, Decimal("10")), (day3, Decimal("10"))]}
+
+    monkeypatch.setattr(stock_services, "fetch_yahoo_history", fake_history)
+
+    stock_services.recalculate_stocks(db_session, portfolio_id, dry_run=False, threshold_pct=Decimal("999"), drop_threshold_pct=Decimal("999"))
+
+    day1_row = db_session.get(DailyStatistic, (portfolio_id, day1))
+    assert day1_row.alerts is None  # 60 > limit 50 - no breach yet
+
+    day2_row = db_session.get(DailyStatistic, (portfolio_id, day2))
+    assert "WATCH (L:48.00/50.00)" in day2_row.alerts
+
+    day3_row = db_session.get(DailyStatistic, (portfolio_id, day3))
+    assert day3_row.alerts is None  # back above the limit
 
 
 @requires_db

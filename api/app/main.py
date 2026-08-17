@@ -2698,13 +2698,16 @@ def recalculate_stock_data(
     # headers and puts the actual error text in front of the user/logs.
     try:
         effective_threshold = resolve_threshold(db, username, threshold_pct, "alert_daily_change_pct")
+        drop_threshold = resolve_threshold(db, username, None, "alert_drop_pct")
         # Auto-fetch missing CNB rates first, same as AktualizujStatistiku always
         # does before recomputing - but only for a real (non-preview) run, so
         # "Kontrola (náhled)" keeps its "nothing gets saved" promise.
         cnb_rates_added = ensure_cnb_rates_up_to_date(db) if not dry_run else 0
-        result = recalculate_stocks(db, portfolio_id, dry_run=dry_run, date_from=date_from, threshold_pct=effective_threshold)
+        result = recalculate_stocks(
+            db, portfolio_id, dry_run=dry_run, date_from=date_from, threshold_pct=effective_threshold, drop_threshold_pct=drop_threshold
+        )
         if not dry_run:
-            snapshot_daily_alerts(db, portfolio_id, threshold_pct=resolve_threshold(db, username, None, "alert_drop_pct"))
+            snapshot_daily_alerts(db, portfolio_id, threshold_pct=drop_threshold)
             db.commit()
     except HTTPException:
         raise

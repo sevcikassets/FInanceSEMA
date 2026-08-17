@@ -617,6 +617,7 @@ def recalculate_stocks(
     dry_run: bool = False,
     date_from: date | None = None,
     threshold_pct: Decimal | float = Decimal("10"),
+    drop_threshold_pct: Decimal | float = Decimal("10"),
 ) -> dict[str, Any]:
     """Recompute portfolio positions and daily statistics from `stock_transactions`.
 
@@ -636,6 +637,13 @@ def recalculate_stocks(
     They are NOT the invested amount merely re-expressed in CZK (that used to
     be the case here, which meant "Nereal. zisk" only ever reflected FX-rate
     drift, never a real stock-price gain or loss).
+
+    The "alerts" text column is rebuilt for the full history every run,
+    matching the original Excel workbook's per-day "Info" column exactly:
+    a position down more than `drop_threshold_pct` versus its own cost
+    basis as of that specific day ("T:..."), a watched ticker at or below
+    its (current) limit price on that day ("L:..."), and a day-over-day
+    price move past `threshold_pct` ("D:..."), combined.
     """
     existing_prices = {
         row.ticker: row.current_price
@@ -647,6 +655,16 @@ def recalculate_stocks(
         .where(StockTransaction.portfolio_id == portfolio_id)
         .order_by(StockTransaction.traded_on.nullslast(), StockTransaction.id)
     ).all()
+    # Every watched ticker with a limit price - needed for the historical "L:"
+    # (watchlist-limit) alert below, including tickers that are only watched
+    # and never actually bought (so absent from `positions`/`transactions`).
+    watchlist_rows = [
+        row
+        for row in db.scalars(
+            select(WatchlistStock).where(WatchlistStock.portfolio_id == portfolio_id, WatchlistStock.ticker.is_not(None))
+        ).all()
+        if row.limit_price is not None
+    ]
 
     positions: dict[str, dict[str, Any]] = {}
     buy_dates: set[date] = set()
@@ -662,6 +680,12 @@ def recalculate_stocks(
     # shares were actually held on any given historical day, so they can be
     # valued at that day's price.
     ticker_qty_events: dict[str, dict[date, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+    # Signed invested_czk (cost basis) change per ticker per day, mirroring
+    # ticker_qty_events - lets the day loop reconstruct not just how many
+    # shares were held on a given historical day, but what they cost, so a
+    # historical "T:" (drawdown) alert can be computed for that exact day
+    # instead of only ever reflecting today's final cost basis.
+    ticker_invested_events: dict[str, dict[date, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
 
     for transaction in transactions:
         ticker = normalize_ticker(transaction.ticker, transaction.market)
@@ -708,6 +732,7 @@ def recalculate_stocks(
                 daily_buys[traded_on][currency] += gross
                 daily_invested[traded_on] += amount_czk
                 ticker_qty_events[ticker][traded_on] += quantity
+                ticker_invested_events[ticker][traded_on] += amount_czk
                 if position["first_buy_date"] is None or traded_on < position["first_buy_date"]:
                     position["first_buy_date"] = traded_on
         elif movement_is_sell(movement):
@@ -718,6 +743,7 @@ def recalculate_stocks(
                 position["invested_czk"] -= cost_basis_removed
                 if traded_on:
                     daily_realized_profit[traded_on] += amount_czk - cost_basis_removed
+                    ticker_invested_events[ticker][traded_on] -= cost_basis_removed
             position["quantity"] += quantity
             if traded_on:
                 ticker_qty_events[ticker][traded_on] += quantity
@@ -746,6 +772,7 @@ def recalculate_stocks(
         )
 
     alert_threshold = Decimal(str(threshold_pct))
+    drop_threshold = Decimal(str(drop_threshold_pct))
     computed_stats: list[DailyStatistic] = []
     total_eur = ZERO
     total_usd = ZERO
@@ -790,8 +817,13 @@ def recalculate_stocks(
     # well before the recalculation itself finished. A small bounded pool
     # keeps the same request pattern per ticker but runs them side by side.
     YAHOO_CONCURRENCY = 8
+    # Watchlist-only tickers (watched but never actually bought) need their own
+    # historical price series too, purely for the "L:" alert below - they'd
+    # otherwise never get a Yahoo history fetch at all (positions is empty for
+    # them), so price_at_or_before would silently return None for every day.
+    watchlist_tickers = {normalize_ticker(row.ticker, None) for row in watchlist_rows if row.ticker}
     if calendar_dates:
-        ticker_list = list(positions)
+        ticker_list = sorted(set(positions) | watchlist_tickers)
         with ThreadPoolExecutor(max_workers=YAHOO_CONCURRENCY) as pool:
             histories = pool.map(lambda t: fetch_yahoo_history(t, start_date, date.today()), ticker_list)
         for ticker, history in zip(ticker_list, histories):
@@ -868,6 +900,7 @@ def recalculate_stocks(
         )
 
     ticker_running_qty: dict[str, Decimal] = defaultdict(Decimal)
+    ticker_running_invested: dict[str, Decimal] = defaultdict(Decimal)
     previous_total_value_czk = ZERO
     previous_invested_total = ZERO
     for stat_date in calendar_dates:
@@ -889,16 +922,30 @@ def recalculate_stocks(
             change = events.get(stat_date)
             if change:
                 ticker_running_qty[ticker] += change
+        for ticker, events in ticker_invested_events.items():
+            change = events.get(stat_date)
+            if change:
+                ticker_running_invested[ticker] += change
+
+        def day_rate_for(currency: str) -> Decimal:
+            if currency == "EUR":
+                return eur_rate
+            if currency == "USD":
+                return usd_rate
+            return ONE
 
         # Market value of everything actually held on this day, bucketed by
-        # trading currency - not the invested/purchased amount. Also flags two
-        # kinds of "Upozorneni" (AkcieStatistika.bas): a day-over-day price
-        # move past `alert_threshold`, or a ticker held that day with no price
-        # data at all for it.
+        # trading currency - not the invested/purchased amount. Also flags
+        # three kinds of "Upozorneni" (AkcieStatistika.bas), matching the
+        # original Excel workbook's per-day Info column exactly: a position
+        # down more than `drop_threshold` versus its own cost basis AS OF
+        # THAT DAY ("T:"), a day-over-day price move past `alert_threshold`
+        # ("D:"), or a ticker held that day with no price data at all for it.
         value_eur = ZERO
         value_usd = ZERO
         value_czk = ZERO
         movers: list[str] = []
+        drawdowns: list[str] = []
         missing_price_tickers: list[str] = []
         for ticker, qty in ticker_running_qty.items():
             if qty <= ZERO:
@@ -922,7 +969,26 @@ def recalculate_stocks(
                 if abs(pct_change) >= alert_threshold:
                     movers.append(f"{ticker} (D:{pct_change:+.1f}%)")
 
+            invested = ticker_running_invested.get(ticker, ZERO)
+            if invested:
+                market_value_czk = holding_value * day_rate_for(ticker_currency)
+                drawdown_pct = (market_value_czk - invested) / invested * Decimal("100")
+                if drawdown_pct <= -drop_threshold:
+                    drawdowns.append(f"{ticker} (T:{drawdown_pct:+.1f}%)")
+
+        watchlist_breaches: list[str] = []
+        for watch in watchlist_rows:
+            ticker = normalize_ticker(watch.ticker, None)
+            if not ticker:
+                continue
+            price = price_at_or_before(ticker, stat_date)
+            if price is None or price > watch.limit_price:
+                continue
+            watchlist_breaches.append(f"{ticker} (L:{price:.2f}/{watch.limit_price:.2f})")
+
         alert_bits = []
+        if drawdowns or watchlist_breaches:
+            alert_bits.append(", ".join([*drawdowns, *watchlist_breaches]))
         if movers:
             alert_bits.append(", ".join(movers))
         if missing_price_tickers:
