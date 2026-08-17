@@ -238,3 +238,106 @@ def annual_interest_from_schedule(
             continue
         totals[year] = totals.get(year, Decimal("0")) + period["interest"]
     return {year: value.quantize(TWO_PLACES, rounding=ROUND_HALF_UP) for year, value in totals.items()}
+
+
+# A LoanMovement (Zápůjčka/Půjčka between private parties) is NOT a mortgage:
+# there's no schedule of monthly principal repayments baked into the data
+# model (a single row just holds one constant `amount` from movement_date
+# until it's repaid) - so amortization_schedule's fixed-payment annuity model
+# doesn't apply here. Applying it anyway (as this app used to) makes the
+# "interest" portion shrink every month as if principal were being paid down,
+# even though none actually is. The functions below instead compute plain
+# simple interest (principal * rate * days/365) on that constant principal,
+# for however much of a given date range it was actually outstanding - so
+# interest naturally stays close to principal * rate / 12 each month, varying
+# only with each month's actual day count, matching how a real private loan
+# with a single bullet repayment at maturity actually accrues interest.
+def loan_movement_interest_in_range(
+    amount: Decimal | float | None,
+    interest_rate: Decimal | float | None,
+    movement_date: date | None,
+    range_start: date,
+    range_end: date,
+    completed_at: date | None = None,
+) -> Decimal:
+    """Simple interest for however much of [range_start, range_end]
+    (inclusive) the loan was actually outstanding - stops accruing at
+    completed_at if the loan was already repaid by then."""
+    if not amount or not interest_rate or not movement_date:
+        return Decimal("0")
+    outstanding_until = completed_at if completed_at else range_end
+    overlap_start = max(range_start, movement_date)
+    overlap_end = min(range_end, outstanding_until)
+    days = (overlap_end - overlap_start).days + 1
+    if days <= 0:
+        return Decimal("0")
+    interest = Decimal(str(amount)) * Decimal(str(interest_rate)) * Decimal(days) / Decimal(365)
+    return interest.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+
+
+def loan_movement_annual_interest(
+    amount: Decimal | float | None,
+    interest_rate: Decimal | float | None,
+    movement_date: date | None,
+    planned_end_date: date | None,
+    completed_at: date | None = None,
+    years: Iterable[int] = DEFAULT_PROJECTION_YEARS,
+) -> dict[int, Decimal]:
+    """loan_movement_interest_in_range, summed per calendar year - the
+    LoanMovement analogue of project_annual_interest (which is specific to
+    a mortgage's amortization). Requires planned_end_date, same as
+    project_annual_interest requires a term, so the projection has a
+    defined stopping point."""
+    if not amount or not interest_rate or not movement_date or not planned_end_date:
+        return {}
+    result: dict[int, Decimal] = {}
+    for year in years:
+        interest = loan_movement_interest_in_range(
+            amount, interest_rate, movement_date, date(year, 1, 1), min(date(year, 12, 31), planned_end_date), completed_at
+        )
+        if interest:
+            result[year] = interest
+    return result
+
+
+def loan_movement_schedule(
+    amount: Decimal | float | None,
+    interest_rate: Decimal | float | None,
+    movement_date: date | None,
+    planned_end_date: date | None,
+    completed_at: date | None = None,
+) -> list[SchedulePeriod]:
+    """Monthly interest-accrual table for a private loan: unlike
+    amortization_schedule, the principal isn't paid down month by month -
+    it sits flat at `amount` until a single bullet repayment on the final
+    row, dated at completed_at (already repaid) or planned_end_date
+    (projected). Each row's interest is that month's actual-day-count
+    share (see loan_movement_interest_in_range)."""
+    end = completed_at or planned_end_date
+    if not amount or not interest_rate or not movement_date or not end or end < movement_date:
+        return []
+    principal_value = Decimal(str(amount)).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+    schedule: list[SchedulePeriod] = []
+    cursor = date(movement_date.year, movement_date.month, 1)
+    period = 0
+    while cursor <= end:
+        month_end = date(cursor.year, cursor.month, calendar.monthrange(cursor.year, cursor.month)[1])
+        is_final = month_end >= end
+        row_date = end if is_final else month_end
+        interest = loan_movement_interest_in_range(amount, interest_rate, movement_date, cursor, row_date, completed_at)
+        principal = principal_value if is_final else Decimal("0.00")
+        period += 1
+        schedule.append(
+            {
+                "period": period,
+                "date": row_date,
+                "payment": (interest + principal).quantize(TWO_PLACES, rounding=ROUND_HALF_UP),
+                "principal": principal,
+                "interest": interest,
+                "balance": Decimal("0.00") if is_final else principal_value,
+            }
+        )
+        if is_final:
+            break
+        cursor = add_months(cursor, 1)
+    return schedule

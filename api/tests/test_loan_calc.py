@@ -3,11 +3,16 @@
 from datetime import date
 from decimal import Decimal
 
+import pytest
+
 from app.loan_calc import (
     add_months,
     amortization_schedule,
     annual_interest_from_schedule,
     cumulative_interest,
+    loan_movement_annual_interest,
+    loan_movement_interest_in_range,
+    loan_movement_schedule,
     monthly_rate,
     number_of_periods,
     period_window,
@@ -212,3 +217,97 @@ def test_annual_interest_from_schedule_sums_by_calendar_year():
     )
     assert totals[2026] == expected_2026
     assert 2028 not in totals
+
+
+# A LoanMovement (Zápůjčka/Půjčka) is not a mortgage - it has no schedule of
+# its own principal repayments, so its interest must be plain simple interest
+# on a constant principal (see loan_movement_interest_in_range's docstring),
+# NOT amortization_schedule's fixed-payment annuity model (which would make
+# the "interest" portion shrink every month as if principal were being paid
+# down, even though it isn't).
+
+
+def test_loan_movement_interest_in_range_missing_inputs_returns_zero():
+    assert loan_movement_interest_in_range(None, Decimal("0.06"), date(2024, 1, 1), date(2024, 1, 1), date(2024, 1, 31)) == Decimal("0")
+    assert loan_movement_interest_in_range(Decimal("100000"), None, date(2024, 1, 1), date(2024, 1, 1), date(2024, 1, 31)) == Decimal("0")
+    assert loan_movement_interest_in_range(Decimal("100000"), Decimal("0.06"), None, date(2024, 1, 1), date(2024, 1, 31)) == Decimal("0")
+
+
+def test_loan_movement_interest_in_range_is_simple_interest_on_full_days():
+    # 1 200 000 * 6% * 31/365 (January) - plain principal * rate * days/365,
+    # not a monthly_rate/12 approximation.
+    interest = loan_movement_interest_in_range(
+        Decimal("1200000"), Decimal("0.06"), date(2024, 1, 1), date(2024, 1, 1), date(2024, 1, 31)
+    )
+    expected = (Decimal("1200000") * Decimal("0.06") * Decimal(31) / Decimal(365)).quantize(Decimal("0.01"))
+    assert interest == expected
+
+
+def test_loan_movement_interest_in_range_stops_at_completed_at():
+    # Repaid mid-month - only the days actually outstanding accrue interest.
+    interest = loan_movement_interest_in_range(
+        Decimal("1200000"), Decimal("0.06"), date(2024, 7, 1), date(2024, 7, 1), date(2024, 7, 31), completed_at=date(2024, 7, 15)
+    )
+    expected = (Decimal("1200000") * Decimal("0.06") * Decimal(15) / Decimal(365)).quantize(Decimal("0.01"))
+    assert interest == expected
+
+
+def test_loan_movement_interest_in_range_zero_before_movement_date_or_after_repayment():
+    assert loan_movement_interest_in_range(
+        Decimal("1200000"), Decimal("0.06"), date(2024, 8, 1), date(2024, 1, 1), date(2024, 7, 31)
+    ) == Decimal("0")
+    assert loan_movement_interest_in_range(
+        Decimal("1200000"), Decimal("0.06"), date(2024, 1, 1), date(2024, 8, 1), date(2024, 8, 31), completed_at=date(2024, 7, 15)
+    ) == Decimal("0")
+
+
+def test_loan_movement_annual_interest_requires_planned_end_date():
+    assert loan_movement_annual_interest(Decimal("1200000"), Decimal("0.06"), date(2024, 1, 1), None) == {}
+
+
+def test_loan_movement_annual_interest_sums_full_year_close_to_rate_times_principal():
+    # A loan outstanding for a full calendar year should accrue very close
+    # to principal * rate (not principal * rate * some fraction, and
+    # nowhere near the front-loaded total a fixed-payment amortization
+    # would produce). 2024 is a leap year (366 days) under a fixed ACT/365
+    # convention, so the exact total is slightly above principal * rate -
+    # a ~1% tolerance comfortably covers that, not a bug.
+    totals = loan_movement_annual_interest(
+        Decimal("1200000"), Decimal("0.06"), date(2024, 1, 1), date(2024, 12, 31), years=range(2024, 2025)
+    )
+    assert float(totals[2024]) == pytest.approx(1200000 * 0.06, rel=0.01)
+
+
+def test_loan_movement_schedule_empty_without_end_date():
+    assert loan_movement_schedule(Decimal("1200000"), Decimal("0.06"), date(2024, 1, 1), None) == []
+
+
+def test_loan_movement_schedule_flat_balance_until_bullet_repayment():
+    schedule = loan_movement_schedule(Decimal("1200000"), Decimal("0.06"), date(2024, 1, 1), date(2024, 12, 31))
+    assert len(schedule) == 12
+    # Unlike a mortgage, principal isn't paid down monthly - balance stays
+    # flat at the full amount through every row except the last.
+    for row in schedule[:-1]:
+        assert row["principal"] == Decimal("0.00")
+        assert row["balance"] == Decimal("1200000.00")
+    assert schedule[-1]["principal"] == Decimal("1200000.00")
+    assert schedule[-1]["balance"] == Decimal("0.00")
+    assert schedule[-1]["date"] == date(2024, 12, 31)
+
+    # The core regression this feature fixes: interest must stay in a tight
+    # band (varying only with each month's day count), NOT decay the way a
+    # fixed-payment amortization schedule's interest portion would.
+    interests = [row["interest"] for row in schedule]
+    assert max(interests) / min(interests) < Decimal("1.15")  # 31 vs 28 days is an ~11% spread
+
+
+def test_loan_movement_schedule_stops_at_completed_at_mid_month():
+    schedule = loan_movement_schedule(
+        Decimal("1200000"), Decimal("0.06"), date(2024, 1, 1), date(2024, 12, 31), completed_at=date(2024, 7, 15)
+    )
+    assert len(schedule) == 7  # Jan..Jul
+    assert schedule[-1]["date"] == date(2024, 7, 15)
+    assert schedule[-1]["principal"] == Decimal("1200000.00")
+    assert schedule[-1]["balance"] == Decimal("0.00")
+    expected_july_interest = (Decimal("1200000") * Decimal("0.06") * Decimal(15) / Decimal(365)).quantize(Decimal("0.01"))
+    assert schedule[-1]["interest"] == expected_july_interest

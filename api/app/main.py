@@ -53,7 +53,14 @@ from .excel_import import (
     move_zapujcka_assets_to_loans,
     split_debt_assets_into_linked_liability,
 )
-from .loan_calc import amortization_schedule, annual_interest_from_schedule, project_annual_interest
+from .loan_calc import (
+    amortization_schedule,
+    annual_interest_from_schedule,
+    loan_movement_annual_interest,
+    loan_movement_interest_in_range,
+    loan_movement_schedule,
+    project_annual_interest,
+)
 from .models import (
     AppUser,
     Asset,
@@ -380,15 +387,17 @@ def asset_outstanding_balance(asset: Asset, calculation_mode: str | None) -> Dec
 
 
 def loan_movement_interest_plan(movement: LoanMovement) -> dict[str, Any]:
-    """Same amortization projection as computed_interest_plan, applied to a
-    LoanMovement instead of an Asset - every movement with amount/
-    interest_rate/movement_date filled is eligible (no per-movement "type"
-    concept exists, unlike Asset/AssetType)."""
-    projection = project_annual_interest(
-        borrowed_amount=movement.amount,
+    """Annual interest projection for a LoanMovement (Zápůjčka/Půjčka) -
+    simple interest on its constant principal (see loan_movement_annual_
+    interest), NOT the mortgage-style amortization computed_interest_plan
+    uses for a Hypotéka: a LoanMovement has no schedule of its own
+    principal repayments, so that model doesn't apply here."""
+    projection = loan_movement_annual_interest(
+        amount=movement.amount,
         interest_rate=movement.interest_rate,
-        borrowed_from=movement.movement_date,
-        borrowed_to=movement.planned_end_date,
+        movement_date=movement.movement_date,
+        planned_end_date=movement.planned_end_date,
+        completed_at=movement.completed_at,
     )
     return {str(year): json_value(value) for year, value in sorted(projection.items())}
 
@@ -403,12 +412,15 @@ def amortization_interest_in_period(
     first_payment_date: date | None = None,
     first_payment_amount: Decimal | None = None,
 ) -> Decimal:
-    """Interest accrued within a single "YYYY-MM" period, via the same
-    amortization_schedule() used by the payment-schedule endpoints - an
+    """Interest accrued within a single "YYYY-MM" period for a mortgage-
+    style amortizing loan (a Hypotéka Asset), via the same
+    amortization_schedule() used by /assets/{id}/payment-schedule - an
     exact period-by-period breakdown, not an annual/12 approximation.
     Missing inputs (no rate/term) yield an empty schedule, contributing 0 -
     same "missing inputs -> nothing" contract amortization_schedule already
-    has, no special-casing needed here."""
+    has, no special-casing needed here. NOT used for LoanMovement (see
+    loan_movement_interest_in_range instead - a private loan has no
+    amortization schedule of its own)."""
     schedule = amortization_schedule(
         pv=pv,
         interest_rate=interest_rate,
@@ -448,14 +460,15 @@ def classify_loan_interest(
     interest_paid = Decimal("0")
     detail: list[dict[str, Any]] = []
 
+    period_start, period_end = period_bounds(period)
     party_names = {p.id: p.name for p in db.scalars(select(Party)).all()}
     for movement in db.scalars(select(LoanMovement).where(LoanMovement.portfolio_id == portfolio_id)).all():
         lender_is_self = movement.lender_id in self_party_ids
         borrower_is_self = movement.borrower_id in self_party_ids
         if lender_is_self == borrower_is_self:
             continue  # both self (internal transfer) or neither (not this Subjekt's business) -> excluded
-        interest = amortization_interest_in_period(
-            movement.amount, movement.interest_rate, movement.movement_date, None, movement.planned_end_date, period
+        interest = loan_movement_interest_in_range(
+            movement.amount, movement.interest_rate, movement.movement_date, period_start, period_end, movement.completed_at
         )
         if interest == 0:
             continue
@@ -1680,11 +1693,12 @@ def loan_movement_payment_schedule(
     movement = db.scalar(select(LoanMovement).where(LoanMovement.id == movement_id, LoanMovement.portfolio_id == portfolio_id))
     if movement is None:
         raise HTTPException(status_code=404, detail="Pohyb nenalezen")
-    schedule = amortization_schedule(
-        pv=movement.amount,
+    schedule = loan_movement_schedule(
+        amount=movement.amount,
         interest_rate=movement.interest_rate,
-        start_date=movement.movement_date,
-        end_date=movement.planned_end_date,
+        movement_date=movement.movement_date,
+        planned_end_date=movement.planned_end_date,
+        completed_at=movement.completed_at,
     )
     return [
         {
