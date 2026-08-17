@@ -67,7 +67,6 @@ from .models import (
     AssetCost,
     AssetType,
     CostCategory,
-    DailyAlertLog,
     DailyStatistic,
     ExchangeRate,
     LoanMovement,
@@ -92,7 +91,6 @@ from .stock_services import (
     rate_for_day,
     recalculate_stocks,
     refresh_current_prices,
-    snapshot_daily_alerts,
     ticker_from_existing_data,
 )
 
@@ -1001,6 +999,13 @@ def ensure_schema_upgrades() -> None:
         # payment, when it differs from the regular amortization schedule).
         conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS first_payment_date DATE"))
         conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS first_payment_amount NUMERIC(16, 2)"))
+
+        # daily_alert_logs (a short-lived "Historie upozornění" experiment)
+        # is superseded by recalculate_stocks backfilling DailyStatistic.
+        # alerts with the same T:/L: info for the whole history - disposable
+        # computed data, safe to drop outright like the other one-time
+        # cleanups in this function.
+        conn.execute(text("DROP TABLE IF EXISTS daily_alert_logs"))
 
     # The data-shape migration below (moving rows, splitting one row into
     # two, copying several fields) is simpler and far less error-prone as
@@ -2622,28 +2627,6 @@ def stock_alerts(
     return compute_alerts(db, portfolio_id, threshold_pct=resolve_threshold(db, username, threshold_pct, "alert_drop_pct"))
 
 
-@app.get("/stocks/alerts/history")
-def stock_alert_history(
-    portfolio_id: uuid.UUID = Depends(require_portfolio_access("alerts")),
-    db: Session = Depends(get_db),
-    date_from: date | None = Query(default=None),
-    date_to: date | None = Query(default=None),
-    limit: int = Query(default=500, ge=1, le=5000),
-) -> list[dict[str, Any]]:
-    """Stored daily snapshots (see stock_services.snapshot_daily_alerts) of
-    past watchlist-limit and portfolio-drawdown alerts - the retroactive
-    lookup the current-state-only /stocks/alerts can't provide."""
-    query = select(DailyAlertLog).where(DailyAlertLog.portfolio_id == portfolio_id)
-    if date_from:
-        query = query.where(DailyAlertLog.stat_date >= date_from)
-    if date_to:
-        query = query.where(DailyAlertLog.stat_date <= date_to)
-    rows = db.scalars(
-        query.order_by(desc(DailyAlertLog.stat_date), DailyAlertLog.alert_type, DailyAlertLog.ticker).limit(limit)
-    ).all()
-    return [model_dict(row) for row in rows]
-
-
 @app.get("/stocks/ticker-history")
 def stock_ticker_history(
     ticker: str,
@@ -2673,12 +2656,9 @@ def refresh_stock_prices(
     db: Session = Depends(get_db),
     threshold_pct: Decimal | None = Query(default=None),
 ) -> dict[str, Any]:
-    result = refresh_current_prices(
+    return refresh_current_prices(
         db, portfolio_id, threshold_pct=resolve_threshold(db, username, threshold_pct, "alert_daily_change_pct")
     )
-    snapshot_daily_alerts(db, portfolio_id, threshold_pct=resolve_threshold(db, username, None, "alert_drop_pct"))
-    db.commit()
-    return result
 
 
 @app.post("/stocks/recalculate")
@@ -2706,9 +2686,6 @@ def recalculate_stock_data(
         result = recalculate_stocks(
             db, portfolio_id, dry_run=dry_run, date_from=date_from, threshold_pct=effective_threshold, drop_threshold_pct=drop_threshold
         )
-        if not dry_run:
-            snapshot_daily_alerts(db, portfolio_id, threshold_pct=drop_threshold)
-            db.commit()
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 - last-resort safety net, see above

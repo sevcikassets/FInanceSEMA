@@ -836,17 +836,6 @@ function chartPercent(value: number) {
   return new Intl.NumberFormat("cs-CZ", { style: "percent", maximumFractionDigits: 1 }).format(value || 0);
 }
 
-// DailyAlertLog.detail's shape depends on alert_type (see the backend
-// docstring) - this branches the same way the live /stocks/alerts panel
-// already renders each category, just reading from the stored snapshot.
-function formatAlertHistoryValue(entry: Row): string {
-  const detail = (entry.detail as Record<string, unknown>) || {};
-  if (entry.alert_type === "watchlist_limit") {
-    return `${formatValue("current_price", detail.current_price as Row[string])} / limit ${formatValue("limit_price", detail.limit_price as Row[string])}`;
-  }
-  return formatValue("profit_pct", detail.profit_pct as Row[string]);
-}
-
 // Every destructive delete asks for confirmation first, naming the specific
 // record so a mis-click is caught before it's permanent - there's no undo
 // for any of these.
@@ -1148,8 +1137,6 @@ export default function Page() {
   const [latestRates, setLatestRates] = useState<LatestRates | null>(null);
   const [stockOverview, setStockOverview] = useState<StockOverview | null>(null);
   const [alerts, setAlerts] = useState<Alerts | null>(null);
-  const [alertHistory, setAlertHistory] = useState<Row[]>([]);
-  const [alertHistoryOpen, setAlertHistoryOpen] = useState(false);
   const [benchmark, setBenchmark] = useState<Row[]>([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -1379,16 +1366,6 @@ export default function Page() {
                     .some((field) => String(field || "").toLowerCase().includes(needle));
                 })
               : rows;
-  const alertHistoryByDate = useMemo(() => {
-    const groups = new Map<string, Row[]>();
-    for (const row of alertHistory) {
-      const key = String(row.stat_date || "");
-      const list = groups.get(key) || [];
-      list.push(row);
-      groups.set(key, list);
-    }
-    return [...groups.entries()]; // already ordered stat_date desc by the API
-  }, [alertHistory]);
 
   const chartData = useMemo(() => {
     if (activeTab !== "charts") return [];
@@ -1592,7 +1569,6 @@ export default function Page() {
     try {
       const needsStockOverview = STOCK_OVERVIEW_TABS.includes(activeTab);
       const needsAlerts = activeTab === "alerts";
-      const needsAlertHistory = activeTab === "alerts";
       // "alerts", "settings" and "subjects" render their own panel from
       // dedicated state (alerts/currentUser/portfolios) rather than the
       // generic rows table, and "alerts"/"settings"'s tab endpoint
@@ -1626,7 +1602,6 @@ export default function Page() {
       if (activeTab === "rates") requests.push(api("/rates/latest"));
       if (needsStockOverview) requests.push(api(withPortfolio("/stocks/overview")));
       if (needsAlerts) requests.push(api(withPortfolio("/stocks/alerts")));
-      if (needsAlertHistory) requests.push(api(withPortfolio("/stocks/alerts/history")));
       if (needsPortfolioList) requests.push(api("/portfolios"));
       if (needsAllParties) requests.push(api("/parties"));
       if (needsDuplicateParties) requests.push(api("/parties/duplicate-candidates"));
@@ -1643,7 +1618,6 @@ export default function Page() {
       if (activeTab === "rates") setLatestRates(rest[restIndex++] as LatestRates);
       if (needsStockOverview) setStockOverview(rest[restIndex++] as StockOverview);
       if (needsAlerts) setAlerts(rest[restIndex++] as Alerts);
-      if (needsAlertHistory) setAlertHistory(rest[restIndex++] as Row[]);
       if (needsPortfolioList) setPortfolios(rest[restIndex++] as { id: string; name: string }[]);
       if (needsAllParties) setAllParties(rest[restIndex++] as Row[]);
       if (needsDuplicateParties) {
@@ -4517,55 +4491,6 @@ export default function Page() {
                 </div>
               </div>
             )}
-          </section>
-        )}
-
-        {activeTab === "alerts" && (
-          <section className="work-panel compact-panel">
-            <div className="panel-header">
-              <div>
-                <h2>Historie upozornění</h2>
-                <p>
-                  Denní záznam sledovaných titulů pod limitní cenou a propadů portfolia - pro zpětnou analýzu, co se kdy
-                  dělo. Ukládá se při každé aktualizaci cen nebo přepočtu portfolia.
-                </p>
-              </div>
-              <button type="button" className="link-button" onClick={() => setAlertHistoryOpen((value) => !value)}>
-                {alertHistoryOpen ? "Skrýt historii" : `Zobrazit historii (${alertHistoryByDate.length} dní)`}
-              </button>
-            </div>
-            {alertHistoryOpen &&
-              (alertHistoryByDate.length === 0 ? (
-                <p className="alert-empty">Zatím žádná historie - založí se při dalším přepočtu nebo aktualizaci cen.</p>
-              ) : (
-                <div className="alert-history-list">
-                  {alertHistoryByDate.map(([dateKey, entries]) => (
-                    <div key={dateKey}>
-                      <h3>{formatDateWithWeekday(dateKey)}</h3>
-                      <table>
-                        <thead>
-                          <tr>
-                            <th>Kategorie</th>
-                            <th>Ticker</th>
-                            <th>Název</th>
-                            <th>Hodnota</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {entries.map((entry) => (
-                            <tr key={String(entry.id)}>
-                              <td>{entry.alert_type === "watchlist_limit" ? "Sledované pod limitem" : "Propad portfolia"}</td>
-                              <td>{String(entry.ticker || "")}</td>
-                              <td>{String(entry.name || "")}</td>
-                              <td className="numeric-cell">{formatAlertHistoryValue(entry)}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  ))}
-                </div>
-              ))}
           </section>
         )}
 

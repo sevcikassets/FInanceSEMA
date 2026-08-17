@@ -1088,18 +1088,6 @@ nav button:hover {
   font-size: 14px;
 }
 
-.alert-history-list {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-  margin-top: 14px;
-}
-
-.alert-history-list h3 {
-  margin: 0 0 8px;
-  font-size: 14px;
-}
-
 .evaluation-line-toggle {
   display: inline-flex;
   align-items: center;
