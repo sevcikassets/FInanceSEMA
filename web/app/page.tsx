@@ -950,11 +950,16 @@ function buildStatisticRows(rows: Row[], expandedMonths: Set<string>) {
     const sortedRows = [...groupRows].sort((a, b) => String(b.stat_date).localeCompare(String(a.stat_date)));
     const latest = sortedRows[0];
     const expanded = expandedMonths.has(monthKey);
+    // "Varování" is inherently a per-day thing - concatenating every day's
+    // raw alert text into one summary cell produced an unreadable wall of
+    // text for the whole month. A day count is the useful summary; the
+    // actual text is still visible per-day once the month is expanded.
+    const daysWithAlerts = sortedRows.filter((row) => row.alerts).length;
     const summary: Row = {
       row_kind: "summary",
       month_key: monthKey,
       period_label: monthLabel(`${monthKey}-01`),
-      alerts: sortedRows.map((row) => row.alerts).filter(Boolean).join(" | "),
+      alerts: daysWithAlerts > 0 ? `${daysWithAlerts} ${daysWithAlerts === 1 ? "den" : daysWithAlerts < 5 ? "dny" : "dní"} s upozorněním` : "",
     };
     for (const col of statSumColumns) {
       summary[col] = sortedRows.reduce((total, row) => total + numberValue(row[col]), 0);
