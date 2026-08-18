@@ -57,8 +57,8 @@ from .loan_calc import (
     amortization_schedule,
     annual_interest_from_schedule,
     loan_movement_annual_interest,
-    loan_movement_interest_in_range,
     loan_movement_schedule,
+    loan_relationship_interest_in_range,
     project_annual_interest,
 )
 from .models import (
@@ -419,7 +419,7 @@ def amortization_interest_in_period(
     Missing inputs (no rate/term) yield an empty schedule, contributing 0 -
     same "missing inputs -> nothing" contract amortization_schedule already
     has, no special-casing needed here. NOT used for LoanMovement (see
-    loan_movement_interest_in_range instead - a private loan has no
+    loan_relationship_interest_in_range instead - a private loan has no
     amortization schedule of its own)."""
     schedule = amortization_schedule(
         pv=pv,
@@ -450,40 +450,60 @@ def classify_loan_interest(
     liability, no self-party ambiguity - matches computed_interest_plan's
     existing "debt_interest = paid" framing).
 
+    LoanMovements are grouped by directed (lender_id, borrower_id) pair
+    before computing interest - the same "who owes whom" netting
+    /loans/balances already does - since a real credit relationship is
+    often several rows over time (draws/top-ups/repayments) rather than one
+    row per loan (see loan_relationship_interest_in_range). A movement's own
+    completed_at, if set, is folded in as a same-relationship reversal
+    event dated the day after (so interest still accrues through
+    completed_at inclusive, matching the old per-movement behaviour).
+
     Returns (total_received, total_paid, detail) where detail is a flat list
-    of every non-zero contributor - used both for the stored aggregate
-    (compute_monthly_evaluation, which only keeps the two totals) and the
-    on-demand interest-detail endpoint (recomputed live, never persisted,
-    since it's cheap and re-deriving avoids a second child table to keep in
-    sync with the aggregate)."""
+    of every non-zero contributor (one per relationship, not per movement) -
+    used both for the stored aggregate (compute_monthly_evaluation, which
+    only keeps the two totals) and the on-demand interest-detail endpoint
+    (recomputed live, never persisted, since it's cheap and re-deriving
+    avoids a second child table to keep in sync with the aggregate)."""
     interest_received = Decimal("0")
     interest_paid = Decimal("0")
     detail: list[dict[str, Any]] = []
 
     period_start, period_end = period_bounds(period)
     party_names = {p.id: p.name for p in db.scalars(select(Party)).all()}
-    for movement in db.scalars(select(LoanMovement).where(LoanMovement.portfolio_id == portfolio_id)).all():
-        lender_is_self = movement.lender_id in self_party_ids
-        borrower_is_self = movement.borrower_id in self_party_ids
+
+    relationships: dict[tuple[uuid.UUID | None, uuid.UUID | None], list[LoanMovement]] = defaultdict(list)
+    for movement in db.scalars(
+        select(LoanMovement).where(LoanMovement.portfolio_id == portfolio_id, LoanMovement.movement_date.is_not(None))
+    ).all():
+        relationships[(movement.lender_id, movement.borrower_id)].append(movement)
+
+    for (lender_id, borrower_id), movements in relationships.items():
+        lender_is_self = lender_id in self_party_ids
+        borrower_is_self = borrower_id in self_party_ids
         if lender_is_self == borrower_is_self:
             continue  # both self (internal transfer) or neither (not this Subjekt's business) -> excluded
-        interest = loan_movement_interest_in_range(
-            movement.amount, movement.interest_rate, movement.movement_date, period_start, period_end, movement.completed_at
-        )
+        events: list[tuple[date, Decimal, Decimal | None]] = []
+        for movement in movements:
+            amount = movement.amount or Decimal("0")
+            events.append((movement.movement_date, amount, movement.interest_rate))
+            if movement.completed_at:
+                events.append((movement.completed_at + timedelta(days=1), -amount, None))
+        interest = loan_relationship_interest_in_range(events, period_start, period_end)
         if interest == 0:
             continue
         if lender_is_self:
             interest_received += interest
-            counterparty = party_names.get(movement.borrower_id)
+            counterparty = party_names.get(borrower_id)
         else:
             interest_paid += interest
-            counterparty = party_names.get(movement.lender_id)
+            counterparty = party_names.get(lender_id)
         detail.append(
             {
                 "direction": "received" if lender_is_self else "paid",
                 "source": "loan",
                 "counterparty": counterparty,
-                "description": movement.description,
+                "description": movements[0].description if len(movements) == 1 else f"{len(movements)} pohybů",
                 "interest_czk": json_value(interest),
             }
         )

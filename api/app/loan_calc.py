@@ -26,7 +26,7 @@ the source workbook, were never actually populated.
 from __future__ import annotations
 
 import calendar
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable, TypedDict
 
@@ -252,27 +252,71 @@ def annual_interest_from_schedule(
 # interest naturally stays close to principal * rate / 12 each month, varying
 # only with each month's actual day count, matching how a real private loan
 # with a single bullet repayment at maturity actually accrues interest.
-def loan_movement_interest_in_range(
-    amount: Decimal | float | None,
-    interest_rate: Decimal | float | None,
-    movement_date: date | None,
+def loan_relationship_interest_in_range(
+    movements: Iterable[tuple[date, Decimal | float, Decimal | float | None]],
     range_start: date,
     range_end: date,
-    completed_at: date | None = None,
 ) -> Decimal:
-    """Simple interest for however much of [range_start, range_end]
-    (inclusive) the loan was actually outstanding - stops accruing at
-    completed_at if the loan was already repaid by then."""
-    if not amount or not interest_rate or not movement_date:
-        return Decimal("0")
-    outstanding_until = completed_at if completed_at else range_end
-    overlap_start = max(range_start, movement_date)
-    overlap_end = min(range_end, outstanding_until)
-    days = (overlap_end - overlap_start).days + 1
-    if days <= 0:
-        return Decimal("0")
-    interest = Decimal(str(amount)) * Decimal(str(interest_rate)) * Decimal(days) / Decimal(365)
+    """Simple (non-amortizing) interest on the running NET balance of a
+    lender-borrower relationship, for whatever portion of [range_start,
+    range_end] the balance was actually positive with a known rate in force.
+
+    A private loan (Zápůjčka/Půjčka) is often tracked as several
+    LoanMovement rows between the SAME two parties over time - an initial
+    draw, later top-ups, partial or full repayments booked as separate
+    signed-amount rows (real data: a relationship's rows sum to exactly 0
+    once fully repaid) - rather than one row per loan. Treating each row as
+    its own isolated loan ignores that later, un-rated rows are draws/
+    repayments against the SAME balance, and never stops accruing interest
+    on an earlier row once it's actually been repaid via a later negative-
+    amount row.
+
+    `movements` is (event_date, signed_amount, interest_rate) tuples - one
+    per LoanMovement in the relationship (a completed_at-based repayment
+    should already be folded in by the caller as its own negative-amount
+    event, see classify_loan_interest). `interest_rate` may be None: an
+    explicit rate, once set on any movement, carries forward to every later
+    movement that doesn't specify its own - a rate is typically entered
+    once when a credit line opens, not repeated on every draw/repayment.
+    No rate ever set for the relationship means no interest, matching the
+    single-loan case. Interest only accrues while the running balance is
+    positive - once repaid to zero (or below, in the same lender->borrower
+    direction), no further interest accrues even if the balance later rises
+    again without a fresh explicit rate."""
+    events = sorted(movements, key=lambda item: item[0])
+    interest = Decimal("0")
+    balance = Decimal("0")
+    rate: Decimal | None = None
+    for index, (event_date, amount, event_rate) in enumerate(events):
+        balance += Decimal(str(amount))
+        if event_rate is not None:
+            rate = Decimal(str(event_rate))
+        next_date = events[index + 1][0] if index + 1 < len(events) else None
+        segment_end = (next_date - timedelta(days=1)) if next_date else range_end
+        if balance <= 0 or rate is None:
+            continue
+        overlap_start = max(event_date, range_start)
+        overlap_end = min(segment_end, range_end)
+        days = (overlap_end - overlap_start).days + 1
+        if days <= 0:
+            continue
+        interest += balance * rate * Decimal(days) / Decimal(365)
     return interest.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+
+
+def _single_movement_events(
+    amount: Decimal | float, interest_rate: Decimal | float, movement_date: date, completed_at: date | None
+) -> list[tuple[date, Decimal | float, Decimal | float | None]]:
+    """A lone LoanMovement expressed as a one-relationship event list for
+    loan_relationship_interest_in_range - used by the per-movement
+    projection/schedule below, which (unlike classify_loan_interest) always
+    treat a single row as its own standalone loan. completed_at, if set, is
+    folded in as a reversal dated the day after, so interest still accrues
+    through completed_at inclusive."""
+    events: list[tuple[date, Decimal | float, Decimal | float | None]] = [(movement_date, amount, interest_rate)]
+    if completed_at:
+        events.append((completed_at + timedelta(days=1), -Decimal(str(amount)), None))
+    return events
 
 
 def loan_movement_annual_interest(
@@ -283,18 +327,17 @@ def loan_movement_annual_interest(
     completed_at: date | None = None,
     years: Iterable[int] = DEFAULT_PROJECTION_YEARS,
 ) -> dict[int, Decimal]:
-    """loan_movement_interest_in_range, summed per calendar year - the
-    LoanMovement analogue of project_annual_interest (which is specific to
-    a mortgage's amortization). Requires planned_end_date, same as
-    project_annual_interest requires a term, so the projection has a
-    defined stopping point."""
+    """loan_relationship_interest_in_range for a single movement, summed
+    per calendar year - the LoanMovement analogue of project_annual_interest
+    (which is specific to a mortgage's amortization). Requires
+    planned_end_date, same as project_annual_interest requires a term, so
+    the projection has a defined stopping point."""
     if not amount or not interest_rate or not movement_date or not planned_end_date:
         return {}
+    events = _single_movement_events(amount, interest_rate, movement_date, completed_at)
     result: dict[int, Decimal] = {}
     for year in years:
-        interest = loan_movement_interest_in_range(
-            amount, interest_rate, movement_date, date(year, 1, 1), min(date(year, 12, 31), planned_end_date), completed_at
-        )
+        interest = loan_relationship_interest_in_range(events, date(year, 1, 1), min(date(year, 12, 31), planned_end_date))
         if interest:
             result[year] = interest
     return result
@@ -312,10 +355,11 @@ def loan_movement_schedule(
     it sits flat at `amount` until a single bullet repayment on the final
     row, dated at completed_at (already repaid) or planned_end_date
     (projected). Each row's interest is that month's actual-day-count
-    share (see loan_movement_interest_in_range)."""
+    share (see loan_relationship_interest_in_range)."""
     end = completed_at or planned_end_date
     if not amount or not interest_rate or not movement_date or not end or end < movement_date:
         return []
+    events = _single_movement_events(amount, interest_rate, movement_date, completed_at)
     principal_value = Decimal(str(amount)).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
     schedule: list[SchedulePeriod] = []
     cursor = date(movement_date.year, movement_date.month, 1)
@@ -324,7 +368,7 @@ def loan_movement_schedule(
         month_end = date(cursor.year, cursor.month, calendar.monthrange(cursor.year, cursor.month)[1])
         is_final = month_end >= end
         row_date = end if is_final else month_end
-        interest = loan_movement_interest_in_range(amount, interest_rate, movement_date, cursor, row_date, completed_at)
+        interest = loan_relationship_interest_in_range(events, cursor, row_date)
         principal = principal_value if is_final else Decimal("0.00")
         period += 1
         schedule.append(

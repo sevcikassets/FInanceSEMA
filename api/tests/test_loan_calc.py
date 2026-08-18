@@ -11,8 +11,8 @@ from app.loan_calc import (
     annual_interest_from_schedule,
     cumulative_interest,
     loan_movement_annual_interest,
-    loan_movement_interest_in_range,
     loan_movement_schedule,
+    loan_relationship_interest_in_range,
     monthly_rate,
     number_of_periods,
     period_window,
@@ -221,44 +221,75 @@ def test_annual_interest_from_schedule_sums_by_calendar_year():
 
 # A LoanMovement (Zápůjčka/Půjčka) is not a mortgage - it has no schedule of
 # its own principal repayments, so its interest must be plain simple interest
-# on a constant principal (see loan_movement_interest_in_range's docstring),
+# on a constant (or, when several movements share a lender/borrower pair,
+# running) balance (see loan_relationship_interest_in_range's docstring),
 # NOT amortization_schedule's fixed-payment annuity model (which would make
 # the "interest" portion shrink every month as if principal were being paid
 # down, even though it isn't).
 
 
-def test_loan_movement_interest_in_range_missing_inputs_returns_zero():
-    assert loan_movement_interest_in_range(None, Decimal("0.06"), date(2024, 1, 1), date(2024, 1, 1), date(2024, 1, 31)) == Decimal("0")
-    assert loan_movement_interest_in_range(Decimal("100000"), None, date(2024, 1, 1), date(2024, 1, 1), date(2024, 1, 31)) == Decimal("0")
-    assert loan_movement_interest_in_range(Decimal("100000"), Decimal("0.06"), None, date(2024, 1, 1), date(2024, 1, 31)) == Decimal("0")
+def test_loan_relationship_interest_missing_rate_or_empty_returns_zero():
+    assert loan_relationship_interest_in_range([], date(2024, 1, 1), date(2024, 1, 31)) == Decimal("0")
+    assert loan_relationship_interest_in_range(
+        [(date(2024, 1, 1), Decimal("100000"), None)], date(2024, 1, 1), date(2024, 1, 31)
+    ) == Decimal("0")
 
 
-def test_loan_movement_interest_in_range_is_simple_interest_on_full_days():
+def test_loan_relationship_interest_is_simple_interest_on_full_days():
     # 1 200 000 * 6% * 31/365 (January) - plain principal * rate * days/365,
-    # not a monthly_rate/12 approximation.
-    interest = loan_movement_interest_in_range(
-        Decimal("1200000"), Decimal("0.06"), date(2024, 1, 1), date(2024, 1, 1), date(2024, 1, 31)
+    # not a monthly_rate/12 approximation. A single movement is the simplest
+    # possible "relationship" (just itself).
+    interest = loan_relationship_interest_in_range(
+        [(date(2024, 1, 1), Decimal("1200000"), Decimal("0.06"))], date(2024, 1, 1), date(2024, 1, 31)
     )
     expected = (Decimal("1200000") * Decimal("0.06") * Decimal(31) / Decimal(365)).quantize(Decimal("0.01"))
     assert interest == expected
 
 
-def test_loan_movement_interest_in_range_stops_at_completed_at():
-    # Repaid mid-month - only the days actually outstanding accrue interest.
-    interest = loan_movement_interest_in_range(
-        Decimal("1200000"), Decimal("0.06"), date(2024, 7, 1), date(2024, 7, 1), date(2024, 7, 31), completed_at=date(2024, 7, 15)
-    )
+def test_loan_relationship_interest_zero_before_movement_date():
+    assert loan_relationship_interest_in_range(
+        [(date(2024, 8, 1), Decimal("1200000"), Decimal("0.06"))], date(2024, 1, 1), date(2024, 7, 31)
+    ) == Decimal("0")
+
+
+def test_loan_relationship_interest_multiple_movements_nets_running_balance():
+    # Real data pattern this feature was built for: several draws/repayments
+    # between the SAME lender/borrower pair over time (not one row per
+    # loan), netting to exactly 0 once fully repaid. Only the first movement
+    # carries an explicit rate - it must carry forward to the later,
+    # un-rated draws/repayments (a rate is entered once, not on every row).
+    movements = [
+        (date(2024, 5, 14), Decimal("250000"), Decimal("0.04")),
+        (date(2024, 5, 29), Decimal("500000"), Decimal("0.04")),
+        (date(2024, 7, 12), Decimal("-500000"), None),
+        (date(2024, 9, 26), Decimal("750000"), None),
+        (date(2025, 2, 6), Decimal("-1000000"), None),
+    ]
+    # Balance after each event: 250k, 750k, 250k, 1 000k, 0.
+    assert sum(amount for _, amount, _ in movements) == Decimal("0")
+
+    # June: constant 750 000 balance for the whole month at the carried-
+    # forward 4% rate.
+    june_interest = loan_relationship_interest_in_range(movements, date(2024, 6, 1), date(2024, 6, 30))
+    expected_june = (Decimal("750000") * Decimal("0.04") * Decimal(30) / Decimal(365)).quantize(Decimal("0.01"))
+    assert june_interest == expected_june
+
+    # After full repayment (balance 0), no further interest accrues even
+    # though the relationship technically still exists.
+    assert loan_relationship_interest_in_range(movements, date(2025, 3, 1), date(2025, 3, 31)) == Decimal("0")
+
+
+def test_loan_relationship_interest_stops_at_completed_at_reversal():
+    # The caller (classify_loan_interest) folds a movement's own completed_at
+    # in as a same-relationship reversal event dated the day after, so
+    # interest still accrues through completed_at inclusive.
+    events = [
+        (date(2024, 7, 1), Decimal("1200000"), Decimal("0.06")),
+        (date(2024, 7, 16), Decimal("-1200000"), None),  # completed_at (7/15) + 1 day
+    ]
+    interest = loan_relationship_interest_in_range(events, date(2024, 7, 1), date(2024, 7, 31))
     expected = (Decimal("1200000") * Decimal("0.06") * Decimal(15) / Decimal(365)).quantize(Decimal("0.01"))
     assert interest == expected
-
-
-def test_loan_movement_interest_in_range_zero_before_movement_date_or_after_repayment():
-    assert loan_movement_interest_in_range(
-        Decimal("1200000"), Decimal("0.06"), date(2024, 8, 1), date(2024, 1, 1), date(2024, 7, 31)
-    ) == Decimal("0")
-    assert loan_movement_interest_in_range(
-        Decimal("1200000"), Decimal("0.06"), date(2024, 1, 1), date(2024, 8, 1), date(2024, 8, 31), completed_at=date(2024, 7, 15)
-    ) == Decimal("0")
 
 
 def test_loan_movement_annual_interest_requires_planned_end_date():

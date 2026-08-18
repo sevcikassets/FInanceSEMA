@@ -120,6 +120,78 @@ def test_evaluation_classifies_interest_by_self_party_membership(client, db_sess
 
 
 @requires_db
+def test_evaluation_interest_nets_multiple_movements_between_same_pair(client, db_session, portfolio_id):
+    """Real production data: a running credit relationship between two
+    parties tracked as several LoanMovement rows over time (draws/top-ups/
+    repayments as separate signed-amount rows, netting to exactly 0 once
+    fully repaid) rather than one row per loan - only the first movement
+    carries an explicit rate. Treating each row as its own isolated loan
+    (the old behaviour) would only accrue interest on the two small rated
+    rows forever, ignoring that the later, un-rated 750 000 top-up is part
+    of the SAME balance, and never stopping once the relationship was fully
+    settled via a later negative-amount row.
+
+    Running balance over time: 250k (5/14), 750k (5/29), 250k (7/12 partial
+    repayment), 1 000k (9/26 top-up), 0 (2025-02-06 full repayment)."""
+    from app.models import LoanMovement, Party
+
+    lender = Party(name="Věřitel Test", kind="unknown")
+    borrower = Party(name="Dlužník Test", kind="unknown")
+    db_session.add_all([lender, borrower])
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    set_self = client.put(
+        f"/portfolios/{portfolio_id}/self-parties", headers=headers, json={"party_ids": [str(lender.id)]}
+    )
+    assert set_self.status_code == 200
+
+    db_session.add_all(
+        [
+            LoanMovement(
+                portfolio_id=portfolio_id, lender_id=lender.id, borrower_id=borrower.id,
+                movement_date=date(2024, 5, 14), amount=Decimal("250000"), interest_rate=Decimal("0.04"),
+            ),
+            LoanMovement(
+                portfolio_id=portfolio_id, lender_id=lender.id, borrower_id=borrower.id,
+                movement_date=date(2024, 5, 29), amount=Decimal("500000"), interest_rate=Decimal("0.04"),
+            ),
+            LoanMovement(
+                portfolio_id=portfolio_id, lender_id=lender.id, borrower_id=borrower.id,
+                movement_date=date(2024, 7, 12), amount=Decimal("-500000"),
+            ),
+            LoanMovement(
+                portfolio_id=portfolio_id, lender_id=lender.id, borrower_id=borrower.id,
+                movement_date=date(2024, 9, 26), amount=Decimal("750000"),
+            ),
+            LoanMovement(
+                portfolio_id=portfolio_id, lender_id=lender.id, borrower_id=borrower.id,
+                movement_date=date(2025, 2, 6), amount=Decimal("-1000000"),
+            ),
+        ]
+    )
+    db_session.commit()
+
+    # October: balance is 1 000 000 (the 9/26 top-up, itself un-rated, added
+    # on top of the 250 000 left after the 7/12 partial repayment) - must
+    # accrue at the 4% rate carried forward from 5/14, not 0%.
+    october = client.post("/evaluations/compute", headers=headers, params={**params, "period": "2024-10"})
+    assert october.status_code == 200
+    october_body = october.json()
+    expected_october = float((Decimal("1000000") * Decimal("0.04") * Decimal(31) / Decimal(365)).quantize(Decimal("0.01")))
+    assert october_body["interest_received_czk"] == pytest.approx(expected_october)
+
+    # March 2025: fully repaid (balance nets to exactly 0 on 2025-02-06) -
+    # no interest despite the relationship still existing.
+    march = client.post("/evaluations/compute", headers=headers, params={**params, "period": "2025-03"})
+    assert march.status_code == 200
+    assert march.json()["interest_received_czk"] == 0
+
+
+@requires_db
 def test_evaluation_compute_upserts_not_accumulates(client, db_session, portfolio_id):
     from app.models import Asset, AssetCost, MonthlyEvaluation
 
