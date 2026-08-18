@@ -162,7 +162,14 @@ def parse_patria_text(text: str) -> list[PatriaTrade]:
     # before splitting handles that transparently; a plain single-tab paste
     # (e.g. hand-built TSV, or the older format this parser originally
     # targeted) is unaffected since it has no repeated tabs to collapse.
-    lines = [re.sub(r"\t+", "\t", line) for line in text.splitlines() if line.strip()]
+    # The export also inserts a horizontal-rule line of underscores between
+    # each trade's two-line block - not blank, so a naive blank-line filter
+    # leaves it in, throwing off the "always process two lines at a time"
+    # pairing below and silently dropping every other trade from that point
+    # on (confirmed against a real 5-trade paste that only produced 3 rows).
+    lines = [
+        re.sub(r"\t+", "\t", line) for line in text.splitlines() if line.strip() and line.strip().strip("_")
+    ]
     trades: list[PatriaTrade] = []
     index = 0
     while index + 1 < len(lines):

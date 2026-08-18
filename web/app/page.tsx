@@ -4744,13 +4744,14 @@ export default function Page() {
                   </button>
                 </div>
                 {patriaImportOpen && (
-                  <>
+                  <div className="patria-import-form">
                     <label>
                       Import Patria
                       <textarea
+                        className="patria-import-textarea"
                         value={patriaText}
                         onChange={(event) => setPatriaText(event.target.value)}
-                        placeholder="Vložte zkopírovaný dvouřádkový export obchodů z Patrie"
+                        placeholder="Vložte zkopírovaný export obchodů z Patrie"
                         autoFocus
                       />
                     </label>
@@ -4758,7 +4759,7 @@ export default function Page() {
                       <Download size={16} />
                       <span>Importovat Patria</span>
                     </button>
-                  </>
+                  </div>
                 )}
               </div>
             )}

@@ -113,6 +113,51 @@ def test_parse_patria_text_handles_double_tab_spacer_columns():
     assert trade.gross_amount_ccy == Decimal("87.55")
 
 
+def test_parse_patria_text_ignores_underscore_separator_lines_between_trades():
+    # Patria's web export inserts a horizontal-rule line of underscores
+    # between each trade's two-line block. It isn't blank, so it used to
+    # survive the blank-line filter and throw off the "always process two
+    # lines at a time" pairing, silently dropping every other trade from
+    # that point on - a real 5-trade paste in this exact shape only ever
+    # produced 3 trades (this one, the middle two, were lost).
+    text = (
+        "Datum obchodu\t\tPočet kusů\t\tSměr\t\tNázev cenného papíru\t\tProvize\t\tTyp pokynu\t\tTrh\t\tProtistrana\n"
+        "Datum vypořádání\t\tCena za kus\t\tAUV\t\tISIN\t\tPoplatek trhu\t\tCelková cena\t\tMěna\t\n"
+        "\n"
+        "18.08.2026 16:11:30\t\t1,00\t\tNákup\t\tVanEck Semiconductor UCITS ETF\t\t5,18\t\tLimit\t\tXETR\t\n"
+        "20.08.2026\t\t92,00\t\t0,00\t\tIE00BMC38736\t\t0,00\t\t97,18\t\tEUR\t\n"
+        "________________________________________\n"
+        "18.08.2026 10:06:05\t\t1,00\t\tNákup\t\tAmundi MSCI Robotics & AI\t\t5,33\t\tLimit\t\tXPAR\t\n"
+        "20.08.2026\t\t144,00\t\t0,00\t\tLU1861132840\t\t0,00\t\t149,33\t\tEUR\t\n"
+        "________________________________________\n"
+        "18.08.2026 17:11:00\t\t5,00\t\tNákup\t\tiShares Automation & Robotics\t\t5,99\t\tLimit\t\tXLON\t\n"
+        "20.08.2026\t\t21,35\t\t0,00\t\tIE00BYZK4552\t\t0,00\t\t112,74\t\tUSD\t\n"
+        "________________________________________\n"
+        "18.08.2026 09:56:21\t\t2,00\t\tNákup\t\tVanguard FTSE All-World UCITS ETF\t\t5,91\t\tLimit\t\tXETR\t\n"
+        "20.08.2026\t\t167,50\t\t0,00\t\tIE00BK5BQT80\t\t0,00\t\t340,91\t\tEUR\t\n"
+        "________________________________________\n"
+        "18.08.2026 17:09:07\t\t2,00\t\tNákup\t\tISHARES PHYSICAL SILVER ETC\t\t6,04\t\tLimit\t\tXLON\t\n"
+        "20.08.2026\t\t61,00\t\t0,00\t\tIE00B4NCWG09\t\t0,00\t\t128,04\t\tUSD\t\n"
+        "________________________________________\n"
+    )
+    trades = parse_patria_text(text)
+    assert len(trades) == 5
+    assert [t.isin for t in trades] == [
+        "IE00BMC38736",
+        "LU1861132840",
+        "IE00BYZK4552",
+        "IE00BK5BQT80",
+        "IE00B4NCWG09",
+    ]
+    assert [t.instrument_name for t in trades] == [
+        "VanEck Semiconductor UCITS ETF",
+        "Amundi MSCI Robotics & AI",
+        "iShares Automation & Robotics",
+        "Vanguard FTSE All-World UCITS ETF",
+        "ISHARES PHYSICAL SILVER ETC",
+    ]
+
+
 def test_extract_quote_reads_chart_endpoint_shape():
     # /v8/finance/chart response shape
     payload = {"chart": {"result": [{"meta": {"regularMarketPrice": 123.45, "currency": "USD"}}]}}
