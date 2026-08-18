@@ -665,6 +665,11 @@ nav button:hover {
   align-items: end;
 }
 
+.loan-filter-row {
+  grid-template-columns: minmax(200px, 280px) minmax(140px, 160px) minmax(140px, 160px) auto;
+  align-items: end;
+}
+
 .latest-rate-row {
   display: grid;
   grid-template-columns: minmax(140px, 1fr) minmax(120px, 1fr) minmax(120px, 1fr);

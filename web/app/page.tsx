@@ -1003,9 +1003,37 @@ function buildCostRows(rows: Row[], assetFilter: string, showDetail: boolean) {
 // data (a "Leden 2023"/"2023" row physically sitting between real
 // movements); the app now computes them itself instead of importing them as
 // if they were real loan movements.
-function buildLoanRows(rows: Row[], expandedYears: Set<string>, expandedMonths: Set<string>) {
+function loanRowMatchesFilter(row: Row, needle: string, dateFrom: string, dateTo: string): boolean {
+  if (needle) {
+    const matches = [row.lender, row.borrower, row.description, row.period_label].some((field) =>
+      String(field || "").toLowerCase().includes(needle),
+    );
+    if (!matches) return false;
+  }
+  const movementDate = String(row.movement_date || "");
+  if (dateFrom && movementDate < dateFrom) return false;
+  if (dateTo && movementDate > dateTo) return false;
+  return true;
+}
+
+function buildLoanRows(
+  rows: Row[],
+  expandedYears: Set<string>,
+  expandedMonths: Set<string>,
+  filterText: string,
+  dateFrom: string,
+  dateTo: string,
+) {
+  const needle = filterText.trim().toLowerCase();
+  const filterActive = Boolean(needle || dateFrom || dateTo);
+  // A search should surface every match immediately, not require manually
+  // expanding each year/month it happens to fall under - so while a filter
+  // is active, every group renders fully expanded regardless of the user's
+  // own collapse/expand state (restored as soon as the filter is cleared).
+  const filteredRows = filterActive ? rows.filter((row) => loanRowMatchesFilter(row, needle, dateFrom, dateTo)) : rows;
+
   const byYear = new Map<string, Row[]>();
-  for (const row of rows) {
+  for (const row of filteredRows) {
     const dateText = String(row.movement_date || "");
     if (!dateText) continue;
     const year = dateText.slice(0, 4);
@@ -1022,7 +1050,7 @@ function buildLoanRows(rows: Row[], expandedYears: Set<string>, expandedMonths: 
       period_label: `Rok ${year}`,
       amount: yearRows.reduce((total, row) => total + numberValue(row.amount), 0),
     });
-    if (!expandedYears.has(year)) continue;
+    if (!expandedYears.has(year) && !filterActive) continue;
 
     const byMonth = new Map<string, Row[]>();
     for (const row of yearRows) {
@@ -1039,7 +1067,7 @@ function buildLoanRows(rows: Row[], expandedYears: Set<string>, expandedMonths: 
         period_label: monthLabel(`${monthKey}-01`),
         amount: monthRows.reduce((total, row) => total + numberValue(row.amount), 0),
       });
-      if (!expandedMonths.has(monthKey)) continue;
+      if (!expandedMonths.has(monthKey) && !filterActive) continue;
 
       const sortedRows = [...monthRows].sort((a, b) => String(b.movement_date || "").localeCompare(String(a.movement_date || "")));
       for (const row of sortedRows) {
@@ -1143,6 +1171,9 @@ export default function Page() {
   const [expandedStatMonths, setExpandedStatMonths] = useState<Set<string>>(() => new Set());
   const [expandedLoanYears, setExpandedLoanYears] = useState<Set<string>>(() => new Set());
   const [expandedLoanMonths, setExpandedLoanMonths] = useState<Set<string>>(() => new Set());
+  const [loanFilter, setLoanFilter] = useState("");
+  const [loanDateFrom, setLoanDateFrom] = useState("");
+  const [loanDateTo, setLoanDateTo] = useState("");
   const [editingLoanId, setEditingLoanId] = useState<string | null>(null);
   const [loanDraft, setLoanDraft] = useState({
     movement_date: "",
@@ -1360,13 +1391,18 @@ export default function Page() {
   const transactionFiltersActive = Boolean(
     transactionFilter.trim() || transactionTypeFilter || transactionDateFrom || transactionDateTo,
   );
+  const loanFilteredCount = useMemo(() => {
+    const needle = loanFilter.trim().toLowerCase();
+    if (!needle && !loanDateFrom && !loanDateTo) return rows.length;
+    return rows.filter((row) => loanRowMatchesFilter(row, needle, loanDateFrom, loanDateTo)).length;
+  }, [rows, loanFilter, loanDateFrom, loanDateTo]);
   const tableRows =
     activeTab === "stats"
       ? buildStatisticRows(rows, expandedStatMonths)
       : activeTab === "costs"
         ? buildCostRows(rows, costAssetFilter, showCostDetail)
         : activeTab === "loans"
-          ? buildLoanRows(rows, expandedLoanYears, expandedLoanMonths)
+          ? buildLoanRows(rows, expandedLoanYears, expandedLoanMonths, loanFilter, loanDateFrom, loanDateTo)
           : activeTab === "evaluations"
             ? buildEvaluationRows(evaluations, expandedEvaluationYears)
             : activeTab === "transactions" && transactionFiltersActive
@@ -3711,7 +3747,13 @@ export default function Page() {
               <h1>{active.label}</h1>
               <p>
                 {summary
-                  ? `${activeTab === "transactions" || activeTab === "evaluations" ? tableRows.length : rows.length} záznamů v aktuálním pohledu`
+                  ? `${
+                      activeTab === "transactions" || activeTab === "evaluations"
+                        ? tableRows.length
+                        : activeTab === "loans"
+                          ? loanFilteredCount
+                          : rows.length
+                    } záznamů v aktuálním pohledu`
                   : "Čekám na importovaná data"}
               </p>
             </div>
@@ -3775,6 +3817,37 @@ export default function Page() {
               </div>
             </div>
             {editingLoanId === "__new__" && renderLoanEditorForm()}
+            <div className="filter-row loan-filter-row">
+              <label>
+                Filtr
+                <input
+                  value={loanFilter}
+                  onChange={(event) => setLoanFilter(event.target.value)}
+                  placeholder="Věřitel, dlužník, popis…"
+                />
+              </label>
+              <label>
+                Od
+                <input type="date" value={loanDateFrom} onChange={(event) => setLoanDateFrom(event.target.value)} />
+              </label>
+              <label>
+                Do
+                <input type="date" value={loanDateTo} onChange={(event) => setLoanDateTo(event.target.value)} />
+              </label>
+              {(loanFilter.trim() || loanDateFrom || loanDateTo) && (
+                <button
+                  type="button"
+                  className="link-button"
+                  onClick={() => {
+                    setLoanFilter("");
+                    setLoanDateFrom("");
+                    setLoanDateTo("");
+                  }}
+                >
+                  Zrušit filtry
+                </button>
+              )}
+            </div>
             {loanBalances && (
               <div className="loan-balances">
                 <div className="panel-header">
