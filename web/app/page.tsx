@@ -1181,6 +1181,9 @@ export default function Page() {
   const [patriaText, setPatriaText] = useState("");
   const [patriaImportOpen, setPatriaImportOpen] = useState(false);
   const [transactionFilter, setTransactionFilter] = useState("");
+  const [transactionTypeFilter, setTransactionTypeFilter] = useState("");
+  const [transactionDateFrom, setTransactionDateFrom] = useState("");
+  const [transactionDateTo, setTransactionDateTo] = useState("");
   const [stockSummaryOpen, setStockSummaryOpen] = useState(false);
   const [stockActionStatus, setStockActionStatus] = useState<string | null>(null);
   const [stockBusy, setStockBusy] = useState(false);
@@ -1350,6 +1353,13 @@ export default function Page() {
     () => [...new Set(rows.map((row) => String(row.asset || "")).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
     [rows],
   );
+  const transactionMovementTypes = useMemo(
+    () => [...new Set(rows.map((row) => String(row.movement_type || "")).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    [rows],
+  );
+  const transactionFiltersActive = Boolean(
+    transactionFilter.trim() || transactionTypeFilter || transactionDateFrom || transactionDateTo,
+  );
   const tableRows =
     activeTab === "stats"
       ? buildStatisticRows(rows, expandedStatMonths)
@@ -1359,11 +1369,22 @@ export default function Page() {
           ? buildLoanRows(rows, expandedLoanYears, expandedLoanMonths)
           : activeTab === "evaluations"
             ? buildEvaluationRows(evaluations, expandedEvaluationYears)
-            : activeTab === "transactions" && transactionFilter.trim()
+            : activeTab === "transactions" && transactionFiltersActive
               ? rows.filter((row) => {
                   const needle = transactionFilter.trim().toLowerCase();
-                  return [row.instrument_name, row.ticker, row.isin, row.movement_type, row.description]
-                    .some((field) => String(field || "").toLowerCase().includes(needle));
+                  if (
+                    needle &&
+                    ![row.instrument_name, row.ticker, row.isin, row.movement_type, row.description].some((field) =>
+                      String(field || "").toLowerCase().includes(needle),
+                    )
+                  ) {
+                    return false;
+                  }
+                  if (transactionTypeFilter && String(row.movement_type || "") !== transactionTypeFilter) return false;
+                  const tradedOn = String(row.traded_on || "");
+                  if (transactionDateFrom && tradedOn < transactionDateFrom) return false;
+                  if (transactionDateTo && tradedOn > transactionDateTo) return false;
+                  return true;
                 })
               : rows;
 
@@ -4670,7 +4691,7 @@ export default function Page() {
             )}
             {activeTab === "transactions" && editingTransactionId === "__new__" && renderTransactionEditorForm()}
             {activeTab === "transactions" && (
-              <div className="filter-row">
+              <div className="filter-row transaction-filter-row">
                 <label>
                   Filtr
                   <input
@@ -4679,6 +4700,39 @@ export default function Page() {
                     placeholder="Ticker, název, ISIN, typ pohybu…"
                   />
                 </label>
+                <label>
+                  Typ pohybu
+                  <select value={transactionTypeFilter} onChange={(event) => setTransactionTypeFilter(event.target.value)}>
+                    <option value="">Vše</option>
+                    {transactionMovementTypes.map((type) => (
+                      <option key={type} value={type}>
+                        {type}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Od
+                  <input type="date" value={transactionDateFrom} onChange={(event) => setTransactionDateFrom(event.target.value)} />
+                </label>
+                <label>
+                  Do
+                  <input type="date" value={transactionDateTo} onChange={(event) => setTransactionDateTo(event.target.value)} />
+                </label>
+                {transactionFiltersActive && (
+                  <button
+                    type="button"
+                    className="link-button"
+                    onClick={() => {
+                      setTransactionFilter("");
+                      setTransactionTypeFilter("");
+                      setTransactionDateFrom("");
+                      setTransactionDateTo("");
+                    }}
+                  >
+                    Zrušit filtry
+                  </button>
+                )}
               </div>
             )}
             {stockSummaryOpen && (
@@ -4912,10 +4966,12 @@ export default function Page() {
                   (activeTab === "loans" && editingLoanId === String(row.id)) ||
                   (activeTab === "transactions" && editingTransactionId === String(row.id));
                 const evaluationDetail = isEvaluationMonthRow && summaryExpanded ? evaluations.find((item) => item.id === row.id) : undefined;
+                const isDividendTransaction =
+                  activeTab === "transactions" && ["dividenda", "dividend"].includes(String(row.movement_type || "").toLowerCase());
                 return (
                   <Fragment key={rowKey}>
                   <tr
-                    className={`${String(row.row_kind || "")}${isClickableSummary ? " clickable-row" : ""}`}
+                    className={`${String(row.row_kind || "")}${isClickableSummary ? " clickable-row" : ""}${isDividendTransaction ? " dividend-row" : ""}`}
                     onClick={handleRowClick}
                   >
                     {(columns[activeTab] || []).map((col, colIndex) => (
@@ -5028,6 +5084,21 @@ export default function Page() {
                         ) : isClickableSummary && colIndex === 0 ? (
                           <span className={`stat-month-toggle${isLoanMonthSummary || isEvaluationMonthRow ? " nested-toggle" : ""}`}>
                             {summaryExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                            {formatValue(col, row[col])}
+                          </span>
+                        ) : activeTab === "transactions" &&
+                          !isDividendTransaction &&
+                          (col === "difference_czk" || col === "difference_pct") &&
+                          typeof row[col] === "number" ? (
+                          <span className={numberValue(row[col]) >= 0 ? "positive" : "negative"}>
+                            {formatSignedProfitPrecise(numberValue(row[col]), col === "difference_pct")}
+                          </span>
+                        ) : activeTab === "transactions" &&
+                          !isDividendTransaction &&
+                          col === "current_price" &&
+                          typeof row[col] === "number" &&
+                          typeof row.difference_czk === "number" ? (
+                          <span className={numberValue(row.difference_czk) >= 0 ? "positive" : "negative"}>
                             {formatValue(col, row[col])}
                           </span>
                         ) : signedProfitColumns.has(col) && typeof row[col] === "number" ? (

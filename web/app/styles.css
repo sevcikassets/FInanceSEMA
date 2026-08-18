@@ -660,6 +660,11 @@ nav button:hover {
   margin: 0;
 }
 
+.transaction-filter-row {
+  grid-template-columns: minmax(200px, 280px) minmax(160px, 200px) minmax(140px, 160px) minmax(140px, 160px) auto;
+  align-items: end;
+}
+
 .latest-rate-row {
   display: grid;
   grid-template-columns: minmax(140px, 1fr) minmax(120px, 1fr) minmax(120px, 1fr);
@@ -1463,6 +1468,13 @@ tr.clickable-row {
 
 tr.clickable-row:hover td {
   background: #ddece8;
+}
+
+/* Transakce: dividend rows get their own background so they stand out at a
+   glance from Nákup/Prodej rows in the same list. */
+tr.dividend-row td {
+  background: #fdf3e0;
+  border-bottom-color: #f0dfb8;
 }
 
 .stat-month-toggle {
