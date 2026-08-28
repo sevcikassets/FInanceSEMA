@@ -23,8 +23,9 @@ except Exception:  # tzdata not installed - fall back to naive local time
 
 import pyotp
 import qrcode
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, desc, func, select, text, update
@@ -841,8 +842,15 @@ def ensure_cnb_rates_up_to_date(db: Session) -> int:
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="FinanceSEMA API")
 settings = get_settings()
+app = FastAPI(
+    title="FinanceSEMA API",
+    docs_url="/docs" if settings.api_enable_docs else None,
+    redoc_url="/redoc" if settings.api_enable_docs else None,
+    openapi_url="/openapi.json" if settings.api_enable_docs else None,
+)
+if settings.allowed_hosts != ["*"]:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -850,6 +858,53 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    response.headers.setdefault("Content-Security-Policy", "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    return response
+
+
+_failed_logins: dict[str, list[datetime]] = {}
+
+
+def _client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        return forwarded_for.split(",", 1)[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _login_locked_out(ip: str) -> bool:
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=settings.login_lockout_seconds)
+    attempts = [stamp for stamp in _failed_logins.get(ip, []) if stamp > cutoff]
+    _failed_logins[ip] = attempts
+    return len(attempts) >= settings.login_max_attempts
+
+
+def _record_failed_login(ip: str) -> None:
+    _failed_logins.setdefault(ip, []).append(datetime.now(timezone.utc))
+
+
+def _clear_failed_logins(ip: str) -> None:
+    _failed_logins.pop(ip, None)
+
+
+def _rate_limit_response() -> None:
+    raise HTTPException(
+        status_code=429,
+        detail="Too many failed login attempts. Try again later.",
+        headers={"Retry-After": str(settings.login_lockout_seconds)},
+    )
 
 
 def _constraint_exists(conn, table: str, name: str) -> bool:
@@ -1142,24 +1197,35 @@ def version() -> dict[str, str | None]:
 
 
 @app.post("/auth/login")
-def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
+    ip = _client_ip(request)
+    if _login_locked_out(ip):
+        _rate_limit_response()
     user = db.get(AppUser, payload.username)
     valid_db_user = bool(user and user.is_active and verify_password(payload.password, user.password_hash))
     if not valid_db_user and not authenticate(payload.username, payload.password):
+        _record_failed_login(ip)
         raise HTTPException(status_code=401, detail="Invalid username or password")
+    _clear_failed_logins(ip)
     if user is not None and user.totp_enabled:
         return {"requires_2fa": True, "pending_token": create_pending_2fa_token(payload.username)}
     return {"requires_2fa": False, "token": create_token(payload.username)}
 
 
 @app.post("/auth/2fa/login")
-def login_2fa(payload: TwoFactorLoginRequest, db: Session = Depends(get_db)) -> dict[str, str]:
+def login_2fa(payload: TwoFactorLoginRequest, request: Request, db: Session = Depends(get_db)) -> dict[str, str]:
+    ip = _client_ip(request)
+    if _login_locked_out(ip):
+        _rate_limit_response()
     username = verify_pending_2fa_token(payload.pending_token)
     user = db.get(AppUser, username)
     if user is None or not user.is_active or not user.totp_enabled or not user.totp_secret:
+        _record_failed_login(ip)
         raise HTTPException(status_code=401, detail="Dvoufázové ověření není pro tento účet zapnuté")
     if not verify_totp_code(user.totp_secret, payload.code):
+        _record_failed_login(ip)
         raise HTTPException(status_code=401, detail="Neplatný ověřovací kód")
+    _clear_failed_logins(ip)
     return {"token": create_token(username)}
 
 
