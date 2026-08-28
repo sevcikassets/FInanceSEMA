@@ -437,6 +437,8 @@ nav button:hover {
   display: block;
   margin-top: 8px;
   font-size: 22px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 .positive {

@@ -65,6 +65,7 @@ from .models import (
     AppUser,
     Asset,
     AssetCost,
+    AssetCostAttachment,
     AssetType,
     CostCategory,
     DailyStatistic,
@@ -81,6 +82,7 @@ from .models import (
     WatchlistStock,
 )
 from .stock_services import (
+    build_instrument_allocation_history,
     build_ticker_history,
     compute_alerts,
     fetch_yahoo_history,
@@ -637,10 +639,21 @@ def portfolio_dict(row: Portfolio) -> dict[str, Any]:
     return {"id": str(row.id), "name": row.name}
 
 
-def cost_attachment_path(cost_id: uuid.UUID) -> Path:
-    # Filename is always the cost's own UUID, never a user-supplied name -
-    # rules out path traversal entirely (see settings.attachments_dir).
-    return Path(settings.attachments_dir) / f"{cost_id}.pdf"
+def cost_attachment_path(attachment_id: uuid.UUID) -> Path:
+    # Filename on disk is always the ATTACHMENT's own UUID, never a user-
+    # supplied name - rules out path traversal entirely (see
+    # settings.attachments_dir). The original uploaded filename is preserved
+    # separately on the AssetCostAttachment row, for display/download.
+    return Path(settings.attachments_dir) / f"{attachment_id}.pdf"
+
+
+def _cost_attachment_dict(row: AssetCostAttachment) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "filename": row.filename,
+        "size_bytes": row.size_bytes,
+        "uploaded_at": row.uploaded_at.isoformat() if row.uploaded_at else None,
+    }
 
 
 def user_portfolios(username: str, db: Session) -> list[dict[str, Any]]:
@@ -1071,6 +1084,29 @@ def ensure_schema_upgrades() -> None:
         # docstring in excel_import.py for the exact candidate criteria.
         for pid in portfolio_ids:
             split_debt_assets_into_linked_liability(session, pid)
+
+        # Legacy single-attachment scheme: a file named {cost_id}.pdf
+        # directly in the attachments dir, with no DB record of it at all
+        # (see AssetCostAttachment's docstring in models.py) - migrate any
+        # such file into a proper row, renaming it to {new_attachment_id}.pdf
+        # to fit the new "keyed by the attachment's own id" scheme. The
+        # original filename was never captured under the old scheme, so a
+        # generic placeholder is the best available name.
+        attachments_dir = Path(settings.attachments_dir)
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+        existing_cost_ids = set(session.scalars(select(AssetCost.id)).all())
+        migrated_cost_ids = set(session.scalars(select(AssetCostAttachment.cost_id)).all())
+        for path in attachments_dir.glob("*.pdf"):
+            try:
+                candidate_id = uuid.UUID(path.stem)
+            except ValueError:
+                continue
+            if candidate_id not in existing_cost_ids or candidate_id in migrated_cost_ids:
+                continue
+            attachment = AssetCostAttachment(cost_id=candidate_id, filename="příloha.pdf", size_bytes=path.stat().st_size)
+            session.add(attachment)
+            session.flush()
+            path.rename(attachments_dir / f"{attachment.id}.pdf")
 
         session.commit()
 
@@ -2210,6 +2246,13 @@ def asset_costs(
     categories_by_id = {
         c.id: c.name for c in db.scalars(select(CostCategory).where(CostCategory.portfolio_id == portfolio_id)).all()
     }
+    attachments_by_cost: dict[uuid.UUID, list[dict[str, Any]]] = defaultdict(list)
+    for attachment in db.scalars(
+        select(AssetCostAttachment)
+        .where(AssetCostAttachment.cost_id.in_([row.id for row in rows]))
+        .order_by(AssetCostAttachment.uploaded_at)
+    ).all():
+        attachments_by_cost[attachment.cost_id].append(_cost_attachment_dict(attachment))
     return [
         model_dict(row)
         | {
@@ -2219,7 +2262,7 @@ def asset_costs(
             # fallback for the rare pre-migration row that ensure_schema_
             # upgrades() hasn't backfilled a category_id for yet.
             "category": categories_by_id.get(row.category_id) or row.category,
-            "has_attachment": cost_attachment_path(row.id).exists(),
+            "attachments": attachments_by_cost.get(row.id, []),
         }
         for row in rows
     ]
@@ -2229,11 +2272,14 @@ def _cost_dict(db: Session, row: AssetCost) -> dict[str, Any]:
     asset = db.get(Asset, row.asset_id) if row.asset_id else None
     payer = db.get(Party, row.payer_id) if row.payer_id else None
     category = db.get(CostCategory, row.category_id) if row.category_id else None
+    attachments = db.scalars(
+        select(AssetCostAttachment).where(AssetCostAttachment.cost_id == row.id).order_by(AssetCostAttachment.uploaded_at)
+    ).all()
     return model_dict(row) | {
         "asset": asset.name if asset else None,
         "payer": payer.name if payer else None,
         "category": category.name if category else row.category,
-        "has_attachment": cost_attachment_path(row.id).exists(),
+        "attachments": [_cost_attachment_dict(a) for a in attachments],
     }
 
 
@@ -2308,9 +2354,11 @@ def delete_asset_cost(
     row = db.scalar(select(AssetCost).where(AssetCost.id == cost_id, AssetCost.portfolio_id == portfolio_id))
     if row is None:
         raise HTTPException(status_code=404, detail="Náklad nenalezen")
-    attachment = cost_attachment_path(cost_id)
-    if attachment.exists():
-        attachment.unlink()
+    for attachment in db.scalars(select(AssetCostAttachment).where(AssetCostAttachment.cost_id == cost_id)).all():
+        path = cost_attachment_path(attachment.id)
+        if path.exists():
+            path.unlink()
+        db.delete(attachment)
     db.delete(row)
     db.commit()
     return {"status": "deleted"}
@@ -2320,7 +2368,7 @@ PDF_MAGIC_BYTES = b"%PDF-"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 
 
-@app.post("/assets/costs/{cost_id}/attachment")
+@app.post("/assets/costs/{cost_id}/attachments")
 async def upload_cost_attachment(
     cost_id: uuid.UUID,
     file: UploadFile = File(...),
@@ -2338,37 +2386,53 @@ async def upload_cost_attachment(
     # disk under a .pdf-shaped path.
     if not content.startswith(PDF_MAGIC_BYTES):
         raise HTTPException(status_code=400, detail="Přílohou může být jen platný PDF soubor")
-    cost_attachment_path(cost_id).write_bytes(content)
-    return {"status": "uploaded"}
+    attachment = AssetCostAttachment(
+        cost_id=cost_id, filename=file.filename or "příloha.pdf", size_bytes=len(content)
+    )
+    db.add(attachment)
+    db.flush()
+    cost_attachment_path(attachment.id).write_bytes(content)
+    db.commit()
+    return _cost_attachment_dict(attachment)
 
 
-@app.get("/assets/costs/{cost_id}/attachment")
+@app.get("/assets/costs/{cost_id}/attachments/{attachment_id}")
 def download_cost_attachment(
     cost_id: uuid.UUID,
+    attachment_id: uuid.UUID,
     portfolio_id: uuid.UUID = Depends(require_portfolio_access("costs")),
     db: Session = Depends(get_db),
 ) -> FileResponse:
     row = db.scalar(select(AssetCost).where(AssetCost.id == cost_id, AssetCost.portfolio_id == portfolio_id))
     if row is None:
         raise HTTPException(status_code=404, detail="Náklad nenalezen")
-    path = cost_attachment_path(cost_id)
+    attachment = db.scalar(select(AssetCostAttachment).where(AssetCostAttachment.id == attachment_id, AssetCostAttachment.cost_id == cost_id))
+    if attachment is None:
+        raise HTTPException(status_code=404, detail="Příloha nenalezena")
+    path = cost_attachment_path(attachment.id)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Příloha nenalezena")
-    return FileResponse(path, media_type="application/pdf", filename=f"{cost_id}.pdf")
+    return FileResponse(path, media_type="application/pdf", filename=attachment.filename)
 
 
-@app.delete("/assets/costs/{cost_id}/attachment")
+@app.delete("/assets/costs/{cost_id}/attachments/{attachment_id}")
 def delete_cost_attachment(
     cost_id: uuid.UUID,
+    attachment_id: uuid.UUID,
     portfolio_id: uuid.UUID = Depends(require_portfolio_access("costs")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     row = db.scalar(select(AssetCost).where(AssetCost.id == cost_id, AssetCost.portfolio_id == portfolio_id))
     if row is None:
         raise HTTPException(status_code=404, detail="Náklad nenalezen")
-    path = cost_attachment_path(cost_id)
+    attachment = db.scalar(select(AssetCostAttachment).where(AssetCostAttachment.id == attachment_id, AssetCostAttachment.cost_id == cost_id))
+    if attachment is None:
+        raise HTTPException(status_code=404, detail="Příloha nenalezena")
+    path = cost_attachment_path(attachment.id)
     if path.exists():
         path.unlink()
+    db.delete(attachment)
+    db.commit()
     return {"status": "deleted"}
 
 
@@ -2578,6 +2642,14 @@ def stock_benchmark(
         {"date": point_date.isoformat(), "close": json_value(point_close)}
         for point_date, point_close in sorted(history.get("points") or [])
     ]
+
+
+@app.get("/stocks/allocation-history")
+def stock_allocation_history(
+    portfolio_id: uuid.UUID = Depends(require_portfolio_access("charts")),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    return build_instrument_allocation_history(db, portfolio_id)
 
 
 @app.get("/stocks/overview")

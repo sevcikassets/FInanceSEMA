@@ -206,6 +206,24 @@ class AssetCost(Base):
     category_ref: Mapped["CostCategory | None"] = relationship()
 
 
+class AssetCostAttachment(Base):
+    """A PDF attachment on an AssetCost - a cost can have any number of
+    these (an upgrade from the original design, which stored a single fixed
+    file per cost at {cost_id}.pdf with no record of its original filename
+    - ensure_schema_upgrades() migrates any such file into a row here the
+    first time this runs). The bytes themselves still live on disk, not in
+    the DB, at {settings.attachments_dir}/{attachment.id}.pdf - see
+    main.py's cost_attachment_path, now keyed by the ATTACHMENT's own id."""
+
+    __tablename__ = "asset_cost_attachments"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    cost_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("asset_costs.id"), index=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    size_bytes: Mapped[int] = mapped_column()
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class CostCategory(Base):
     """Admin-managed dictionary of cost categories per Subjekt, so the same
     category doesn't end up spelled differently across cost entries (see

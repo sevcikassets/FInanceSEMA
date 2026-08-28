@@ -466,6 +466,63 @@ function RecalcFromField({ value, onChange }: { value: string; onChange: (value:
   );
 }
 
+// "1000000" -> "1 000 000" / "1000000.5" -> "1 000 000,5" (Czech grouping/
+// decimal convention, matching how the app already displays every other
+// money figure) - large loan/cost amounts are otherwise hard to read digit
+// by digit while typing.
+function formatThousandsDisplay(raw: string): string {
+  if (!raw) return raw;
+  const negative = raw.startsWith("-");
+  const unsigned = negative ? raw.slice(1) : raw;
+  const [integerPart, decimalPart] = unsigned.split(".");
+  const groupedInteger = integerPart.replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+  const formatted = decimalPart !== undefined ? `${groupedInteger},${decimalPart}` : groupedInteger;
+  return (negative ? "-" : "") + formatted;
+}
+
+// Strips whatever the user just typed/pasted back down to a plain numeric
+// string (optional leading "-", digits, at most one decimal point) that
+// Number(...) can parse - accepts either "," or "." as the decimal
+// separator and ignores thousand-separator spaces, so re-typing over an
+// already-formatted "1 000 000,5" round-trips cleanly.
+function sanitizeAmountInput(text: string): string {
+  const negative = text.trim().startsWith("-");
+  let cleaned = text.replace(/\s/g, "").replace(",", ".").replace(/[^0-9.]/g, "");
+  const firstDot = cleaned.indexOf(".");
+  if (firstDot !== -1) {
+    cleaned = cleaned.slice(0, firstDot + 1) + cleaned.slice(firstDot + 1).replace(/\./g, "");
+  }
+  return (negative ? "-" : "") + cleaned;
+}
+
+// Shows the raw value with live thousand-grouping once the field isn't
+// being actively edited (on blur), and the plain editable value while
+// focused - avoids the cursor-jumping that reformatting on every keystroke
+// would cause, at the cost of only seeing the grouped form after tabbing
+// away from the field.
+function ThousandsInput({
+  value,
+  onChange,
+  required,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  required?: boolean;
+}) {
+  const [focused, setFocused] = useState(false);
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      value={focused ? value : formatThousandsDisplay(value)}
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
+      onChange={(event) => onChange(sanitizeAmountInput(event.target.value))}
+      required={required}
+    />
+  );
+}
+
 // A "Výsledkové operace" line (Vyhodnocení tab) that expands to show which
 // loans/Hypotéky contributed to interest_received_czk/interest_paid_czk -
 // the other P&L lines (stocks) don't need this, that detail already exists
@@ -1166,6 +1223,7 @@ export default function Page() {
   const [stockOverview, setStockOverview] = useState<StockOverview | null>(null);
   const [alerts, setAlerts] = useState<Alerts | null>(null);
   const [benchmark, setBenchmark] = useState<Row[]>([]);
+  const [allocationHistory, setAllocationHistory] = useState<Row[]>([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [expandedStatMonths, setExpandedStatMonths] = useState<Set<string>>(() => new Set());
@@ -1468,6 +1526,18 @@ export default function Page() {
     });
   }, [chartData, benchmark, activeTab]);
 
+  const allocationChartData = useMemo(() => {
+    if (activeTab !== "charts") return [];
+    return allocationHistory
+      .map((row) => ({
+        date: String(row.date || ""),
+        stock_share: numberValue(row.stock_share),
+        etf_share: numberValue(row.etf_share),
+      }))
+      .filter((row) => row.date)
+      .sort((a, b) => a.date.localeCompare(b.date));
+  }, [allocationHistory, activeTab]);
+
   function toggleStatMonth(monthKey: string) {
     setExpandedStatMonths((current) => {
       const next = new Set(current);
@@ -1654,6 +1724,7 @@ export default function Page() {
       const needsAssetExtras = activeTab === "assets";
       const needsLoanBalances = activeTab === "loans";
       const needsBenchmark = activeTab === "charts";
+      const needsAllocationHistory = activeTab === "charts";
       const requests: Promise<unknown>[] = [activePortfolioId ? api(withPortfolio("/summary")) : Promise.resolve(null)];
       if (needsRows) requests.push(api(withPortfolio(active.endpoint)));
       if (activeTab === "rates") requests.push(api("/rates/latest"));
@@ -1667,6 +1738,7 @@ export default function Page() {
       if (needsLoanBalances) requests.push(api(withPortfolio("/loans/balances")));
       if (needsEvaluations) requests.push(api(withPortfolio("/evaluations")));
       if (needsBenchmark) requests.push(api(withPortfolio("/stocks/benchmark")));
+      if (needsAllocationHistory) requests.push(api(withPortfolio("/stocks/allocation-history")));
       const [summaryData, ...rest] = await Promise.all(requests);
       if (latestLoadRequestRef.current !== requestId) return;
       setSummary(summaryData as Summary | null);
@@ -1700,6 +1772,7 @@ export default function Page() {
       if (needsLoanBalances) setLoanBalances(rest[restIndex++] as LoanBalances);
       if (needsEvaluations) setEvaluations(rest[restIndex++] as Evaluation[]);
       if (needsBenchmark) setBenchmark(rest[restIndex++] as Row[]);
+      if (needsAllocationHistory) setAllocationHistory(rest[restIndex++] as Row[]);
     } catch (err) {
       if (latestLoadRequestRef.current !== requestId) return;
       setError(err instanceof Error ? err.message : "Nepodařilo se načíst data");
@@ -2318,12 +2391,7 @@ export default function Page() {
           </label>
           <label>
             Částka
-            <input
-              type="number"
-              step="0.01"
-              value={costDraft.amount}
-              onChange={(event) => setCostDraft((value) => ({ ...value, amount: event.target.value }))}
-            />
+            <ThousandsInput value={costDraft.amount} onChange={(amount) => setCostDraft((value) => ({ ...value, amount }))} />
           </label>
           <label>
             Dodavatel
@@ -2670,11 +2738,9 @@ export default function Page() {
           </label>
           <label>
             Částka
-            <input
-              type="number"
-              step="0.01"
+            <ThousandsInput
               value={loanDraft.amount}
-              onChange={(event) => setLoanDraft((value) => ({ ...value, amount: event.target.value }))}
+              onChange={(amount) => setLoanDraft((value) => ({ ...value, amount }))}
               required
             />
           </label>
@@ -4886,6 +4952,17 @@ export default function Page() {
                   series={[
                     { key: "profit_pct", label: "Portfolio", color: "#2a78d6" },
                     { key: "sp500_pct", label: "S&P 500", color: "#eb6834" },
+                  ]}
+                  formatValue={chartPercent}
+                  large
+                />
+                <PortfolioChart
+                  title="Podíl ETF a akcií v čase"
+                  mode="lines"
+                  data={allocationChartData}
+                  series={[
+                    { key: "stock_share", label: "Akcie", color: "#2a78d6" },
+                    { key: "etf_share", label: "ETF", color: "#1baf7a" },
                   ]}
                   formatValue={chartPercent}
                   large

@@ -6,6 +6,7 @@ All figures below are fictional test fixtures, not real financial data.
 
 from __future__ import annotations
 
+import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -1329,7 +1330,7 @@ def test_asset_cost_crud_resolves_category_and_payer_and_is_portfolio_scoped(cli
     cost_id = body["id"]
     assert body["category"] == "Pojisteni"
     assert body["payer"] == "Martin"
-    assert body["has_attachment"] is False
+    assert body["attachments"] == []
 
     # A second cost reusing the same category/payer text must resolve to the
     # same dictionary rows, not create duplicates.
@@ -1394,8 +1395,11 @@ def test_asset_cost_create_rejects_asset_from_another_portfolio(client, db_sessi
 
 @requires_db
 def test_asset_cost_attachment_upload_download_delete(client, db_session, portfolio_id, tmp_path, monkeypatch):
-    """Attachments are stored as {cost.id}.pdf under ATTACHMENTS_DIR, gated by
-    a magic-bytes check (Content-Type is client-supplied and spoofable)."""
+    """A cost can now hold more than one attachment - each is stored as
+    {attachment.id}.pdf under ATTACHMENTS_DIR (not {cost.id}.pdf anymore,
+    since there can be several), gated by a magic-bytes check (Content-Type
+    is client-supplied and spoofable), with the original filename preserved
+    on the AssetCostAttachment row for display/download."""
     from app import main as main_module
 
     monkeypatch.setattr(main_module.settings, "attachments_dir", str(tmp_path))
@@ -1408,36 +1412,125 @@ def test_asset_cost_attachment_upload_download_delete(client, db_session, portfo
     cost_id = created.json()["id"]
 
     not_a_pdf = client.post(
-        f"/assets/costs/{cost_id}/attachment",
+        f"/assets/costs/{cost_id}/attachments",
         headers=headers,
         params=params,
         files={"file": ("fake.pdf", b"not actually a pdf", "application/pdf")},
     )
     assert not_a_pdf.status_code == 400
 
-    pdf_bytes = b"%PDF-1.4\n%%EOF"
-    uploaded = client.post(
-        f"/assets/costs/{cost_id}/attachment",
+    pdf_bytes_1 = b"%PDF-1.4\n%%EOF"
+    first = client.post(
+        f"/assets/costs/{cost_id}/attachments",
         headers=headers,
         params=params,
-        files={"file": ("real.pdf", pdf_bytes, "application/pdf")},
+        files={"file": ("faktura.pdf", pdf_bytes_1, "application/pdf")},
     )
-    assert uploaded.status_code == 200
-    assert (tmp_path / f"{cost_id}.pdf").read_bytes() == pdf_bytes
+    assert first.status_code == 200
+    first_id = first.json()["id"]
+    assert first.json()["filename"] == "faktura.pdf"
+    assert (tmp_path / f"{first_id}.pdf").read_bytes() == pdf_bytes_1
+
+    # A second attachment on the SAME cost must not replace the first one -
+    # this is the whole point of the upgrade from one-fixed-file-per-cost.
+    pdf_bytes_2 = b"%PDF-1.4\nsecond\n%%EOF"
+    second = client.post(
+        f"/assets/costs/{cost_id}/attachments",
+        headers=headers,
+        params=params,
+        files={"file": ("dodaci_list.pdf", pdf_bytes_2, "application/pdf")},
+    )
+    assert second.status_code == 200
+    second_id = second.json()["id"]
+    assert (tmp_path / f"{second_id}.pdf").read_bytes() == pdf_bytes_2
 
     listed = client.get("/assets/costs", headers=headers, params=params)
-    assert listed.json()[0]["has_attachment"] is True
+    attachments = listed.json()[0]["attachments"]
+    assert {a["filename"] for a in attachments} == {"faktura.pdf", "dodaci_list.pdf"}
 
-    downloaded = client.get(f"/assets/costs/{cost_id}/attachment", headers=headers, params=params)
+    downloaded = client.get(f"/assets/costs/{cost_id}/attachments/{first_id}", headers=headers, params=params)
     assert downloaded.status_code == 200
-    assert downloaded.content == pdf_bytes
+    assert downloaded.content == pdf_bytes_1
+    assert 'filename="faktura.pdf"' in downloaded.headers["content-disposition"]
 
-    deleted = client.delete(f"/assets/costs/{cost_id}/attachment", headers=headers, params=params)
+    # Deleting one attachment must leave the other completely untouched.
+    deleted = client.delete(f"/assets/costs/{cost_id}/attachments/{first_id}", headers=headers, params=params)
     assert deleted.status_code == 200
-    assert not (tmp_path / f"{cost_id}.pdf").exists()
+    assert not (tmp_path / f"{first_id}.pdf").exists()
+    assert (tmp_path / f"{second_id}.pdf").exists()
 
-    after_delete = client.get(f"/assets/costs/{cost_id}/attachment", headers=headers, params=params)
+    after_delete = client.get(f"/assets/costs/{cost_id}/attachments/{first_id}", headers=headers, params=params)
     assert after_delete.status_code == 404
+    still_listed = client.get("/assets/costs", headers=headers, params=params)
+    assert [a["filename"] for a in still_listed.json()[0]["attachments"]] == ["dodaci_list.pdf"]
+
+
+@requires_db
+def test_asset_cost_delete_removes_all_its_attachments(client, db_session, portfolio_id, tmp_path, monkeypatch):
+    from app import main as main_module
+
+    monkeypatch.setattr(main_module.settings, "attachments_dir", str(tmp_path))
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    created = client.post("/assets/costs", headers=headers, params=params, json={"item": "Faktura"})
+    cost_id = created.json()["id"]
+    pdf_bytes = b"%PDF-1.4\n%%EOF"
+    ids = []
+    for name in ("a.pdf", "b.pdf"):
+        response = client.post(
+            f"/assets/costs/{cost_id}/attachments", headers=headers, params=params,
+            files={"file": (name, pdf_bytes, "application/pdf")},
+        )
+        ids.append(response.json()["id"])
+
+    deleted = client.delete(f"/assets/costs/{cost_id}", headers=headers, params=params)
+    assert deleted.status_code == 200
+    for attachment_id in ids:
+        assert not (tmp_path / f"{attachment_id}.pdf").exists()
+    from app.models import AssetCostAttachment
+
+    assert db_session.query(AssetCostAttachment).filter_by(cost_id=uuid.UUID(cost_id)).count() == 0
+
+
+@requires_db
+def test_ensure_schema_upgrades_migrates_legacy_single_attachment_file(db_session, portfolio_id, tmp_path, monkeypatch):
+    """Before multi-attachment support, a cost's attachment was a bare file
+    at {cost_id}.pdf with no DB record at all. The migration must turn any
+    such file into a proper AssetCostAttachment row and rename it to
+    {new_attachment_id}.pdf, without losing the bytes."""
+    from app import main as main_module
+    from app.models import AssetCost, AssetCostAttachment
+
+    monkeypatch.setattr(main_module.settings, "attachments_dir", str(tmp_path))
+
+    cost = AssetCost(portfolio_id=portfolio_id, item="Stara faktura")
+    db_session.add(cost)
+    db_session.commit()
+
+    pdf_bytes = b"%PDF-1.4\nlegacy\n%%EOF"
+    legacy_path = tmp_path / f"{cost.id}.pdf"
+    legacy_path.write_bytes(pdf_bytes)
+
+    # An orphaned file (no matching AssetCost) must be left alone, not
+    # migrated into a dangling row.
+    orphan_path = tmp_path / f"{uuid.uuid4()}.pdf"
+    orphan_path.write_bytes(pdf_bytes)
+
+    main_module.ensure_schema_upgrades()
+
+    assert not legacy_path.exists()  # renamed away, not left under the old name
+    assert orphan_path.exists()  # untouched
+
+    attachment = db_session.query(AssetCostAttachment).filter_by(cost_id=cost.id).one()
+    assert (tmp_path / f"{attachment.id}.pdf").read_bytes() == pdf_bytes
+
+    # Idempotent: running it again must not create a second row for the
+    # same cost.
+    main_module.ensure_schema_upgrades()
+    assert db_session.query(AssetCostAttachment).filter_by(cost_id=cost.id).count() == 1
 
 
 @requires_db

@@ -1148,3 +1148,66 @@ def build_ticker_history(db: Session, portfolio_id: uuid.UUID, ticker: str, date
     }
 
     return {"ticker": normalized, "currency": currency, "rows": rows, "summary": summary}
+
+
+def build_instrument_allocation_history(db: Session, portfolio_id: uuid.UUID) -> list[dict[str, Any]]:
+    """Cumulative invested split between ETF and stocks over the same day axis
+    the statistics/chart tabs use. It is intentionally based on booked CZK
+    transaction amounts, so it is fast and deterministic: no Yahoo history
+    fetch is needed just to render the allocation chart."""
+    transactions = db.scalars(
+        select(StockTransaction)
+        .where(StockTransaction.portfolio_id == portfolio_id, StockTransaction.traded_on.is_not(None))
+        .order_by(StockTransaction.traded_on, StockTransaction.id)
+    ).all()
+    if not transactions:
+        return []
+
+    daily: dict[date, dict[str, Decimal]] = defaultdict(lambda: {"stock": ZERO, "etf": ZERO})
+    event_dates: set[date] = set()
+    for transaction in transactions:
+        if not movement_is_buy(transaction.movement_type) and not movement_is_sell(transaction.movement_type):
+            continue
+        traded_on = transaction.traded_on
+        if traded_on is None:
+            continue
+        bucket = "etf" if "etf" in (transaction.instrument_type or "").strip().lower() else "stock"
+        signed_amount = abs(decimal_or_zero(transaction.amount_czk))
+        if movement_is_sell(transaction.movement_type):
+            signed_amount = -signed_amount
+        daily[traded_on][bucket] += signed_amount
+        event_dates.add(traded_on)
+
+    statistic_dates = set(db.scalars(select(DailyStatistic.stat_date).where(DailyStatistic.portfolio_id == portfolio_id)).all())
+    known_dates = statistic_dates | event_dates
+    if not known_dates:
+        return []
+    start_date = min(known_dates)
+    end_date = max(date.today(), max(known_dates))
+    axis_dates = [
+        candidate
+        for offset in range((end_date - start_date).days + 1)
+        for candidate in [start_date + timedelta(days=offset)]
+        if candidate.weekday() < 5 or candidate in event_dates
+    ]
+
+    stock_total = ZERO
+    etf_total = ZERO
+    result: list[dict[str, Any]] = []
+    for current_date in axis_dates:
+        stock_total += daily[current_date]["stock"]
+        etf_total += daily[current_date]["etf"]
+        total = stock_total + etf_total
+        stock_share = stock_total / total if total else ZERO
+        etf_share = etf_total / total if total else ZERO
+        result.append(
+            {
+                "date": current_date,
+                "stock_czk": to_number(stock_total),
+                "etf_czk": to_number(etf_total),
+                "total_czk": to_number(total),
+                "stock_share": to_number(stock_share),
+                "etf_share": to_number(etf_share),
+            }
+        )
+    return result
