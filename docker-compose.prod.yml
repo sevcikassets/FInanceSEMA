@@ -27,6 +27,8 @@ services:
       # dev-only http://localhost:3010 default from .env/API_CORS_ORIGINS -
       # otherwise every request from production gets rejected as CORS.
       API_CORS_ORIGINS: https://${DOMAIN:?set DOMAIN in .env}
+      API_ALLOWED_HOSTS: ${DOMAIN:?set DOMAIN in .env}
+      API_ENABLE_DOCS: "false"
       APP_USERNAME: ${FINANCE_APP_USERNAME:?set FINANCE_APP_USERNAME in .env}
       APP_PASSWORD: ${FINANCE_APP_PASSWORD:?set FINANCE_APP_PASSWORD in .env}
       APP_TOKEN_SECRET: ${FINANCE_APP_TOKEN_SECRET:?set FINANCE_APP_TOKEN_SECRET in .env (e.g. openssl rand -hex 32)}
@@ -52,10 +54,19 @@ services:
       # Order matters: strip the /api prefix first, then rate-limit - a
       # generous cap (well above normal UI usage) that still blunts a
       # scripted brute-force run against /auth/login or /auth/2fa/login.
-      - "traefik.http.routers.finance-sema-api.middlewares=finance-sema-api-strip,finance-sema-api-ratelimit"
+      - "traefik.http.routers.finance-sema-api.middlewares=finance-sema-api-strip,finance-sema-api-ratelimit,finance-sema-secure-headers"
       - "traefik.http.middlewares.finance-sema-api-strip.stripprefix.prefixes=/api"
       - "traefik.http.middlewares.finance-sema-api-ratelimit.ratelimit.average=20"
       - "traefik.http.middlewares.finance-sema-api-ratelimit.ratelimit.burst=40"
+      - "traefik.http.middlewares.finance-sema-secure-headers.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.finance-sema-secure-headers.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.finance-sema-secure-headers.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.finance-sema-secure-headers.headers.customFrameOptionsValue=DENY"
+      - "traefik.http.middlewares.finance-sema-secure-headers.headers.referrerPolicy=strict-origin-when-cross-origin"
+      - "traefik.http.middlewares.finance-sema-secure-headers.headers.permissionsPolicy=camera=(), microphone=(), geolocation=()"
+      - "traefik.http.middlewares.finance-sema-secure-headers.headers.contentSecurityPolicy=default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+      - "traefik.http.middlewares.finance-sema-secure-headers.headers.customResponseHeaders.X-Powered-By="
+      - "traefik.http.middlewares.finance-sema-secure-headers.headers.customResponseHeaders.Server="
       - "traefik.http.services.finance-sema-api.loadbalancer.server.port=8000"
       # api is on two networks (default + proxy) - without this, Traefik can
       # non-deterministically pick either one to reach the container, and
@@ -83,6 +94,7 @@ services:
       - "traefik.http.routers.finance-sema.entrypoints=websecure"
       - "traefik.http.routers.finance-sema.tls.certresolver=letsencrypt"
       - "traefik.http.routers.finance-sema.service=finance-sema"
+      - "traefik.http.routers.finance-sema.middlewares=finance-sema-secure-headers"
       - "traefik.http.services.finance-sema.loadbalancer.server.port=3000"
       - "traefik.docker.network=proxy"
     networks:
