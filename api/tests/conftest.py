@@ -40,6 +40,35 @@ os.environ.setdefault("APP_PASSWORD", "finance")
 os.environ.setdefault("APP_TOKEN_SECRET", "test-secret")
 
 import pytest  # noqa: E402
+from sqlalchemy import event  # noqa: E402
+
+# This suite has intermittently deadlocked - one test's connection left
+# idle-in-transaction (holding a lock on a table another connection from the
+# same pool needs) while something else, on a DIFFERENT pooled connection,
+# waits on that lock forever (e.g. ensure_schema_upgrades()'s ALTER TABLE
+# statements, or the next test's db_session teardown dropping tables). Never
+# fully root-caused despite two real, independently-justified fixes (an
+# uncommitted read transaction in one test, and BackgroundScheduler being
+# stopped/restarted on every single TestClient's startup/shutdown cycle -
+# see schedule_daily_recalculation's docstring in app/main.py) - it may
+# still recur. A 10s lock_timeout on every pooled connection turns that from
+# a silent, indefinite hang into a fast, loud "canceling statement due to
+# lock timeout" failure that names the actual blocked statement, instead of
+# a mysteriously stuck test run with no error at all. Applied here (not in
+# app/db.py) so it never reaches production, where a real slow migration
+# legitimately taking longer than 10s should not be treated as a deadlock.
+try:
+    from app.db import engine as _test_engine
+
+    @event.listens_for(_test_engine, "connect")
+    def _set_lock_timeout(dbapi_connection, connection_record) -> None:  # noqa: ARG001
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SET lock_timeout = '10s'")
+        finally:
+            cursor.close()
+except Exception:  # noqa: BLE001 - DB not reachable at import time; requires_db skips those tests anyway
+    pass
 
 
 def _database_available() -> bool:
