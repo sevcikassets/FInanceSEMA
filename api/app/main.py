@@ -23,6 +23,8 @@ except Exception:  # tzdata not installed - fall back to naive local time
 
 import pyotp
 import qrcode
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -1166,12 +1168,71 @@ def ensure_schema_upgrades() -> None:
         session.commit()
 
 
+def run_daily_stock_recalculation() -> None:
+    """Scheduled job (see schedule_daily_recalculation) - recomputes every
+    Subjekt's stock portfolio and "Denní statistika" once a day, so it
+    always reflects a fresh state as of the job's own run time without
+    anyone needing to click "Přepočítat" by hand. Runs with the same
+    default alert thresholds an unauthenticated recalculation would use -
+    there's no logged-in user driving this, so there's no per-user
+    preference to resolve (see resolve_threshold's own fallback). Each
+    Subjekt gets its own DB session, so one portfolio's failure (e.g. a
+    Yahoo outage) can't abort the rest."""
+    with Session(bind=engine) as session:
+        portfolio_ids = list(session.scalars(select(Portfolio.id)).all())
+    for portfolio_id in portfolio_ids:
+        with Session(bind=engine) as session:
+            try:
+                cnb_rates_added = ensure_cnb_rates_up_to_date(session)
+                result = recalculate_stocks(
+                    session,
+                    portfolio_id,
+                    dry_run=False,
+                    threshold_pct=DEFAULT_ALERT_THRESHOLD_PCT,
+                    drop_threshold_pct=DEFAULT_ALERT_THRESHOLD_PCT,
+                )
+                logger.info(
+                    "Scheduled recalculation done for portfolio %s (cnb_rates_added=%s): %s",
+                    portfolio_id, cnb_rates_added, result,
+                )
+            except Exception:  # noqa: BLE001 - one Subjekt's failure must not skip the rest
+                session.rollback()
+                logger.exception("Scheduled recalculation failed for portfolio %s", portfolio_id)
+
+
+scheduler = BackgroundScheduler()
+
+
+def schedule_daily_recalculation() -> None:
+    """Wires run_daily_stock_recalculation to fire every day at 01:00 Prague
+    time (falls back to the container's local time if tzdata isn't
+    available - same degraded-but-safe fallback as cnb_cutoff_date). Guarded
+    by `scheduler.running` so repeated calls (e.g. one per test's TestClient
+    startup) don't try to start an already-running scheduler."""
+    if scheduler.running:
+        return
+    scheduler.add_job(
+        run_daily_stock_recalculation,
+        trigger=CronTrigger(hour=1, minute=0, timezone=PRAGUE_TZ),
+        id="daily_stock_recalculation",
+        replace_existing=True,
+    )
+    scheduler.start()
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
     ensure_schema_upgrades()
     ensure_admin_user()
     Path(settings.attachments_dir).mkdir(parents=True, exist_ok=True)
+    schedule_daily_recalculation()
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
 
 
 @app.get("/health")
