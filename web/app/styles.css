@@ -918,6 +918,28 @@ nav button:hover {
   display: none;
 }
 
+.cost-attachment-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 2px 0 6px;
+}
+
+.cost-attachment-item .link-button:first-child {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cost-attachment-item .link-button:last-child {
+  color: var(--muted);
+  padding: 2px 6px;
+  font-weight: 700;
+}
+
 .two-factor-setup {
   display: grid;
   gap: 12px;

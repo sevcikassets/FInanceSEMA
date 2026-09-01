@@ -32,6 +32,7 @@ import {
   X,
 } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { jsPDF } from "jspdf";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8010";
 
@@ -521,6 +522,143 @@ function ThousandsInput({
       required={required}
     />
   );
+}
+
+// Phone photos are very often stored "sideways" or upside down, with the
+// correct display rotation recorded only in this EXIF tag (0x0112), never
+// baked into the pixel data itself - anything that draws the raw bytes onto
+// a canvas (as convertJpegToPdfFile below needs to) must apply this
+// rotation itself, or the resulting PDF page comes out rotated. Scans just
+// the first 256KB (EXIF always sits in the APP1 segment right after the
+// JPEG's own SOI marker) rather than the whole file. Returns 1 (no
+// rotation) for anything that isn't a JPEG or has no EXIF orientation tag.
+async function readJpegExifOrientation(file: File): Promise<number> {
+  const buffer = await file.slice(0, 256 * 1024).arrayBuffer();
+  const view = new DataView(buffer);
+  if (view.byteLength < 4 || view.getUint16(0) !== 0xffd8) return 1;
+  let offset = 2;
+  while (offset + 4 <= view.byteLength) {
+    const marker = view.getUint16(offset);
+    if ((marker & 0xff00) !== 0xff00) break;
+    const segmentLength = view.getUint16(offset + 2);
+    if (marker === 0xffe1 && offset + 10 <= view.byteLength && view.getUint32(offset + 4) === 0x45786966) {
+      const tiffStart = offset + 10;
+      if (tiffStart + 8 <= view.byteLength) {
+        const little = view.getUint16(tiffStart) === 0x4949;
+        const firstIfdOffset = view.getUint32(tiffStart + 4, little);
+        const ifdStart = tiffStart + firstIfdOffset;
+        if (ifdStart + 2 <= view.byteLength) {
+          const entryCount = view.getUint16(ifdStart, little);
+          for (let i = 0; i < entryCount; i++) {
+            const entryOffset = ifdStart + 2 + i * 12;
+            if (entryOffset + 10 > view.byteLength) break;
+            if (view.getUint16(entryOffset, little) === 0x0112) {
+              return view.getUint16(entryOffset + 8, little);
+            }
+          }
+        }
+      }
+    }
+    if (marker === 0xffda) break; // start of scan - image data follows, no more markers before it
+    offset += 2 + segmentLength;
+  }
+  return 1;
+}
+
+// Standard EXIF-orientation-to-canvas-transform table (values 2-8, 1/unknown
+// = no transform) - width/height are the SOURCE image's own dimensions.
+function applyExifOrientationTransform(ctx: CanvasRenderingContext2D, orientation: number, width: number, height: number) {
+  switch (orientation) {
+    case 2:
+      ctx.transform(-1, 0, 0, 1, width, 0);
+      break;
+    case 3:
+      ctx.transform(-1, 0, 0, -1, width, height);
+      break;
+    case 4:
+      ctx.transform(1, 0, 0, -1, 0, height);
+      break;
+    case 5:
+      ctx.transform(0, 1, 1, 0, 0, 0);
+      break;
+    case 6:
+      ctx.transform(0, 1, -1, 0, height, 0);
+      break;
+    case 7:
+      ctx.transform(0, -1, -1, 0, height, width);
+      break;
+    case 8:
+      ctx.transform(0, -1, 1, 0, 0, width);
+      break;
+    default:
+      break;
+  }
+}
+
+// The JPEG's own SOF marker (0xFFC0-0xFFCF, excluding DHT/JPG/DAC at C4/C8/
+// CC) carries the RAW encoded pixel dimensions, independent of the EXIF
+// orientation tag - used below to detect whether the browser already
+// auto-rotated a bitmap despite imageOrientation:"none" (see
+// convertJpegToPdfFile), by comparing bitmap.width/height against this.
+async function readJpegSofDimensions(file: File): Promise<{ width: number; height: number } | null> {
+  const buffer = await file.slice(0, 256 * 1024).arrayBuffer();
+  const view = new DataView(buffer);
+  if (view.byteLength < 4 || view.getUint16(0) !== 0xffd8) return null;
+  let offset = 2;
+  while (offset + 9 <= view.byteLength) {
+    const marker = view.getUint16(offset);
+    if ((marker & 0xff00) !== 0xff00) break;
+    const isSof = marker >= 0xffc0 && marker <= 0xffcf && marker !== 0xffc4 && marker !== 0xffc8 && marker !== 0xffcc;
+    if (isSof) return { height: view.getUint16(offset + 5), width: view.getUint16(offset + 7) };
+    if (marker === 0xffda) break;
+    offset += 2 + view.getUint16(offset + 2);
+  }
+  return null;
+}
+
+// Draws a JPEG onto a canvas the right way up (per its own EXIF orientation,
+// not whatever the browser's decoder happens to default to) and wraps the
+// result in a single-page PDF sized exactly to the (rotated) image - so a
+// phone photo of a receipt can be attached to a náklad/pohyb the same way a
+// scanned PDF would be, without the user needing a separate scanning app.
+async function convertJpegToPdfFile(file: File): Promise<File> {
+  const orientation = await readJpegExifOrientation(file);
+  const sofDimensions = await readJpegSofDimensions(file);
+  // imageOrientation: "none" is requested to stop the browser from
+  // auto-rotating, so our own transform below is the only rotation applied
+  // - but this has been observed to be silently ignored (bitmap comes back
+  // pre-rotated anyway). Detect that by checking whether the bitmap's
+  // dimensions already match the SOF's raw dimensions swapped - if so, the
+  // browser did the rotation for us, and applying our transform on top
+  // would rotate it a second time.
+  const bitmap = await createImageBitmap(file, { imageOrientation: "none" });
+  const swapDimensions = orientation >= 5 && orientation <= 8;
+  const alreadyRotatedByBrowser =
+    swapDimensions &&
+    sofDimensions !== null &&
+    bitmap.width === sofDimensions.height &&
+    bitmap.height === sofDimensions.width;
+  const canvas = document.createElement("canvas");
+  const rotate = swapDimensions && !alreadyRotatedByBrowser;
+  canvas.width = rotate ? bitmap.height : bitmap.width;
+  canvas.height = rotate ? bitmap.width : bitmap.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas není v tomto prohlížeči podporován");
+  if (!alreadyRotatedByBrowser) {
+    applyExifOrientationTransform(ctx, orientation, bitmap.width, bitmap.height);
+  }
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+
+  const imageDataUrl = canvas.toDataURL("image/jpeg", 0.9);
+  const pdf = new jsPDF({
+    orientation: canvas.width >= canvas.height ? "landscape" : "portrait",
+    unit: "px",
+    format: [canvas.width, canvas.height],
+  });
+  pdf.addImage(imageDataUrl, "JPEG", 0, 0, canvas.width, canvas.height);
+  const pdfName = file.name.replace(/\.(jpe?g)$/i, "") + ".pdf";
+  return new File([pdf.output("blob")], pdfName, { type: "application/pdf" });
 }
 
 // A "Výsledkové operace" line (Vyhodnocení tab) that expands to show which
@@ -3046,14 +3184,20 @@ export default function Page() {
 
   // Bypasses the shared api() helper on purpose - it always forces
   // Content-Type: application/json, which would break multipart form
-  // encoding for the file upload.
-  async function uploadCostAttachment(costId: string, file: File) {
+  // encoding for the file upload. A cost can hold several attachments now
+  // (see the "attachments" list on each row) - this only ever ADDS one,
+  // never replaces what's already there. A JPEG selection is transparently
+  // converted to a correctly-rotated single-page PDF first (see
+  // convertJpegToPdfFile) - the backend only ever accepts PDF.
+  async function uploadCostAttachment(costId: string, selectedFile: File) {
     setCostAttachmentBusy(costId);
     setError(null);
     try {
+      const isJpeg = selectedFile.type === "image/jpeg" || /\.jpe?g$/i.test(selectedFile.name);
+      const file = isJpeg ? await convertJpegToPdfFile(selectedFile) : selectedFile;
       const formData = new FormData();
       formData.append("file", file);
-      const response = await fetch(`${API_URL}${withPortfolio(`/assets/costs/${costId}/attachment`)}`, {
+      const response = await fetch(`${API_URL}${withPortfolio(`/assets/costs/${costId}/attachments`)}`, {
         method: "POST",
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         body: formData,
@@ -3069,10 +3213,10 @@ export default function Page() {
 
   // Fetches the PDF as an authenticated blob rather than linking directly -
   // a plain <a href> can't carry the Authorization header the API requires.
-  async function viewCostAttachment(costId: string) {
+  async function viewCostAttachment(costId: string, attachmentId: string) {
     setError(null);
     try {
-      const response = await fetch(`${API_URL}${withPortfolio(`/assets/costs/${costId}/attachment`)}`, {
+      const response = await fetch(`${API_URL}${withPortfolio(`/assets/costs/${costId}/attachments/${attachmentId}`)}`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       if (!response.ok) throw new Error(await response.text());
@@ -3085,11 +3229,11 @@ export default function Page() {
     }
   }
 
-  async function deleteCostAttachment(costId: string) {
+  async function deleteCostAttachment(costId: string, attachmentId: string) {
     setCostAttachmentBusy(costId);
     setError(null);
     try {
-      await api(withPortfolio(`/assets/costs/${costId}/attachment`), { method: "DELETE" });
+      await api(withPortfolio(`/assets/costs/${costId}/attachments/${attachmentId}`), { method: "DELETE" });
       await loadAll();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Smazání přílohy se nezdařilo");
@@ -5144,36 +5288,41 @@ export default function Page() {
                               >
                                 Smazat
                               </button>
-                              {row.has_attachment ? (
-                                <>
-                                  <button type="button" className="link-button" onClick={() => viewCostAttachment(String(row.id))}>
-                                    Příloha
+                              {((row.attachments as Row[]) || []).map((attachment) => (
+                                <span className="cost-attachment-item" key={String(attachment.id)}>
+                                  <button
+                                    type="button"
+                                    className="link-button"
+                                    onClick={() => viewCostAttachment(String(row.id), String(attachment.id))}
+                                  >
+                                    {String(attachment.filename || "Příloha")}
                                   </button>
                                   <button
                                     type="button"
                                     className="link-button"
                                     onClick={() => {
-                                      if (confirmDelete(`přílohu nákladu "${String(row.item)}"`)) deleteCostAttachment(String(row.id));
+                                      if (confirmDelete(`přílohu "${String(attachment.filename)}" nákladu "${String(row.item)}"`))
+                                        deleteCostAttachment(String(row.id), String(attachment.id));
                                     }}
                                     disabled={costAttachmentBusy === String(row.id)}
                                   >
-                                    Smazat přílohu
+                                    ×
                                   </button>
-                                </>
-                              ) : (
-                                <label className="link-button cost-attachment-upload">
-                                  {costAttachmentBusy === String(row.id) ? "Nahrávám…" : "Přidat přílohu"}
-                                  <input
-                                    type="file"
-                                    accept="application/pdf"
-                                    onChange={(event) => {
-                                      const file = event.target.files?.[0];
-                                      if (file) uploadCostAttachment(String(row.id), file);
-                                      event.target.value = "";
-                                    }}
-                                  />
-                                </label>
-                              )}
+                                </span>
+                              ))}
+                              <label className="link-button cost-attachment-upload">
+                                {costAttachmentBusy === String(row.id) ? "Nahrávám…" : "Přidat přílohu"}
+                                <input
+                                  type="file"
+                                  accept="application/pdf,image/jpeg"
+                                  disabled={costAttachmentBusy === String(row.id)}
+                                  onChange={(event) => {
+                                    const file = event.target.files?.[0];
+                                    if (file) uploadCostAttachment(String(row.id), file);
+                                    event.target.value = "";
+                                  }}
+                                />
+                              </label>
                             </div>
                           ) : null
                         ) : col === "actions" && activeTab === "loans" ? (
