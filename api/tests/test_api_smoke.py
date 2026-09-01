@@ -1628,6 +1628,7 @@ def test_asset_cost_delete_removes_all_its_attachments(client, db_session, portf
     from app.models import AssetCostAttachment
 
     assert db_session.query(AssetCostAttachment).filter_by(cost_id=uuid.UUID(cost_id)).count() == 0
+    db_session.commit()  # release the read transaction the query above left open
 
 
 @requires_db
