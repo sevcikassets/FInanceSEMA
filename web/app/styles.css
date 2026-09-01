@@ -1059,6 +1059,18 @@ nav button:hover {
   font-size: 11px;
 }
 
+.sold-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bad) 15%, transparent);
+  color: var(--bad);
+  font-size: 11px;
+  font-weight: 600;
+  vertical-align: middle;
+}
+
 .payment-schedule-wrap {
   margin-top: 12px;
   height: clamp(200px, 40vh, 420px);

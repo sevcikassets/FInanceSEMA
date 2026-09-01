@@ -198,6 +198,141 @@ def test_asset_endpoints_expose_computed_interest_plan(client, portfolio_id):
 
 
 @requires_db
+def test_sold_asset_excluded_from_net_worth_and_shows_realized_gain_loss(client, portfolio_id):
+    """Marking an asset sold (sold_at + sale_price) must zero out its
+    net_worth_contribution (it's no longer owned) while still reporting a
+    realized_gain_loss_czk computed against its book value just before the
+    sale (total_value plus non-real-estate-category costs, the same figure
+    net_worth_contribution used to count) - see asset_realized_gain_loss."""
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    created = client.post(
+        "/assets",
+        headers=headers,
+        params=params,
+        json={"code": "BYT-01", "name": "Byt na prodej", "total_value": "5000000"},
+    )
+    assert created.status_code == 200
+    asset_id = created.json()["id"]
+    assert created.json()["realized_gain_loss_czk"] is None
+
+    # A non-"Nemovitost" category cost is real additional spending, counted
+    # on top of total_value toward both net worth and the sale's cost basis.
+    cost_created = client.post(
+        "/assets/costs",
+        headers=headers,
+        params=params,
+        json={"asset_id": asset_id, "item": "Rekonstrukce", "category": "Vybaveni", "amount": "200000"},
+    )
+    assert cost_created.status_code == 200
+
+    before_sale = client.get("/assets", headers=headers, params=params).json()[0]
+    assert before_sale["net_worth_contribution"] == 5_200_000
+    assert before_sale["realized_gain_loss_czk"] is None
+
+    sold = client.put(
+        f"/assets/{asset_id}",
+        headers=headers,
+        params=params,
+        json={"code": "BYT-01", "name": "Byt na prodej", "total_value": "5000000", "sold_at": "2026-06-15", "sale_price": "6000000"},
+    )
+    assert sold.status_code == 200
+    assert sold.json()["net_worth_contribution"] == 0
+    assert sold.json()["realized_gain_loss_czk"] == 800_000  # 6,000,000 - (5,000,000 + 200,000)
+
+    after_sale = client.get("/assets", headers=headers, params=params).json()[0]
+    assert after_sale["sold_at"] == "2026-06-15"
+    assert after_sale["net_worth_contribution"] == 0
+    assert after_sale["realized_gain_loss_czk"] == 800_000
+
+
+@requires_db
+def test_asset_income_cost_excluded_from_net_worth_but_expense_still_counts(client, portfolio_id):
+    """Rent (and any other income, i.e. a negative AssetCost.amount) is cash
+    flow out of the asset, not a capital contribution to its value - it must
+    NOT reduce net_worth_contribution, unlike an ordinary expense (positive
+    amount, e.g. a renovation), which still adds to it as before."""
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    created = client.post(
+        "/assets",
+        headers=headers,
+        params=params,
+        json={"code": "BYT-02", "name": "Byt k pronajmu", "total_value": "5000000"},
+    )
+    asset_id = created.json()["id"]
+
+    rent = client.post(
+        "/assets/costs",
+        headers=headers,
+        params=params,
+        json={"asset_id": asset_id, "item": "Najem srpen", "amount": "-15000"},
+    )
+    assert rent.status_code == 200
+
+    after_rent = client.get("/assets", headers=headers, params=params).json()[0]
+    assert after_rent["net_worth_contribution"] == 5_000_000  # unaffected by rent income
+    assert after_rent["costs_czk"] == 0
+
+    renovation = client.post(
+        "/assets/costs",
+        headers=headers,
+        params=params,
+        json={"asset_id": asset_id, "item": "Oprava strechy", "amount": "50000"},
+    )
+    assert renovation.status_code == 200
+
+    after_expense = client.get("/assets", headers=headers, params=params).json()[0]
+    assert after_expense["net_worth_contribution"] == 5_050_000  # ordinary expense still counts
+    assert after_expense["costs_czk"] == 50_000
+
+
+@requires_db
+def test_sold_debt_interest_asset_excluded_from_net_worth(client, db_session, portfolio_id):
+    """A Hypotéka (debt_interest) asset normally contributes -borrowed_amount
+    to net worth (it's money owed) - once marked sold/closed, it must
+    contribute 0 like any other sold asset, not -borrowed_amount."""
+    from app.models import AssetType
+
+    asset_type = AssetType(portfolio_id=portfolio_id, name="Hypotéka", calculation_mode="debt_interest")
+    db_session.add(asset_type)
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    created = client.post(
+        "/assets",
+        headers=headers,
+        params=params,
+        json={"code": "HYP-01", "name": "Hypoteka", "asset_type_id": str(asset_type.id), "borrowed_amount": "4000000"},
+    )
+    assert created.status_code == 200
+    asset_id = created.json()["id"]
+    assert created.json()["net_worth_contribution"] == -4_000_000
+
+    sold = client.put(
+        f"/assets/{asset_id}",
+        headers=headers,
+        params=params,
+        json={
+            "code": "HYP-01",
+            "name": "Hypoteka",
+            "asset_type_id": str(asset_type.id),
+            "borrowed_amount": "4000000",
+            "sold_at": "2026-06-15",
+        },
+    )
+    assert sold.status_code == 200
+    assert sold.json()["net_worth_contribution"] == 0
+
+
+@requires_db
 def test_stocks_alerts_endpoint_requires_auth(client, portfolio_id):
     params = {"portfolio_id": str(portfolio_id)}
     unauthenticated = client.get("/stocks/alerts", params=params)
@@ -1526,6 +1661,11 @@ def test_ensure_schema_upgrades_migrates_legacy_single_attachment_file(db_sessio
 
     attachment = db_session.query(AssetCostAttachment).filter_by(cost_id=cost.id).one()
     assert (tmp_path / f"{attachment.id}.pdf").read_bytes() == pdf_bytes
+    # The query above left db_session's own connection idle-in-transaction,
+    # holding a lock that would otherwise deadlock against the ALTER TABLE
+    # statements the next ensure_schema_upgrades() call runs on a different
+    # pooled connection - commit (nothing to persist, just releases it).
+    db_session.commit()
 
     # Idempotent: running it again must not create a second row for the
     # same cost.

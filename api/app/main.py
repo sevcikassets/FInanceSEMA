@@ -256,6 +256,8 @@ class AssetInput(BaseModel):
     first_payment_amount: Decimal | None = None
     fixed_until: date | None = None
     payment: Decimal | None = None
+    sold_at: date | None = None
+    sale_price: Decimal | None = None
 
 
 class PortfolioAccessGrant(BaseModel):
@@ -340,7 +342,11 @@ def asset_costs_count_in_value(calculation_mode: str | None) -> bool:
 def asset_costs_by_id(db: Session, portfolio_id: uuid.UUID) -> dict[uuid.UUID, Decimal]:
     """Cumulative AssetCost.amount per asset_id, for folding into net worth -
     excludes costs under a "Nemovitost"-named category (see
-    is_real_estate_cost_category). A single query instead of one per asset."""
+    is_real_estate_cost_category), and excludes income (negative amount,
+    e.g. rent): that's cash flow out of the asset, not a capital
+    contribution to its value, so it belongs in Vyhodnocení's per-period
+    cashflow reporting, not folded into a lifetime net-worth figure here.
+    A single query instead of one per asset."""
     rows = db.execute(
         select(AssetCost.asset_id, AssetCost.amount, CostCategory.name, AssetCost.category)
         .outerjoin(CostCategory, CostCategory.id == AssetCost.category_id)
@@ -350,6 +356,8 @@ def asset_costs_by_id(db: Session, portfolio_id: uuid.UUID) -> dict[uuid.UUID, D
     for asset_id, amount, category_name, legacy_category in rows:
         if is_real_estate_cost_category(category_name or legacy_category):
             continue
+        if amount is not None and amount < 0:
+            continue
         totals[asset_id] += amount or Decimal("0")
     return dict(totals)
 
@@ -358,10 +366,25 @@ def asset_net_worth_contribution(asset: Asset, calculation_mode: str | None, cos
     """How much this asset counts toward /summary's assets_total: a
     debt_interest asset (Hypotéka) is money OWED, so its borrowed_amount
     reduces net worth; everything else counts its total_value as-is, plus
-    accumulated non-real-estate-category costs (see asset_costs_count_in_value)."""
+    accumulated non-real-estate-category costs (see asset_costs_count_in_value).
+    A sold asset (sold_at set) is no longer owned, so it contributes nothing
+    - the row itself is kept for history, see asset_realized_gain_loss."""
+    if asset.sold_at is not None:
+        return Decimal("0")
     if calculation_mode == "debt_interest":
         return -(asset.borrowed_amount or Decimal("0"))
     return (asset.total_value or Decimal("0")) + costs_total
+
+
+def asset_realized_gain_loss(asset: Asset, costs_total: Decimal) -> Decimal | None:
+    """Realized gain/loss on a sold asset: its sale price minus the book
+    value it would otherwise have counted toward net worth right before the
+    sale (total_value plus accumulated non-real-estate-category costs - the
+    same figure asset_net_worth_contribution used to return). None unless
+    both sold_at and sale_price are set."""
+    if asset.sold_at is None or asset.sale_price is None:
+        return None
+    return asset.sale_price - ((asset.total_value or Decimal("0")) + costs_total)
 
 
 def asset_outstanding_balance(asset: Asset, calculation_mode: str | None) -> Decimal:
@@ -1097,6 +1120,11 @@ def ensure_schema_upgrades() -> None:
         # cleanups in this function.
         conn.execute(text("DROP TABLE IF EXISTS daily_alert_logs"))
 
+        # --- Marking an Asset as sold (property sale support) - see
+        # asset_net_worth_contribution / asset_realized_gain_loss.
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS sold_at DATE"))
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS sale_price NUMERIC(16, 2)"))
+
     # The data-shape migration below (moving rows, splitting one row into
     # two, copying several fields) is simpler and far less error-prone as
     # ORM object manipulation than hand-written INSERT/UPDATE/DELETE SQL -
@@ -1208,7 +1236,16 @@ def schedule_daily_recalculation() -> None:
     time (falls back to the container's local time if tzdata isn't
     available - same degraded-but-safe fallback as cnb_cutoff_date). Guarded
     by `scheduler.running` so repeated calls (e.g. one per test's TestClient
-    startup) don't try to start an already-running scheduler."""
+    startup) don't try to start an already-running scheduler.
+
+    Deliberately never shut down on app shutdown (there used to be an
+    on_shutdown handler calling scheduler.shutdown() here) - its thread is a
+    daemon thread (APScheduler's default), so it dies with the process on
+    its own. Explicitly stopping and restarting it on every single test's
+    TestClient startup/shutdown cycle (100+ times in one test run) was
+    intermittently deadlocking the test suite - stopping and immediately
+    restarting the same BackgroundScheduler instance that fast, that many
+    times, isn't something APScheduler is built to do cleanly."""
     if scheduler.running:
         return
     scheduler.add_job(
@@ -1227,12 +1264,6 @@ def on_startup() -> None:
     ensure_admin_user()
     Path(settings.attachments_dir).mkdir(parents=True, exist_ok=True)
     schedule_daily_recalculation()
-
-
-@app.on_event("shutdown")
-def on_shutdown() -> None:
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
 
 
 @app.get("/health")
@@ -1918,6 +1949,7 @@ def _asset_dict(db: Session, row: Asset) -> dict[str, Any]:
         "costs_czk": json_value(costs_total),
         "costs_counted_in_value": asset_costs_count_in_value(calculation_mode),
         "net_worth_contribution": json_value(asset_net_worth_contribution(row, calculation_mode, costs_total)),
+        "realized_gain_loss_czk": json_value(asset_realized_gain_loss(row, costs_total)),
         "linked_asset": linked.name if linked else None,
         "linked_asset_code": linked.code if linked else None,
     }
@@ -1969,6 +2001,7 @@ def assets(
                 "costs_czk": json_value(costs_total),
                 "costs_counted_in_value": asset_costs_count_in_value(calculation_mode),
                 "net_worth_contribution": json_value(asset_net_worth_contribution(row, calculation_mode, costs_total)),
+                "realized_gain_loss_czk": json_value(asset_realized_gain_loss(row, costs_total)),
                 "linked_asset": linked.name if linked else None,
                 "linked_asset_code": linked.code if linked else None,
             }
@@ -2010,6 +2043,8 @@ def create_asset(
         first_payment_amount=payload.first_payment_amount,
         fixed_until=payload.fixed_until,
         payment=payload.payment,
+        sold_at=payload.sold_at,
+        sale_price=payload.sale_price,
     )
     db.add(row)
     db.commit()
@@ -2054,6 +2089,8 @@ def update_asset(
     row.first_payment_amount = payload.first_payment_amount
     row.fixed_until = payload.fixed_until
     row.payment = payload.payment
+    row.sold_at = payload.sold_at
+    row.sale_price = payload.sale_price
     db.commit()
     return _asset_dict(db, row)
 

@@ -134,7 +134,7 @@ const tabs = [
   { id: "assets", label: "Majetek", icon: Building2, endpoint: "/assets" },
   { id: "asset_types", label: "Typy majetku", icon: Tags, endpoint: "/assets/asset-types" },
   { id: "payers", label: "Plátci", icon: Users, endpoint: "/parties/payers" },
-  { id: "costs", label: "Náklady", icon: WalletCards, endpoint: "/assets/costs" },
+  { id: "costs", label: "Náklady a výnosy", icon: WalletCards, endpoint: "/assets/costs" },
   { id: "categories", label: "Kategorie nákladů", icon: Tag, endpoint: "/assets/cost-categories" },
   { id: "loans", label: "Půjčky", icon: Coins, endpoint: "/loans/movements" },
   { id: "evaluations", label: "Vyhodnocení", icon: PieChart, endpoint: "/evaluations" },
@@ -195,7 +195,7 @@ const PORTFOLIO_SCOPED_TABS = tabs.filter((tab) => !GLOBAL_AGENDAS.has(tab.id) &
 const columns: Record<string, string[]> = {
   portfolio: ["ticker", "name", "quantity", "currency", "market_value_czk", "invested_czk", "profit_czk", "profit_pct"],
   assets: ["code", "owner", "asset_type", "name", "total_value", "own_funds", "borrowed_amount", "interest_rate"],
-  costs: ["cost_date", "asset", "payer", "supplier", "category", "item", "amount", "actions"],
+  costs: ["cost_date", "asset", "payer", "supplier", "category", "item", "expense_amount", "income_amount", "actions"],
   loans: ["period_label", "lender", "borrower", "amount", "interest_rate", "planned_end_date", "description", "actions"],
   evaluations: [
     "period_label",
@@ -319,6 +319,8 @@ const labels: Record<string, string> = {
   category: "Kategorie",
   item: "Položka",
   amount: "Částka",
+  expense_amount: "Náklad",
+  income_amount: "Výnos",
   movement_date: "Datum",
   period_label: "Období",
   lender: "Věřitel",
@@ -1162,6 +1164,16 @@ function buildStatisticRows(rows: Row[], expandedMonths: Set<string>) {
   return result;
 }
 
+// Split into a Náklad column (positive amount) and a Výnos column (negative
+// amount, shown as its positive magnitude) rather than one signed "Částka"
+// column - a negative number reading as "income" isn't intuitive at a
+// glance, this reads like a normal expense/income ledger instead.
+function splitCostAmount(amount: number): { expense_amount: number | null; income_amount: number | null } {
+  if (amount > 0) return { expense_amount: amount, income_amount: null };
+  if (amount < 0) return { expense_amount: null, income_amount: -amount };
+  return { expense_amount: null, income_amount: null };
+}
+
 function buildCostRows(rows: Row[], assetFilter: string, showDetail: boolean) {
   const filteredRows = assetFilter ? rows.filter((row) => String(row.asset || "") === assetFilter) : rows;
   const groups = new Map<string, Row[]>();
@@ -1176,17 +1188,20 @@ function buildCostRows(rows: Row[], assetFilter: string, showDetail: boolean) {
   const result: Row[] = [];
   for (const [monthKey, groupRows] of [...groups.entries()].sort((a, b) => b[0].localeCompare(a[0]))) {
     const sortedRows = [...groupRows].sort((a, b) => String(b.cost_date || "").localeCompare(String(a.cost_date || "")));
+    const expenseTotal = sortedRows.reduce((total, row) => total + Math.max(numberValue(row.amount), 0), 0);
+    const incomeTotal = sortedRows.reduce((total, row) => total + Math.max(-numberValue(row.amount), 0), 0);
     const summary: Row = {
       row_kind: "summary",
       cost_date: monthKey === "bez-data" ? "Bez data" : monthLabel(`${monthKey}-01`),
       asset: assetFilter || "Všechny investice",
       item: "Měsíční mezisoučet",
-      amount: sortedRows.reduce((total, row) => total + numberValue(row.amount), 0),
+      expense_amount: expenseTotal || null,
+      income_amount: incomeTotal || null,
     };
     result.push(summary);
     if (showDetail) {
       for (const row of sortedRows) {
-        result.push({ ...row, row_kind: "detail" });
+        result.push({ ...row, ...splitCostAmount(numberValue(row.amount)), row_kind: "detail" });
       }
     }
   }
@@ -1477,6 +1492,7 @@ export default function Page() {
     item: "",
     category: "",
     amount: "",
+    costType: "expense" as "expense" | "income",
     supplier: "",
     payer: "",
     note: "",
@@ -1504,6 +1520,8 @@ export default function Page() {
     first_payment_amount: "",
     fixed_until: "",
     payment: "",
+    sold_at: "",
+    sale_price: "",
   });
   const [assetBusy, setAssetBusy] = useState(false);
   const [assetStatus, setAssetStatus] = useState<string | null>(null);
@@ -2528,6 +2546,16 @@ export default function Page() {
             </select>
           </label>
           <label>
+            Typ
+            <select
+              value={costDraft.costType}
+              onChange={(event) => setCostDraft((value) => ({ ...value, costType: event.target.value as "expense" | "income" }))}
+            >
+              <option value="expense">Náklad</option>
+              <option value="income">Výnos</option>
+            </select>
+          </label>
+          <label>
             Částka
             <ThousandsInput value={costDraft.amount} onChange={(amount) => setCostDraft((value) => ({ ...value, amount }))} />
           </label>
@@ -2560,18 +2588,30 @@ export default function Page() {
 
   function openNewCostForm() {
     setEditingCostId("__new__");
-    setCostDraft({ asset_id: "", cost_date: "", item: "", category: "", amount: "", supplier: "", payer: "", note: "" });
+    setCostDraft({
+      asset_id: "",
+      cost_date: "",
+      item: "",
+      category: "",
+      amount: "",
+      costType: "expense",
+      supplier: "",
+      payer: "",
+      note: "",
+    });
     setCostStatus(null);
   }
 
   function openCostEditor(row: Row) {
     setEditingCostId(String(row.id));
+    const amount = row.amount != null ? Number(row.amount) : null;
     setCostDraft({
       asset_id: row.asset_id ? String(row.asset_id) : "",
       cost_date: row.cost_date ? String(row.cost_date) : "",
       item: row.item ? String(row.item) : "",
       category: row.category ? String(row.category) : "",
-      amount: row.amount != null ? String(row.amount) : "",
+      amount: amount != null ? String(Math.abs(amount)) : "",
+      costType: amount != null && amount < 0 ? "income" : "expense",
       supplier: row.supplier ? String(row.supplier) : "",
       payer: row.payer ? String(row.payer) : "",
       note: row.note ? String(row.note) : "",
@@ -2589,12 +2629,13 @@ export default function Page() {
     setCostBusy(true);
     setCostStatus(null);
     try {
+      const magnitude = costDraft.amount.trim() ? Math.abs(Number(costDraft.amount)) : null;
       const payload = {
         asset_id: costDraft.asset_id || null,
         cost_date: costDraft.cost_date || null,
         item: costDraft.item.trim(),
         category: costDraft.category.trim() || null,
-        amount: costDraft.amount.trim() ? Number(costDraft.amount) : null,
+        amount: magnitude === null ? null : costDraft.costType === "income" ? -magnitude : magnitude,
         supplier: costDraft.supplier.trim() || null,
         payer: costDraft.payer.trim() || null,
         note: costDraft.note.trim() || null,
@@ -3291,6 +3332,23 @@ export default function Page() {
               onChange={(event) => setAssetDraft((value) => ({ ...value, own_funds: event.target.value }))}
             />
           </label>
+          <label>
+            Datum prodeje
+            <input
+              type="date"
+              value={assetDraft.sold_at}
+              onChange={(event) => setAssetDraft((value) => ({ ...value, sold_at: event.target.value }))}
+            />
+          </label>
+          <label>
+            Prodejní cena
+            <input
+              type="number"
+              step="0.01"
+              value={assetDraft.sale_price}
+              onChange={(event) => setAssetDraft((value) => ({ ...value, sale_price: event.target.value }))}
+            />
+          </label>
           {(assetTypeById(assetDraft.asset_type_id, assetTypesList)?.calculation_mode === "debt_interest" ||
             assetDraft.linked_asset_id ||
             assetDraft.borrowed_amount ||
@@ -3436,6 +3494,8 @@ export default function Page() {
       first_payment_amount: "",
       fixed_until: "",
       payment: "",
+      sold_at: "",
+      sale_price: "",
     });
     setAssetStatus(null);
   }
@@ -3460,6 +3520,8 @@ export default function Page() {
       first_payment_amount: row.first_payment_amount != null ? String(row.first_payment_amount) : "",
       fixed_until: row.fixed_until ? String(row.fixed_until) : "",
       payment: row.payment != null ? String(row.payment) : "",
+      sold_at: row.sold_at ? String(row.sold_at) : "",
+      sale_price: row.sale_price != null ? String(row.sale_price) : "",
     });
     setAssetStatus(null);
   }
@@ -3492,6 +3554,8 @@ export default function Page() {
         first_payment_amount: assetDraft.first_payment_amount.trim() ? Number(assetDraft.first_payment_amount) : null,
         fixed_until: assetDraft.fixed_until || null,
         payment: assetDraft.payment.trim() ? Number(assetDraft.payment) : null,
+        sold_at: assetDraft.sold_at || null,
+        sale_price: assetDraft.sale_price.trim() ? Number(assetDraft.sale_price) : null,
       };
       if (editingAssetId === "__new__") {
         await api(withPortfolio("/assets"), { method: "POST", body: JSON.stringify(payload) });
@@ -5132,7 +5196,10 @@ export default function Page() {
               <article className="asset-agenda" key={String(asset.id || asset.code)}>
                 <header>
                   <div>
-                    <h2>{String(asset.name || "")}</h2>
+                    <h2>
+                      {String(asset.name || "")}
+                      {asset.sold_at && <span className="sold-badge">Prodáno {String(asset.sold_at)}</span>}
+                    </h2>
                     <p>
                       {String(asset.code || "")} · {String(asset.owner || "Bez vlastníka")} · {String(asset.asset_type || "Bez typu")}
                     </p>
@@ -5165,6 +5232,20 @@ export default function Page() {
                         {formatValue("net_worth_contribution", asset.net_worth_contribution)}
                       </strong>
                     </div>
+                    {asset.sold_at && (
+                      <div>
+                        <span>Prodejní cena</span>
+                        <strong>{formatValue("sale_price", asset.sale_price)}</strong>
+                      </div>
+                    )}
+                    {asset.sold_at && asset.realized_gain_loss_czk != null && (
+                      <div>
+                        <span>Realizovaný zisk/ztráta</span>
+                        <strong className={numberValue(asset.realized_gain_loss_czk) >= 0 ? "positive" : "negative"}>
+                          {formatValue("realized_gain_loss_czk", asset.realized_gain_loss_czk)}
+                        </strong>
+                      </div>
+                    )}
                   </div>
                 </header>
                 <div className="cost-row-actions asset-agenda-actions">
@@ -5405,6 +5486,8 @@ export default function Page() {
                           <span className={numberValue(row[col]) >= 0 ? "positive" : "negative"}>
                             {formatSignedProfit(numberValue(row[col]))}
                           </span>
+                        ) : activeTab === "costs" && col === "income_amount" && typeof row[col] === "number" ? (
+                          <span className="positive">{formatValue(col, row[col])}</span>
                         ) : activeTab === "stats" ? (
                           formatStatValue(col, row[col])
                         ) : (

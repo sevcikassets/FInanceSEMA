@@ -171,6 +171,13 @@ class Asset(Base):
     # bolted onto the property row.
     asset_type_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("asset_types.id"), index=True)
     linked_asset_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("assets.id"), index=True)
+    # Set together (or not at all) to mark an asset as sold - see
+    # asset_net_worth_contribution (excludes it once sold) and
+    # asset_realized_gain_loss (sale_price minus its book value just before
+    # the sale) in main.py. The row itself is kept, not deleted, so its
+    # history (costs, past valuations) stays intact.
+    sold_at: Mapped[date | None] = mapped_column(Date)
+    sale_price: Mapped[Decimal | None] = mapped_column(Numeric(16, 2))
 
     owner: Mapped[Party | None] = relationship()
 
