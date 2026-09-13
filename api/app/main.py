@@ -258,6 +258,7 @@ class AssetInput(BaseModel):
     payment: Decimal | None = None
     sold_at: date | None = None
     sale_price: Decimal | None = None
+    project_url: str | None = None
 
 
 class PortfolioAccessGrant(BaseModel):
@@ -1124,6 +1125,10 @@ def ensure_schema_upgrades() -> None:
         # asset_net_worth_contribution / asset_realized_gain_loss.
         conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS sold_at DATE"))
         conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS sale_price NUMERIC(16, 2)"))
+
+        # --- Optional link to wherever the asset's own renovation/
+        # construction project is tracked (Trello, Drive, ...).
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS project_url VARCHAR(1024)"))
 
     # The data-shape migration below (moving rows, splitting one row into
     # two, copying several fields) is simpler and far less error-prone as
@@ -2045,6 +2050,7 @@ def create_asset(
         payment=payload.payment,
         sold_at=payload.sold_at,
         sale_price=payload.sale_price,
+        project_url=(payload.project_url or "").strip() or None,
     )
     db.add(row)
     db.commit()
@@ -2091,6 +2097,7 @@ def update_asset(
     row.payment = payload.payment
     row.sold_at = payload.sold_at
     row.sale_price = payload.sale_price
+    row.project_url = (payload.project_url or "").strip() or None
     db.commit()
     return _asset_dict(db, row)
 

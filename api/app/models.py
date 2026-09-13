@@ -178,6 +178,10 @@ class Asset(Base):
     # history (costs, past valuations) stays intact.
     sold_at: Mapped[date | None] = mapped_column(Date)
     sale_price: Mapped[Decimal | None] = mapped_column(Numeric(16, 2))
+    # Free-form link to wherever the actual renovation/construction project
+    # for this asset is tracked (a Trello board, a shared Drive folder, ...) -
+    # entirely external to this app, just a convenience shortcut on the card.
+    project_url: Mapped[str | None] = mapped_column(String(1024))
 
     owner: Mapped[Party | None] = relationship()
 

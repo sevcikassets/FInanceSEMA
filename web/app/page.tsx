@@ -1164,6 +1164,15 @@ function buildStatisticRows(rows: Row[], expandedMonths: Set<string>) {
   return result;
 }
 
+// Cost rows for one asset, most recent first - powers the "Odpracované
+// práce" expandable list on the Majetek card (assetWorkLog is the full
+// /assets/costs list, fetched once per Majetek-tab load, not per asset).
+function assetWorkItems(assetWorkLog: Row[], assetId: string): Row[] {
+  return assetWorkLog
+    .filter((row) => String(row.asset_id || "") === assetId)
+    .sort((a, b) => String(b.cost_date || "").localeCompare(String(a.cost_date || "")));
+}
+
 // Split into a Náklad column (positive amount) and a Výnos column (negative
 // amount, shown as its positive magnitude) rather than one signed "Částka"
 // column - a negative number reading as "income" isn't intuitive at a
@@ -1485,6 +1494,8 @@ export default function Page() {
   const [categoryStatus, setCategoryStatus] = useState<string | null>(null);
   const [costAssetsList, setCostAssetsList] = useState<Row[]>([]);
   const [costCategoriesList, setCostCategoriesList] = useState<Row[]>([]);
+  const [assetWorkLog, setAssetWorkLog] = useState<Row[]>([]);
+  const [expandedAssetWorkLog, setExpandedAssetWorkLog] = useState<Set<string>>(new Set());
   const [editingCostId, setEditingCostId] = useState<string | null>(null);
   const [costDraft, setCostDraft] = useState({
     asset_id: "",
@@ -1522,6 +1533,7 @@ export default function Page() {
     payment: "",
     sold_at: "",
     sale_price: "",
+    project_url: "",
   });
   const [assetBusy, setAssetBusy] = useState(false);
   const [assetStatus, setAssetStatus] = useState<string | null>(null);
@@ -1878,6 +1890,10 @@ export default function Page() {
       // free text (get-or-create), not a dictionary pick, so no extra fetch
       // is needed for it - see "Plátci", which manages cost payers instead.
       const needsAssetExtras = activeTab === "assets";
+      // Powers the "Odpracované práce" expandable list on each asset card -
+      // the same cost rows the Náklady a výnosy tab shows, just fetched here
+      // too and filtered client-side by asset_id (see assetWorkItemsByAsset).
+      const needsAssetWorkLog = activeTab === "assets";
       const needsLoanBalances = activeTab === "loans";
       const needsBenchmark = activeTab === "charts";
       const needsAllocationHistory = activeTab === "charts";
@@ -1891,6 +1907,7 @@ export default function Page() {
       if (needsDuplicateParties) requests.push(api("/parties/duplicate-candidates"));
       if (needsCostExtras) requests.push(api(withPortfolio("/assets")), api(withPortfolio("/assets/cost-categories")));
       if (needsAssetExtras) requests.push(api(withPortfolio("/assets/asset-types")));
+      if (needsAssetWorkLog) requests.push(api(withPortfolio("/assets/costs")));
       if (needsLoanBalances) requests.push(api(withPortfolio("/loans/balances")));
       if (needsEvaluations) requests.push(api(withPortfolio("/evaluations")));
       if (needsBenchmark) requests.push(api(withPortfolio("/stocks/benchmark")));
@@ -1925,6 +1942,7 @@ export default function Page() {
       if (needsAssetExtras) {
         setAssetTypesList(rest[restIndex++] as Row[]);
       }
+      if (needsAssetWorkLog) setAssetWorkLog(rest[restIndex++] as Row[]);
       if (needsLoanBalances) setLoanBalances(rest[restIndex++] as LoanBalances);
       if (needsEvaluations) setEvaluations(rest[restIndex++] as Evaluation[]);
       if (needsBenchmark) setBenchmark(rest[restIndex++] as Row[]);
@@ -3349,6 +3367,15 @@ export default function Page() {
               onChange={(event) => setAssetDraft((value) => ({ ...value, sale_price: event.target.value }))}
             />
           </label>
+          <label>
+            Odkaz na projekt
+            <input
+              type="url"
+              placeholder="https://…"
+              value={assetDraft.project_url}
+              onChange={(event) => setAssetDraft((value) => ({ ...value, project_url: event.target.value }))}
+            />
+          </label>
           {(assetTypeById(assetDraft.asset_type_id, assetTypesList)?.calculation_mode === "debt_interest" ||
             assetDraft.linked_asset_id ||
             assetDraft.borrowed_amount ||
@@ -3496,6 +3523,7 @@ export default function Page() {
       payment: "",
       sold_at: "",
       sale_price: "",
+      project_url: "",
     });
     setAssetStatus(null);
   }
@@ -3522,12 +3550,22 @@ export default function Page() {
       payment: row.payment != null ? String(row.payment) : "",
       sold_at: row.sold_at ? String(row.sold_at) : "",
       sale_price: row.sale_price != null ? String(row.sale_price) : "",
+      project_url: row.project_url ? String(row.project_url) : "",
     });
     setAssetStatus(null);
   }
 
   function closeAssetEditor() {
     setEditingAssetId(null);
+  }
+
+  function toggleAssetWorkLog(assetId: string) {
+    setExpandedAssetWorkLog((current) => {
+      const next = new Set(current);
+      if (next.has(assetId)) next.delete(assetId);
+      else next.add(assetId);
+      return next;
+    });
   }
 
   async function saveAssetDraft(event: React.FormEvent) {
@@ -3556,6 +3594,7 @@ export default function Page() {
         payment: assetDraft.payment.trim() ? Number(assetDraft.payment) : null,
         sold_at: assetDraft.sold_at || null,
         sale_price: assetDraft.sale_price.trim() ? Number(assetDraft.sale_price) : null,
+        project_url: assetDraft.project_url.trim() || null,
       };
       if (editingAssetId === "__new__") {
         await api(withPortfolio("/assets"), { method: "POST", body: JSON.stringify(payload) });
@@ -5206,6 +5245,13 @@ export default function Page() {
                     {asset.linked_asset && (
                       <p className="field-hint">Financuje: {String(asset.linked_asset_code || "")} — {String(asset.linked_asset)}</p>
                     )}
+                    {asset.project_url && (
+                      <p className="field-hint">
+                        <a href={String(asset.project_url)} target="_blank" rel="noopener noreferrer">
+                          Odkaz na projekt ↗
+                        </a>
+                      </p>
+                    )}
                   </div>
                   <div className="agenda-metrics">
                     <div>
@@ -5271,6 +5317,13 @@ export default function Page() {
                           : "Zobrazit splátkový kalendář"}
                     </button>
                   )}
+                  {assetWorkItems(assetWorkLog, String(asset.id)).length > 0 && (
+                    <button type="button" className="link-button" onClick={() => toggleAssetWorkLog(String(asset.id))}>
+                      {expandedAssetWorkLog.has(String(asset.id))
+                        ? "Skrýt odpracované práce"
+                        : `Zobrazit odpracované práce (${assetWorkItems(assetWorkLog, String(asset.id)).length})`}
+                    </button>
+                  )}
                 </div>
                 {interestPlanEntries(asset).length > 0 && (
                   <div className="interest-plan">
@@ -5286,6 +5339,32 @@ export default function Page() {
                   </div>
                 )}
                 {assetSchedule?.forId === String(asset.id) && <PaymentScheduleTable rows={assetSchedule.rows} />}
+                {expandedAssetWorkLog.has(String(asset.id)) && (
+                  <div className="nested-table asset-work-log">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Datum</th>
+                          <th>Položka</th>
+                          <th>Kategorie</th>
+                          <th>Dodavatel</th>
+                          <th>Částka</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {assetWorkItems(assetWorkLog, String(asset.id)).map((item) => (
+                          <tr key={String(item.id)}>
+                            <td>{formatValue("cost_date", item.cost_date)}</td>
+                            <td>{String(item.item || "")}</td>
+                            <td>{String(item.category || "")}</td>
+                            <td>{String(item.supplier || "")}</td>
+                            <td className="numeric-cell">{formatValue("amount", item.amount)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
                 {editingAssetId === String(asset.id) && renderAssetEditorForm()}
               </article>
             ))}

@@ -1263,6 +1263,11 @@ nav button:hover {
   min-width: 840px;
 }
 
+.asset-work-log {
+  margin-top: 10px;
+  margin-bottom: 10px;
+}
+
 .table-wrap {
   overflow: auto;
   background: var(--panel);

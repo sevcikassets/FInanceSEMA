@@ -333,6 +333,35 @@ def test_sold_debt_interest_asset_excluded_from_net_worth(client, db_session, po
 
 
 @requires_db
+def test_asset_project_url_round_trips_and_blank_clears_it(client, portfolio_id):
+    """project_url is a plain optional field on Asset - persists through
+    create/update, and an empty string on update clears it back to None
+    rather than being stored as a literal empty string."""
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    params = {"portfolio_id": str(portfolio_id)}
+
+    created = client.post(
+        "/assets",
+        headers=headers,
+        params=params,
+        json={"code": "PRJ-01", "name": "Byt s projektem", "project_url": "https://trello.com/b/example"},
+    )
+    assert created.status_code == 200
+    asset_id = created.json()["id"]
+    assert created.json()["project_url"] == "https://trello.com/b/example"
+
+    cleared = client.put(
+        f"/assets/{asset_id}",
+        headers=headers,
+        params=params,
+        json={"code": "PRJ-01", "name": "Byt s projektem", "project_url": ""},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["project_url"] is None
+
+
+@requires_db
 def test_stocks_alerts_endpoint_requires_auth(client, portfolio_id):
     params = {"portfolio_id": str(portfolio_id)}
     unauthenticated = client.get("/stocks/alerts", params=params)
