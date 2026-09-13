@@ -1910,7 +1910,11 @@ export default function Page() {
       if (needsDuplicateParties) requests.push(api("/parties/duplicate-candidates"));
       if (needsCostExtras) requests.push(api(withPortfolio("/assets")), api(withPortfolio("/assets/cost-categories")));
       if (needsAssetExtras) requests.push(api(withPortfolio("/assets/asset-types")));
-      if (needsActivitiesProjects) requests.push(api("/activities/projects"));
+      // Activities is a separate app - if it's unreachable or misconfigured,
+      // that must degrade to "no projects to show", never take down the
+      // whole Majetek tab (which would otherwise fail here too, since every
+      // request in this batch shares one Promise.all).
+      if (needsActivitiesProjects) requests.push(api("/activities/projects").catch(() => []));
       if (needsLoanBalances) requests.push(api(withPortfolio("/loans/balances")));
       if (needsEvaluations) requests.push(api(withPortfolio("/evaluations")));
       if (needsBenchmark) requests.push(api(withPortfolio("/stocks/benchmark")));

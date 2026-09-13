@@ -2399,8 +2399,15 @@ def activities_projects(_: str = Depends(require_user), db: Session = Depends(ge
     outside this app's own data, in a separate app on the same host (see
     activities_db.py). Powers the "Projekt v Activities" picker on an Asset,
     and the frontend resolves a linked activities_project_id to its name by
-    matching against this same list."""
-    return list_activities_projects(db)
+    matching against this same list. Activities being unreachable (down,
+    shared_infra network/credentials not set up yet, ...) must degrade to
+    "no projects to show" here, not a 500 that breaks the whole Majetek tab -
+    see ACTIVITIES_DATABASE_URL in .env.example."""
+    try:
+        return list_activities_projects(db)
+    except Exception:  # noqa: BLE001 - Activities being unreachable must not break Majetek
+        logger.exception("Failed to reach Activities' database for /activities/projects")
+        return []
 
 
 @app.get("/activities/projects/{project_id}/time-entries")

@@ -12,7 +12,15 @@ from .config import get_settings
 # purpose: this app never migrates or writes to Activities' schema, so a
 # full ORM mapping would be misleading upkeep - the handful of columns
 # actually needed are queried directly by the helpers below instead.
-activities_engine = create_engine(get_settings().activities_database_url, pool_pre_ping=True)
+# connect_timeout bounds how long a connection attempt can hang if
+# Activities/shared_infra is down or misconfigured - without it, a broken
+# network path can leave the TCP handshake hanging far longer than any
+# reasonable page load (observed: multiple minutes), which defeats the
+# graceful-degradation handling in main.py's /activities/projects (that
+# only helps once an exception is actually raised).
+activities_engine = create_engine(
+    get_settings().activities_database_url, pool_pre_ping=True, connect_args={"connect_timeout": 3}
+)
 ActivitiesSessionLocal = sessionmaker(bind=activities_engine, autoflush=False, autocommit=False)
 
 
