@@ -333,32 +333,75 @@ def test_sold_debt_interest_asset_excluded_from_net_worth(client, db_session, po
 
 
 @requires_db
-def test_asset_project_url_round_trips_and_blank_clears_it(client, portfolio_id):
-    """project_url is a plain optional field on Asset - persists through
-    create/update, and an empty string on update clears it back to None
-    rather than being stored as a literal empty string."""
+def test_asset_activities_project_id_round_trips_and_clears(client, portfolio_id):
+    """activities_project_id is a plain optional UUID on Asset (references a
+    project in the Activities app's own database - see activities_db.py,
+    never a SQLAlchemy ForeignKey since that table lives elsewhere) -
+    persists through create/update, and can be cleared back to None."""
     login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
     headers = {"Authorization": f"Bearer {login.json()['token']}"}
     params = {"portfolio_id": str(portfolio_id)}
+    project_id = str(uuid.uuid4())
 
     created = client.post(
         "/assets",
         headers=headers,
         params=params,
-        json={"code": "PRJ-01", "name": "Byt s projektem", "project_url": "https://trello.com/b/example"},
+        json={"code": "PRJ-01", "name": "Byt s projektem", "activities_project_id": project_id},
     )
     assert created.status_code == 200
     asset_id = created.json()["id"]
-    assert created.json()["project_url"] == "https://trello.com/b/example"
+    assert created.json()["activities_project_id"] == project_id
 
     cleared = client.put(
         f"/assets/{asset_id}",
         headers=headers,
         params=params,
-        json={"code": "PRJ-01", "name": "Byt s projektem", "project_url": ""},
+        json={"code": "PRJ-01", "name": "Byt s projektem", "activities_project_id": None},
     )
     assert cleared.status_code == 200
-    assert cleared.json()["project_url"] is None
+    assert cleared.json()["activities_project_id"] is None
+
+
+@requires_db
+def test_activities_projects_endpoint_requires_auth_and_returns_list(client, monkeypatch):
+    """Doesn't hit a real Activities database in tests - monkeypatches the
+    query helper (see activities_db.py) so this only verifies the endpoint's
+    own auth/wiring, not cross-database connectivity."""
+    from app import main as main_module
+
+    unauthenticated = client.get("/activities/projects")
+    assert unauthenticated.status_code == 401
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+
+    monkeypatch.setattr(
+        main_module, "list_activities_projects", lambda db: [{"id": "11111111-1111-1111-1111-111111111111", "name": "RD Kvasice"}]
+    )
+    response = client.get("/activities/projects", headers=headers)
+    assert response.status_code == 200
+    assert response.json() == [{"id": "11111111-1111-1111-1111-111111111111", "name": "RD Kvasice"}]
+
+
+@requires_db
+def test_activities_time_entries_endpoint_passes_through_project_id(client, monkeypatch):
+    from app import main as main_module
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "finance"})
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    project_id = uuid.uuid4()
+    captured = {}
+
+    def fake_time_entries(db, project_id_arg):
+        captured["project_id"] = project_id_arg
+        return [{"spent_on": "2026-06-15", "description": "Bourání příček", "duration_hours": 4.5, "category_code": "PRACE"}]
+
+    monkeypatch.setattr(main_module, "list_activities_time_entries", fake_time_entries)
+    response = client.get(f"/activities/projects/{project_id}/time-entries", headers=headers)
+    assert response.status_code == 200
+    assert response.json()[0]["description"] == "Bourání příček"
+    assert captured["project_id"] == project_id
 
 
 @requires_db

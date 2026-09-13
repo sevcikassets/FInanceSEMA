@@ -25,6 +25,12 @@ services:
         required: false
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://finance:finance@db:5432/finance_sema}
+      # Read-only cross-app connection to the Activities app's own Postgres
+      # (a separate docker-compose project - see the "activities" service's
+      # docker-compose.yml, joined to the shared_infra network below for
+      # exactly this). Powers GET /activities/* (linked project + its work
+      # log on an Asset's Majetek card) - never written to from here.
+      ACTIVITIES_DATABASE_URL: ${ACTIVITIES_DATABASE_URL:-postgresql+psycopg://activities:activities@activities-db:5432/activities}
       API_CORS_ORIGINS: ${API_CORS_ORIGINS:-http://localhost:3010}
       APP_USERNAME: ${FINANCE_APP_USERNAME:-admin}
       APP_PASSWORD: ${FINANCE_APP_PASSWORD:-finance}
@@ -35,6 +41,9 @@ services:
       - ./attachments:/app/attachments
     ports:
       - "127.0.0.1:8010:8000"
+    networks:
+      - default
+      - shared_infra
     depends_on:
       db:
         condition: service_healthy
@@ -57,3 +66,8 @@ services:
 
 volumes:
   finance-sema-db:
+
+networks:
+  default:
+  shared_infra:
+    external: true

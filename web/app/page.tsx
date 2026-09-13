@@ -1164,13 +1164,9 @@ function buildStatisticRows(rows: Row[], expandedMonths: Set<string>) {
   return result;
 }
 
-// Cost rows for one asset, most recent first - powers the "Odpracované
-// práce" expandable list on the Majetek card (assetWorkLog is the full
-// /assets/costs list, fetched once per Majetek-tab load, not per asset).
-function assetWorkItems(assetWorkLog: Row[], assetId: string): Row[] {
-  return assetWorkLog
-    .filter((row) => String(row.asset_id || "") === assetId)
-    .sort((a, b) => String(b.cost_date || "").localeCompare(String(a.cost_date || "")));
+function activitiesProjectName(activitiesProjectsList: Row[], projectId: unknown): string | null {
+  const project = activitiesProjectsList.find((row) => String(row.id) === String(projectId));
+  return project ? String(project.name) : null;
 }
 
 // Split into a Náklad column (positive amount) and a Výnos column (negative
@@ -1494,8 +1490,14 @@ export default function Page() {
   const [categoryStatus, setCategoryStatus] = useState<string | null>(null);
   const [costAssetsList, setCostAssetsList] = useState<Row[]>([]);
   const [costCategoriesList, setCostCategoriesList] = useState<Row[]>([]);
-  const [assetWorkLog, setAssetWorkLog] = useState<Row[]>([]);
+  const [activitiesProjectsList, setActivitiesProjectsList] = useState<Row[]>([]);
   const [expandedAssetWorkLog, setExpandedAssetWorkLog] = useState<Set<string>>(new Set());
+  // Lazily fetched per asset (keyed by asset id) the first time its work log
+  // is expanded - each asset has at most one linked Activities project, no
+  // point bulk-loading every linked project's whole time-entry history
+  // up front for a section most assets won't even have.
+  const [assetWorkLogEntries, setAssetWorkLogEntries] = useState<Record<string, Row[]>>({});
+  const [assetWorkLogBusy, setAssetWorkLogBusy] = useState<string | null>(null);
   const [editingCostId, setEditingCostId] = useState<string | null>(null);
   const [costDraft, setCostDraft] = useState({
     asset_id: "",
@@ -1533,7 +1535,7 @@ export default function Page() {
     payment: "",
     sold_at: "",
     sale_price: "",
-    project_url: "",
+    activities_project_id: "",
   });
   const [assetBusy, setAssetBusy] = useState(false);
   const [assetStatus, setAssetStatus] = useState<string | null>(null);
@@ -1890,10 +1892,11 @@ export default function Page() {
       // free text (get-or-create), not a dictionary pick, so no extra fetch
       // is needed for it - see "Plátci", which manages cost payers instead.
       const needsAssetExtras = activeTab === "assets";
-      // Powers the "Odpracované práce" expandable list on each asset card -
-      // the same cost rows the Náklady a výnosy tab shows, just fetched here
-      // too and filtered client-side by asset_id (see assetWorkItemsByAsset).
-      const needsAssetWorkLog = activeTab === "assets";
+      // Powers both the "Projekt v Activities" picker in the asset form and
+      // resolving a linked activities_project_id to its display name on the
+      // card - Activities' own project registry, read live from its
+      // database (see activities_db.py), not duplicated into this app.
+      const needsActivitiesProjects = activeTab === "assets";
       const needsLoanBalances = activeTab === "loans";
       const needsBenchmark = activeTab === "charts";
       const needsAllocationHistory = activeTab === "charts";
@@ -1907,7 +1910,7 @@ export default function Page() {
       if (needsDuplicateParties) requests.push(api("/parties/duplicate-candidates"));
       if (needsCostExtras) requests.push(api(withPortfolio("/assets")), api(withPortfolio("/assets/cost-categories")));
       if (needsAssetExtras) requests.push(api(withPortfolio("/assets/asset-types")));
-      if (needsAssetWorkLog) requests.push(api(withPortfolio("/assets/costs")));
+      if (needsActivitiesProjects) requests.push(api("/activities/projects"));
       if (needsLoanBalances) requests.push(api(withPortfolio("/loans/balances")));
       if (needsEvaluations) requests.push(api(withPortfolio("/evaluations")));
       if (needsBenchmark) requests.push(api(withPortfolio("/stocks/benchmark")));
@@ -1942,7 +1945,7 @@ export default function Page() {
       if (needsAssetExtras) {
         setAssetTypesList(rest[restIndex++] as Row[]);
       }
-      if (needsAssetWorkLog) setAssetWorkLog(rest[restIndex++] as Row[]);
+      if (needsActivitiesProjects) setActivitiesProjectsList(rest[restIndex++] as Row[]);
       if (needsLoanBalances) setLoanBalances(rest[restIndex++] as LoanBalances);
       if (needsEvaluations) setEvaluations(rest[restIndex++] as Evaluation[]);
       if (needsBenchmark) setBenchmark(rest[restIndex++] as Row[]);
@@ -3368,13 +3371,18 @@ export default function Page() {
             />
           </label>
           <label>
-            Odkaz na projekt
-            <input
-              type="url"
-              placeholder="https://…"
-              value={assetDraft.project_url}
-              onChange={(event) => setAssetDraft((value) => ({ ...value, project_url: event.target.value }))}
-            />
+            Projekt v Activities
+            <select
+              value={assetDraft.activities_project_id}
+              onChange={(event) => setAssetDraft((value) => ({ ...value, activities_project_id: event.target.value }))}
+            >
+              <option value="">Bez projektu</option>
+              {activitiesProjectsList.map((project) => (
+                <option value={String(project.id)} key={String(project.id)}>
+                  {String(project.name)}
+                </option>
+              ))}
+            </select>
           </label>
           {(assetTypeById(assetDraft.asset_type_id, assetTypesList)?.calculation_mode === "debt_interest" ||
             assetDraft.linked_asset_id ||
@@ -3523,7 +3531,7 @@ export default function Page() {
       payment: "",
       sold_at: "",
       sale_price: "",
-      project_url: "",
+      activities_project_id: "",
     });
     setAssetStatus(null);
   }
@@ -3550,7 +3558,7 @@ export default function Page() {
       payment: row.payment != null ? String(row.payment) : "",
       sold_at: row.sold_at ? String(row.sold_at) : "",
       sale_price: row.sale_price != null ? String(row.sale_price) : "",
-      project_url: row.project_url ? String(row.project_url) : "",
+      activities_project_id: row.activities_project_id ? String(row.activities_project_id) : "",
     });
     setAssetStatus(null);
   }
@@ -3559,13 +3567,24 @@ export default function Page() {
     setEditingAssetId(null);
   }
 
-  function toggleAssetWorkLog(assetId: string) {
+  async function toggleAssetWorkLog(assetId: string, activitiesProjectId: string) {
+    const alreadyExpanded = expandedAssetWorkLog.has(assetId);
     setExpandedAssetWorkLog((current) => {
       const next = new Set(current);
-      if (next.has(assetId)) next.delete(assetId);
+      if (alreadyExpanded) next.delete(assetId);
       else next.add(assetId);
       return next;
     });
+    if (alreadyExpanded || assetWorkLogEntries[assetId]) return;
+    setAssetWorkLogBusy(assetId);
+    try {
+      const entries = (await api(`/activities/projects/${activitiesProjectId}/time-entries`)) as Row[];
+      setAssetWorkLogEntries((current) => ({ ...current, [assetId]: entries }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Načtení odpracovaných prací se nezdařilo");
+    } finally {
+      setAssetWorkLogBusy(null);
+    }
   }
 
   async function saveAssetDraft(event: React.FormEvent) {
@@ -3594,7 +3613,7 @@ export default function Page() {
         payment: assetDraft.payment.trim() ? Number(assetDraft.payment) : null,
         sold_at: assetDraft.sold_at || null,
         sale_price: assetDraft.sale_price.trim() ? Number(assetDraft.sale_price) : null,
-        project_url: assetDraft.project_url.trim() || null,
+        activities_project_id: assetDraft.activities_project_id || null,
       };
       if (editingAssetId === "__new__") {
         await api(withPortfolio("/assets"), { method: "POST", body: JSON.stringify(payload) });
@@ -5245,11 +5264,9 @@ export default function Page() {
                     {asset.linked_asset && (
                       <p className="field-hint">Financuje: {String(asset.linked_asset_code || "")} — {String(asset.linked_asset)}</p>
                     )}
-                    {asset.project_url && (
+                    {asset.activities_project_id && (
                       <p className="field-hint">
-                        <a href={String(asset.project_url)} target="_blank" rel="noopener noreferrer">
-                          Odkaz na projekt ↗
-                        </a>
+                        Projekt v Activities: {activitiesProjectName(activitiesProjectsList, asset.activities_project_id) || "?"}
                       </p>
                     )}
                   </div>
@@ -5317,11 +5334,17 @@ export default function Page() {
                           : "Zobrazit splátkový kalendář"}
                     </button>
                   )}
-                  {assetWorkItems(assetWorkLog, String(asset.id)).length > 0 && (
-                    <button type="button" className="link-button" onClick={() => toggleAssetWorkLog(String(asset.id))}>
-                      {expandedAssetWorkLog.has(String(asset.id))
-                        ? "Skrýt odpracované práce"
-                        : `Zobrazit odpracované práce (${assetWorkItems(assetWorkLog, String(asset.id)).length})`}
+                  {asset.activities_project_id && (
+                    <button
+                      type="button"
+                      className="link-button"
+                      onClick={() => toggleAssetWorkLog(String(asset.id), String(asset.activities_project_id))}
+                    >
+                      {assetWorkLogBusy === String(asset.id)
+                        ? "Načítám…"
+                        : expandedAssetWorkLog.has(String(asset.id))
+                          ? "Skrýt odpracované práce"
+                          : "Zobrazit odpracované práce"}
                     </button>
                   )}
                 </div>
@@ -5339,32 +5362,35 @@ export default function Page() {
                   </div>
                 )}
                 {assetSchedule?.forId === String(asset.id) && <PaymentScheduleTable rows={assetSchedule.rows} />}
-                {expandedAssetWorkLog.has(String(asset.id)) && (
-                  <div className="nested-table asset-work-log">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Datum</th>
-                          <th>Položka</th>
-                          <th>Kategorie</th>
-                          <th>Dodavatel</th>
-                          <th>Částka</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {assetWorkItems(assetWorkLog, String(asset.id)).map((item) => (
-                          <tr key={String(item.id)}>
-                            <td>{formatValue("cost_date", item.cost_date)}</td>
-                            <td>{String(item.item || "")}</td>
-                            <td>{String(item.category || "")}</td>
-                            <td>{String(item.supplier || "")}</td>
-                            <td className="numeric-cell">{formatValue("amount", item.amount)}</td>
+                {expandedAssetWorkLog.has(String(asset.id)) &&
+                  (assetWorkLogEntries[String(asset.id)]?.length ? (
+                    <div className="nested-table asset-work-log">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Datum</th>
+                            <th>Popis</th>
+                            <th>Kategorie</th>
+                            <th>Hodin</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
+                        </thead>
+                        <tbody>
+                          {assetWorkLogEntries[String(asset.id)].map((entry, index) => (
+                            <tr key={index}>
+                              <td>{formatValue("cost_date", entry.spent_on)}</td>
+                              <td>{String(entry.description || "")}</td>
+                              <td>{String(entry.category_code || "")}</td>
+                              <td className="numeric-cell">{formatValue("duration_hours", entry.duration_hours)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    assetWorkLogBusy !== String(asset.id) && (
+                      <p className="alert-empty">V Activities zatím nejsou pro tento projekt zaznamenány žádné odpracované práce.</p>
+                    )
+                  ))}
                 {editingAssetId === String(asset.id) && renderAssetEditorForm()}
               </article>
             ))}

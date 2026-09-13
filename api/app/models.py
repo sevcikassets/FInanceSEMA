@@ -178,10 +178,13 @@ class Asset(Base):
     # history (costs, past valuations) stays intact.
     sold_at: Mapped[date | None] = mapped_column(Date)
     sale_price: Mapped[Decimal | None] = mapped_column(Numeric(16, 2))
-    # Free-form link to wherever the actual renovation/construction project
-    # for this asset is tracked (a Trello board, a shared Drive folder, ...) -
-    # entirely external to this app, just a convenience shortcut on the card.
-    project_url: Mapped[str | None] = mapped_column(String(1024))
+    # References projects.id in the Activities app's OWN database (a
+    # separate docker-compose project on this host - see activities_db.py) -
+    # not a SQLAlchemy ForeignKey, since that table lives outside this app's
+    # database entirely. Powers the "Odkaz na projekt" name and the
+    # "Odpracované práce" work log on the Majetek card, both read live from
+    # Activities rather than duplicated into this app.
+    activities_project_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
 
     owner: Mapped[Party | None] = relationship()
 

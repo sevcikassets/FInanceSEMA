@@ -47,6 +47,7 @@ from .auth import (
     verify_totp_code,
 )
 from .config import get_settings
+from .activities_db import get_activities_db, list_activities_projects, list_activities_time_entries
 from .db import Base, engine, get_db
 from .excel_import import (
     get_or_create_asset_type,
@@ -258,7 +259,7 @@ class AssetInput(BaseModel):
     payment: Decimal | None = None
     sold_at: date | None = None
     sale_price: Decimal | None = None
-    project_url: str | None = None
+    activities_project_id: uuid.UUID | None = None
 
 
 class PortfolioAccessGrant(BaseModel):
@@ -1126,9 +1127,11 @@ def ensure_schema_upgrades() -> None:
         conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS sold_at DATE"))
         conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS sale_price NUMERIC(16, 2)"))
 
-        # --- Optional link to wherever the asset's own renovation/
-        # construction project is tracked (Trello, Drive, ...).
-        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS project_url VARCHAR(1024)"))
+        # --- Link to a project in the Activities app's own database (see
+        # activities_db.py) - supersedes the short-lived project_url
+        # free-text field (never deployed anywhere but a local dev copy).
+        conn.execute(text("ALTER TABLE assets DROP COLUMN IF EXISTS project_url"))
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS activities_project_id UUID"))
 
     # The data-shape migration below (moving rows, splitting one row into
     # two, copying several fields) is simpler and far less error-prone as
@@ -2050,7 +2053,7 @@ def create_asset(
         payment=payload.payment,
         sold_at=payload.sold_at,
         sale_price=payload.sale_price,
-        project_url=(payload.project_url or "").strip() or None,
+        activities_project_id=payload.activities_project_id,
     )
     db.add(row)
     db.commit()
@@ -2097,7 +2100,7 @@ def update_asset(
     row.payment = payload.payment
     row.sold_at = payload.sold_at
     row.sale_price = payload.sale_price
-    row.project_url = (payload.project_url or "").strip() or None
+    row.activities_project_id = payload.activities_project_id
     db.commit()
     return _asset_dict(db, row)
 
@@ -2388,6 +2391,23 @@ def create_payer(payload: PayerInput, _: str = Depends(require_admin), db: Sessi
     db.add(row)
     db.commit()
     return {"id": str(row.id), "name": row.name}
+
+
+@app.get("/activities/projects")
+def activities_projects(_: str = Depends(require_user), db: Session = Depends(get_activities_db)) -> list[dict[str, Any]]:
+    """Not portfolio-scoped - Activities' project registry lives entirely
+    outside this app's own data, in a separate app on the same host (see
+    activities_db.py). Powers the "Projekt v Activities" picker on an Asset,
+    and the frontend resolves a linked activities_project_id to its name by
+    matching against this same list."""
+    return list_activities_projects(db)
+
+
+@app.get("/activities/projects/{project_id}/time-entries")
+def activities_project_time_entries(
+    project_id: uuid.UUID, _: str = Depends(require_user), db: Session = Depends(get_activities_db)
+) -> list[dict[str, Any]]:
+    return list_activities_time_entries(db, project_id)
 
 
 @app.delete("/parties/payers/{payer_id}")

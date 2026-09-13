@@ -5,6 +5,11 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://finance:finance@db:5432/finance_sema"
+    # Read-only cross-app connection to the Activities app's own Postgres (a
+    # separate docker-compose project on the same host, joined via the
+    # shared_infra network) - see activities_db.py. Never migrated or
+    # written to from here.
+    activities_database_url: str = "postgresql+psycopg://activities:activities@activities-db:5432/activities"
     api_cors_origins: str = "http://localhost:3010"
     app_username: str = "admin"
     app_password: str = "finance"
