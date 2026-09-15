@@ -1471,6 +1471,14 @@ export default function Page() {
   const [mergeSelection, setMergeSelection] = useState<Record<string, string>>({});
   const [mergeBusy, setMergeBusy] = useState(false);
   const [mergeStatus, setMergeStatus] = useState<string | null>(null);
+  // Manual merge - for near-duplicates the automatic name-matcher above
+  // can't catch (e.g. "ŠEVČÍK ASSETS" vs "ŠEVČÍK ASSETS, s.r.o." - an
+  // actual added word, not just case/whitespace/punctuation that
+  // _normalize_party_name strips). Same /parties/merge endpoint, just a
+  // free pick from the full party list instead of an auto-detected group.
+  const [manualMergeQuery, setManualMergeQuery] = useState("");
+  const [manualMergeSelectedIds, setManualMergeSelectedIds] = useState<Set<string>>(new Set());
+  const [manualMergeKeepId, setManualMergeKeepId] = useState("");
   const [editingAccessUsername, setEditingAccessUsername] = useState<string | null>(null);
   const [accessDraft, setAccessDraft] = useState<Record<string, string[]>>({});
   const [accessBusy, setAccessBusy] = useState(false);
@@ -2299,6 +2307,33 @@ export default function Page() {
     try {
       await api("/parties/merge", { method: "POST", body: JSON.stringify({ keep_id: keepId, remove_ids: removeIds }) });
       setMergeStatus(`Sloučeno do "${String(keepName)}".`);
+      await loadAll();
+    } catch (err) {
+      setMergeStatus(err instanceof Error ? err.message : "Sloučení se nezdařilo");
+    } finally {
+      setMergeBusy(false);
+    }
+  }
+
+  async function mergeManualSelection() {
+    const selectedIds = [...manualMergeSelectedIds];
+    if (selectedIds.length < 2 || !manualMergeKeepId) return;
+    const keepName = allParties.find((p) => String(p.id) === manualMergeKeepId)?.name;
+    const removeIds = selectedIds.filter((id) => id !== manualMergeKeepId);
+    if (
+      !confirmDelete(
+        `sloučit ${removeIds.length} záznam(y) do "${String(keepName)}" - všechny odkazy (půjčky, majetek, náklady) se přesunou a duplicity se smažou`,
+      )
+    )
+      return;
+    setMergeBusy(true);
+    setMergeStatus(null);
+    try {
+      await api("/parties/merge", { method: "POST", body: JSON.stringify({ keep_id: manualMergeKeepId, remove_ids: removeIds }) });
+      setMergeStatus(`Sloučeno do "${String(keepName)}".`);
+      setManualMergeSelectedIds(new Set());
+      setManualMergeKeepId("");
+      setManualMergeQuery("");
       await loadAll();
     } catch (err) {
       setMergeStatus(err instanceof Error ? err.message : "Sloučení se nezdařilo");
@@ -4765,6 +4800,73 @@ export default function Page() {
                     </button>
                   </div>
                 ))}
+              </div>
+            )}
+            {Boolean(currentUser?.is_admin) && (
+              <div className="access-editor">
+                <p>
+                  Ruční sloučení: pro záznamy, které automatický nástroj výše nenajde - např. „ŠEVČÍK ASSETS" a
+                  „ŠEVČÍK ASSETS, s.r.o." se liší o skutečné slovo, ne jen o mezeru/interpunkci/velikost písmen.
+                  Vyber ručně 2 a více záznamů, označ, který zůstane, a slouč.
+                </p>
+                <label>
+                  Hledat podle jména
+                  <input
+                    type="text"
+                    value={manualMergeQuery}
+                    onChange={(event) => setManualMergeQuery(event.target.value)}
+                    placeholder="např. Ševčík"
+                  />
+                </label>
+                <div className="duplicate-party-group manual-merge-list">
+                  {allParties
+                    .filter((party) => String(party.name).toLowerCase().includes(manualMergeQuery.trim().toLowerCase()))
+                    .map((party) => {
+                      const id = String(party.id);
+                      return (
+                        <label className="checkbox-row" key={id}>
+                          <input
+                            type="checkbox"
+                            checked={manualMergeSelectedIds.has(id)}
+                            onChange={(event) => {
+                              setManualMergeSelectedIds((current) => {
+                                const next = new Set(current);
+                                if (event.target.checked) next.add(id);
+                                else next.delete(id);
+                                return next;
+                              });
+                              if (!event.target.checked && manualMergeKeepId === id) setManualMergeKeepId("");
+                            }}
+                          />
+                          {String(party.name)} <span className="field-hint">({String(party.kind)})</span>
+                        </label>
+                      );
+                    })}
+                </div>
+                {manualMergeSelectedIds.size >= 2 && (
+                  <>
+                    <p>Který záznam zůstane?</p>
+                    {[...manualMergeSelectedIds].map((id) => (
+                      <label className="checkbox-row" key={id}>
+                        <input
+                          type="radio"
+                          name="manual-merge-keep"
+                          checked={manualMergeKeepId === id}
+                          onChange={() => setManualMergeKeepId(id)}
+                        />
+                        {String(allParties.find((p) => String(p.id) === id)?.name || id)}
+                      </label>
+                    ))}
+                    <button
+                      type="button"
+                      className="link-button"
+                      onClick={mergeManualSelection}
+                      disabled={mergeBusy || !manualMergeKeepId}
+                    >
+                      Sloučit do vybraného
+                    </button>
+                  </>
+                )}
               </div>
             )}
           </section>
