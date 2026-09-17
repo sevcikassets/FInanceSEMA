@@ -36,6 +36,12 @@ services:
       APP_USERNAME: ${FINANCE_APP_USERNAME:?set FINANCE_APP_USERNAME in .env}
       APP_PASSWORD: ${FINANCE_APP_PASSWORD:?set FINANCE_APP_PASSWORD in .env}
       APP_TOKEN_SECRET: ${FINANCE_APP_TOKEN_SECRET:?set FINANCE_APP_TOKEN_SECRET in .env (e.g. openssl rand -hex 32)}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
     volumes:
       - ./imports:/imports
       - ./exports:/app/exports

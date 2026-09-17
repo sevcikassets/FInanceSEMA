@@ -99,6 +99,7 @@ from .stock_services import (
     refresh_current_prices,
     ticker_from_existing_data,
 )
+from .email_reports import send_portfolio_report, should_send_today
 
 
 class LoginRequest(BaseModel):
@@ -177,6 +178,11 @@ class StockTransactionInput(BaseModel):
 
 class PortfolioInput(BaseModel):
     name: str
+
+
+class PortfolioReportSettingsInput(BaseModel):
+    report_email: str | None = None
+    report_period: Literal["off", "daily", "weekly", "monthly"] = "off"
 
 
 class CostCategoryInput(BaseModel):
@@ -664,7 +670,7 @@ def user_dict(row: AppUser) -> dict[str, Any]:
 
 
 def portfolio_dict(row: Portfolio) -> dict[str, Any]:
-    return {"id": str(row.id), "name": row.name}
+    return {"id": str(row.id), "name": row.name, "report_email": row.report_email, "report_period": row.report_period}
 
 
 def cost_attachment_path(attachment_id: uuid.UUID) -> Path:
@@ -1133,6 +1139,11 @@ def ensure_schema_upgrades() -> None:
         conn.execute(text("ALTER TABLE assets DROP COLUMN IF EXISTS project_url"))
         conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS activities_project_id UUID"))
 
+        # --- E-mailové reporty (denní/týdenní/měsíční statistika) na Subjekt -
+        # viz email_reports.py a run_daily_email_reports below.
+        conn.execute(text("ALTER TABLE portfolios ADD COLUMN IF NOT EXISTS report_email VARCHAR(500)"))
+        conn.execute(text("ALTER TABLE portfolios ADD COLUMN IF NOT EXISTS report_period VARCHAR(16) NOT NULL DEFAULT 'off'"))
+
     # The data-shape migration below (moving rows, splitting one row into
     # two, copying several fields) is simpler and far less error-prone as
     # ORM object manipulation than hand-written INSERT/UPDATE/DELETE SQL -
@@ -1236,6 +1247,32 @@ def run_daily_stock_recalculation() -> None:
                 logger.exception("Scheduled recalculation failed for portfolio %s", portfolio_id)
 
 
+def run_daily_email_reports() -> None:
+    """Scheduled job (see schedule_daily_recalculation) - sends each
+    Subjekt's configured e-mail report (Portfolio.report_email/
+    report_period) once should_send_today says today matches that Subjekt's
+    period. Runs after run_daily_stock_recalculation (see the cron hours
+    below) so today's DailyStatistic row already reflects today's prices.
+    Same isolated per-Subjekt session/failure handling as that job - one
+    Subjekt's SMTP failure must not skip the rest."""
+    today = date.today()
+    with Session(bind=engine) as session:
+        due_portfolio_ids = list(
+            session.scalars(select(Portfolio.id).where(Portfolio.report_period != "off")).all()
+        )
+    for portfolio_id in due_portfolio_ids:
+        with Session(bind=engine) as session:
+            try:
+                portfolio = session.get(Portfolio, portfolio_id)
+                if portfolio is None or not should_send_today(portfolio.report_period, today):
+                    continue
+                send_portfolio_report(session, portfolio, today)
+                logger.info("Sent e-mail report for portfolio %s", portfolio_id)
+            except Exception:  # noqa: BLE001 - one Subjekt's failure must not skip the rest
+                session.rollback()
+                logger.exception("Failed to send e-mail report for portfolio %s", portfolio_id)
+
+
 scheduler = BackgroundScheduler()
 
 
@@ -1260,6 +1297,14 @@ def schedule_daily_recalculation() -> None:
         run_daily_stock_recalculation,
         trigger=CronTrigger(hour=1, minute=0, timezone=PRAGUE_TZ),
         id="daily_stock_recalculation",
+        replace_existing=True,
+    )
+    # 07:00, after the 01:00 recalculation above, so today's DailyStatistic
+    # row (and current prices) are already fresh by the time a report goes out.
+    scheduler.add_job(
+        run_daily_email_reports,
+        trigger=CronTrigger(hour=7, minute=0, timezone=PRAGUE_TZ),
+        id="daily_email_reports",
         replace_existing=True,
     )
     scheduler.start()
@@ -1522,6 +1567,25 @@ def rename_portfolio(
     if db.scalar(select(Portfolio).where(Portfolio.name == name, Portfolio.id != portfolio_id)) is not None:
         raise HTTPException(status_code=409, detail="Subjekt s tímto názvem už existuje")
     row.name = name
+    db.commit()
+    return portfolio_dict(row)
+
+
+@app.put("/portfolios/{portfolio_id}/report-settings")
+def update_portfolio_report_settings(
+    portfolio_id: uuid.UUID, payload: PortfolioReportSettingsInput, _: str = Depends(require_admin), db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    row = db.get(Portfolio, portfolio_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Subjekt nenalezen")
+    emails = [addr.strip() for addr in (payload.report_email or "").split(",") if addr.strip()]
+    for addr in emails:
+        if "@" not in addr or " " in addr:
+            raise HTTPException(status_code=400, detail=f"Neplatná e-mailová adresa: {addr}")
+    if payload.report_period != "off" and not emails:
+        raise HTTPException(status_code=400, detail="Zadejte příjemce, nebo periodu nastavte na Vypnuto")
+    row.report_email = ", ".join(emails) if emails else None
+    row.report_period = payload.report_period
     db.commit()
     return portfolio_dict(row)
 

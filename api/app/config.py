@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     # never under a user-supplied filename, to rule out path traversal. See
     # docker-compose*.yml for the volume mount that makes this persistent.
     attachments_dir: str = "/app/attachments"
+    # E-mailové reporty (viz email_reports.py) - unset smtp_host disables
+    # sending entirely (run_daily_email_reports logs and skips instead of
+    # failing loudly, since not every deploy needs this feature).
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_from: str | None = None
+    smtp_use_tls: bool = True
 
     @property
     def cors_origins(self) -> list[str]:

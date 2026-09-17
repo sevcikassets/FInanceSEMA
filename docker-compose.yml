@@ -35,6 +35,12 @@ services:
       APP_USERNAME: ${FINANCE_APP_USERNAME:-admin}
       APP_PASSWORD: ${FINANCE_APP_PASSWORD:-finance}
       APP_TOKEN_SECRET: ${FINANCE_APP_TOKEN_SECRET:-local-dev-secret}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
     volumes:
       - ./imports:/imports
       - ./exports:/app/exports

@@ -1093,6 +1093,7 @@ const signedProfitColumns = new Set([
   "daily_profit_czk",
   "realized_profit_czk",
   "unrealized_profit_delta_czk",
+  "profit_czk",
 ]);
 
 // Sledování akcie (ticker price-history) table: fixed 2 decimal places
@@ -1456,7 +1457,7 @@ export default function Page() {
   const [notifStatus, setNotifStatus] = useState<string | null>(null);
   const [activePortfolioId, setActivePortfolioId] = useState<string | null>(null);
   const latestLoadRequestRef = useRef(0);
-  const [portfolios, setPortfolios] = useState<{ id: string; name: string }[]>([]);
+  const [portfolios, setPortfolios] = useState<{ id: string; name: string; report_email?: string | null; report_period?: string }[]>([]);
   const [newPortfolioName, setNewPortfolioName] = useState("");
   const [portfolioBusy, setPortfolioBusy] = useState(false);
   const [portfolioStatus, setPortfolioStatus] = useState<string | null>(null);
@@ -1467,6 +1468,11 @@ export default function Page() {
   const [selfPartyIds, setSelfPartyIds] = useState<Set<string>>(() => new Set());
   const [selfPartiesBusy, setSelfPartiesBusy] = useState(false);
   const [selfPartiesStatus, setSelfPartiesStatus] = useState<string | null>(null);
+  const [editingReportSettingsPortfolioId, setEditingReportSettingsPortfolioId] = useState<string | null>(null);
+  const [reportEmailInput, setReportEmailInput] = useState("");
+  const [reportPeriodInput, setReportPeriodInput] = useState("off");
+  const [reportSettingsBusy, setReportSettingsBusy] = useState(false);
+  const [reportSettingsStatus, setReportSettingsStatus] = useState<string | null>(null);
   const [duplicateParties, setDuplicateParties] = useState<{ key: string; members: Row[] }[]>([]);
   const [mergeSelection, setMergeSelection] = useState<Record<string, string>>({});
   const [mergeBusy, setMergeBusy] = useState(false);
@@ -1935,7 +1941,8 @@ export default function Page() {
       if (activeTab === "rates") setLatestRates(rest[restIndex++] as LatestRates);
       if (needsStockOverview) setStockOverview(rest[restIndex++] as StockOverview);
       if (needsAlerts) setAlerts(rest[restIndex++] as Alerts);
-      if (needsPortfolioList) setPortfolios(rest[restIndex++] as { id: string; name: string }[]);
+      if (needsPortfolioList)
+        setPortfolios(rest[restIndex++] as { id: string; name: string; report_email?: string | null; report_period?: string }[]);
       if (needsAllParties) setAllParties(rest[restIndex++] as Row[]);
       if (needsDuplicateParties) {
         const groups = rest[restIndex++] as { key: string; members: Row[] }[];
@@ -2287,6 +2294,31 @@ export default function Page() {
       setSelfPartiesStatus(err instanceof Error ? err.message : "Vlastní jména se nepodařilo uložit");
     } finally {
       setSelfPartiesBusy(false);
+    }
+  }
+
+  function openReportSettingsEditor(portfolio: { id: string; report_email?: string | null; report_period?: string }) {
+    setEditingReportSettingsPortfolioId(portfolio.id);
+    setReportEmailInput(portfolio.report_email || "");
+    setReportPeriodInput(portfolio.report_period || "off");
+    setReportSettingsStatus(null);
+  }
+
+  async function saveReportSettings() {
+    if (!editingReportSettingsPortfolioId) return;
+    setReportSettingsBusy(true);
+    setReportSettingsStatus(null);
+    try {
+      await api(`/portfolios/${editingReportSettingsPortfolioId}/report-settings`, {
+        method: "PUT",
+        body: JSON.stringify({ report_email: reportEmailInput.trim(), report_period: reportPeriodInput }),
+      });
+      setEditingReportSettingsPortfolioId(null);
+      await loadAll();
+    } catch (err) {
+      setReportSettingsStatus(err instanceof Error ? err.message : "Nastavení reportu se nepodařilo uložit");
+    } finally {
+      setReportSettingsBusy(false);
     }
   }
 
@@ -4724,6 +4756,9 @@ export default function Page() {
                     <button type="button" className="link-button" onClick={() => openSelfPartiesEditor(portfolio.id)}>
                       Vlastní jména
                     </button>
+                    <button type="button" className="link-button" onClick={() => openReportSettingsEditor(portfolio)}>
+                      E-mailové reporty
+                    </button>
                   </div>
                 ),
               )}
@@ -4767,6 +4802,52 @@ export default function Page() {
                     Zrušit
                   </button>
                 </div>
+              </div>
+            )}
+            {editingReportSettingsPortfolioId && (
+              <div className="access-editor">
+                <p>
+                  E-mailové reporty subjektu <strong>{portfolios.find((p) => p.id === editingReportSettingsPortfolioId)?.name}</strong>:
+                  report obsahuje statistiku, graf porovnání s S&amp;P 500, největší poklesy/nárůsty a nejvýnosnější/nejztrátovější
+                  akcie za období odpovídající zvolené periodě (denně = dnešek, týdně = posledních 7 dní, měsíčně = aktuální měsíc).
+                  Pro víc příjemců oddělte adresy čárkou.
+                </p>
+                <form
+                  className="rate-form"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    saveReportSettings();
+                  }}
+                >
+                  <label>
+                    Příjemce (e-mail)
+                    <input
+                      type="text"
+                      value={reportEmailInput}
+                      onChange={(event) => setReportEmailInput(event.target.value)}
+                      placeholder="jan@example.com, petra@example.com"
+                    />
+                  </label>
+                  <label>
+                    Perioda
+                    <select value={reportPeriodInput} onChange={(event) => setReportPeriodInput(event.target.value)}>
+                      <option value="off">Vypnuto</option>
+                      <option value="daily">Denně</option>
+                      <option value="weekly">Týdně (pondělí)</option>
+                      <option value="monthly">Měsíčně (1. den)</option>
+                    </select>
+                  </label>
+                  {reportSettingsStatus && <div className="success-notice">{reportSettingsStatus}</div>}
+                  <div className="stock-actions">
+                    <button className="action-button" type="submit" disabled={reportSettingsBusy}>
+                      <Save size={16} />
+                      <span>Uložit</span>
+                    </button>
+                    <button type="button" className="link-button" onClick={() => setEditingReportSettingsPortfolioId(null)}>
+                      Zrušit
+                    </button>
+                  </div>
+                </form>
               </div>
             )}
             {duplicateParties.length > 0 && (
@@ -5692,6 +5773,10 @@ export default function Page() {
                           typeof row.difference_czk === "number" ? (
                           <span className={numberValue(row.difference_czk) >= 0 ? "positive" : "negative"}>
                             {formatValue(col, row[col])}
+                          </span>
+                        ) : col === "profit_pct" && typeof row[col] === "number" ? (
+                          <span className={numberValue(row[col]) >= 0 ? "positive" : "negative"}>
+                            {formatSignedProfitPrecise(numberValue(row[col]), true)}
                           </span>
                         ) : signedProfitColumns.has(col) && typeof row[col] === "number" ? (
                           <span className={numberValue(row[col]) >= 0 ? "positive" : "negative"}>
