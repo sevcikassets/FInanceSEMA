@@ -70,6 +70,24 @@ class PortfolioSelfParty(Base):
     party_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("parties.id"), primary_key=True)
 
 
+class SmtpSettings(Base):
+    """Single row (id always "default") holding SMTP credentials for
+    e-mail reports, configured from the app's own Nastavení tab (admin
+    only) - overrides the SMTP_* env vars when set, so changing/fixing
+    e-mail delivery never requires server/SSH access. See
+    email_reports.py's _resolve_smtp_config."""
+
+    __tablename__ = "smtp_settings"
+
+    id: Mapped[str] = mapped_column(String(16), primary_key=True, default="default")
+    host: Mapped[str | None] = mapped_column(String(255))
+    port: Mapped[int | None] = mapped_column()
+    username: Mapped[str | None] = mapped_column(String(255))
+    password: Mapped[str | None] = mapped_column(String(255))
+    from_address: Mapped[str | None] = mapped_column(String(255))
+    use_tls: Mapped[bool] = mapped_column(default=True)
+
+
 class AppUser(Base):
     __tablename__ = "app_users"
 

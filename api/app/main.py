@@ -82,6 +82,7 @@ from .models import (
     PortfolioAccess,
     PortfolioPosition,
     PortfolioSelfParty,
+    SmtpSettings,
     StockTransaction,
     WatchlistStock,
 )
@@ -99,7 +100,7 @@ from .stock_services import (
     refresh_current_prices,
     ticker_from_existing_data,
 )
-from .email_reports import send_portfolio_report, should_send_today
+from .email_reports import send_portfolio_report, send_test_email, should_send_today
 
 
 class LoginRequest(BaseModel):
@@ -183,6 +184,22 @@ class PortfolioInput(BaseModel):
 class PortfolioReportSettingsInput(BaseModel):
     report_email: str | None = None
     report_period: Literal["off", "daily", "weekly", "monthly"] = "off"
+
+
+class SmtpSettingsInput(BaseModel):
+    host: str | None = None
+    port: int = 587
+    username: str | None = None
+    # Blank/omitted keeps whatever password is already stored - same
+    # pattern as UserUpdateInput.password, so the admin never has to
+    # re-enter (or blank out) it just to change another field.
+    password: str | None = None
+    from_address: str | None = None
+    use_tls: bool = True
+
+
+class SmtpTestInput(BaseModel):
+    to: str
 
 
 class CostCategoryInput(BaseModel):
@@ -1472,6 +1489,55 @@ def update_notification_settings(
     user.alert_drop_pct = payload.alert_drop_pct
     db.commit()
     return user_dict(user)
+
+
+def smtp_settings_dict(row: SmtpSettings | None) -> dict[str, Any]:
+    # Never returns the stored password - only whether one is set, same
+    # never-echo-secrets convention as user_dict/password_hash.
+    return {
+        "host": row.host if row else None,
+        "port": (row.port if row and row.port else 587),
+        "username": row.username if row else None,
+        "has_password": bool(row and row.password),
+        "from_address": row.from_address if row else None,
+        "use_tls": (row.use_tls if row is not None else True),
+    }
+
+
+@app.get("/settings/smtp")
+def get_smtp_settings(_: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return smtp_settings_dict(db.get(SmtpSettings, "default"))
+
+
+@app.put("/settings/smtp")
+def update_smtp_settings(
+    payload: SmtpSettingsInput, _: str = Depends(require_admin), db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    row = db.get(SmtpSettings, "default")
+    if row is None:
+        row = SmtpSettings(id="default")
+        db.add(row)
+    row.host = (payload.host or "").strip() or None
+    row.port = payload.port
+    row.username = (payload.username or "").strip() or None
+    if payload.password:
+        row.password = payload.password
+    row.from_address = (payload.from_address or "").strip() or None
+    row.use_tls = payload.use_tls
+    db.commit()
+    return smtp_settings_dict(row)
+
+
+@app.post("/settings/smtp/test")
+def test_smtp_settings(payload: SmtpTestInput, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, str]:
+    to_address = payload.to.strip()
+    if not to_address:
+        raise HTTPException(status_code=400, detail="Zadejte e-mail příjemce")
+    try:
+        send_test_email(db, to_address)
+    except Exception as exc:  # noqa: BLE001 - surface the SMTP library's own error message to the admin
+        raise HTTPException(status_code=400, detail=f"Odeslání selhalo: {exc}") from exc
+    return {"status": "ok"}
 
 
 @app.get("/users")

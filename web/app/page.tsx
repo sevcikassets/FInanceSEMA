@@ -69,6 +69,15 @@ type Alerts = {
   daily_movers_as_of: string | null;
 };
 
+type SmtpSettings = {
+  host: string | null;
+  port: number;
+  username: string | null;
+  has_password: boolean;
+  from_address: string | null;
+  use_tls: boolean;
+};
+
 type LoanBalances = {
   balances: Row[];
   total_outstanding: number;
@@ -1455,6 +1464,18 @@ export default function Page() {
   const [notifDropPct, setNotifDropPct] = useState("");
   const [notifBusy, setNotifBusy] = useState(false);
   const [notifStatus, setNotifStatus] = useState<string | null>(null);
+  const [smtpSettings, setSmtpSettings] = useState<SmtpSettings | null>(null);
+  const [smtpHost, setSmtpHost] = useState("");
+  const [smtpPort, setSmtpPort] = useState("587");
+  const [smtpUsername, setSmtpUsername] = useState("");
+  const [smtpPassword, setSmtpPassword] = useState("");
+  const [smtpFrom, setSmtpFrom] = useState("");
+  const [smtpUseTls, setSmtpUseTls] = useState(true);
+  const [smtpBusy, setSmtpBusy] = useState(false);
+  const [smtpStatus, setSmtpStatus] = useState<string | null>(null);
+  const [smtpTestEmail, setSmtpTestEmail] = useState("");
+  const [smtpTestBusy, setSmtpTestBusy] = useState(false);
+  const [smtpTestStatus, setSmtpTestStatus] = useState<string | null>(null);
   const [activePortfolioId, setActivePortfolioId] = useState<string | null>(null);
   const latestLoadRequestRef = useRef(0);
   const [portfolios, setPortfolios] = useState<{ id: string; name: string; report_email?: string | null; report_period?: string }[]>([]);
@@ -1914,6 +1935,7 @@ export default function Page() {
       const needsLoanBalances = activeTab === "loans";
       const needsBenchmark = activeTab === "charts";
       const needsAllocationHistory = activeTab === "charts";
+      const needsSmtpSettings = activeTab === "settings" && Boolean(currentUser?.is_admin);
       const requests: Promise<unknown>[] = [activePortfolioId ? api(withPortfolio("/summary")) : Promise.resolve(null)];
       if (needsRows) requests.push(api(withPortfolio(active.endpoint)));
       if (activeTab === "rates") requests.push(api("/rates/latest"));
@@ -1933,6 +1955,7 @@ export default function Page() {
       if (needsEvaluations) requests.push(api(withPortfolio("/evaluations")));
       if (needsBenchmark) requests.push(api(withPortfolio("/stocks/benchmark")));
       if (needsAllocationHistory) requests.push(api(withPortfolio("/stocks/allocation-history")));
+      if (needsSmtpSettings) requests.push(api("/settings/smtp"));
       const [summaryData, ...rest] = await Promise.all(requests);
       if (latestLoadRequestRef.current !== requestId) return;
       setSummary(summaryData as Summary | null);
@@ -1969,6 +1992,7 @@ export default function Page() {
       if (needsEvaluations) setEvaluations(rest[restIndex++] as Evaluation[]);
       if (needsBenchmark) setBenchmark(rest[restIndex++] as Row[]);
       if (needsAllocationHistory) setAllocationHistory(rest[restIndex++] as Row[]);
+      if (needsSmtpSettings) setSmtpSettings(rest[restIndex++] as SmtpSettings);
     } catch (err) {
       if (latestLoadRequestRef.current !== requestId) return;
       setError(err instanceof Error ? err.message : "Nepodařilo se načíst data");
@@ -1978,6 +2002,15 @@ export default function Page() {
   useEffect(() => {
     loadAll();
   }, [token, activeTab, activePortfolioId]);
+
+  useEffect(() => {
+    if (!smtpSettings) return;
+    setSmtpHost(smtpSettings.host || "");
+    setSmtpPort(String(smtpSettings.port || 587));
+    setSmtpUsername(smtpSettings.username || "");
+    setSmtpFrom(smtpSettings.from_address || "");
+    setSmtpUseTls(smtpSettings.use_tls);
+  }, [smtpSettings]);
 
   function logout() {
     localStorage.removeItem("finance-token");
@@ -2179,6 +2212,46 @@ export default function Page() {
       setNotifStatus(err instanceof Error ? err.message : "Nastavení se nepodařilo uložit");
     } finally {
       setNotifBusy(false);
+    }
+  }
+
+  async function saveSmtpSettings(event: React.FormEvent) {
+    event.preventDefault();
+    setSmtpStatus(null);
+    setSmtpBusy(true);
+    try {
+      const updated = (await api("/settings/smtp", {
+        method: "PUT",
+        body: JSON.stringify({
+          host: smtpHost.trim(),
+          port: Number(smtpPort) || 587,
+          username: smtpUsername.trim(),
+          password: smtpPassword || null,
+          from_address: smtpFrom.trim(),
+          use_tls: smtpUseTls,
+        }),
+      })) as SmtpSettings;
+      setSmtpSettings(updated);
+      setSmtpPassword("");
+      setSmtpStatus("Uloženo.");
+    } catch (err) {
+      setSmtpStatus(err instanceof Error ? err.message : "Nastavení SMTP se nepodařilo uložit");
+    } finally {
+      setSmtpBusy(false);
+    }
+  }
+
+  async function sendSmtpTestEmail(event: React.FormEvent) {
+    event.preventDefault();
+    setSmtpTestStatus(null);
+    setSmtpTestBusy(true);
+    try {
+      await api("/settings/smtp/test", { method: "POST", body: JSON.stringify({ to: smtpTestEmail.trim() }) });
+      setSmtpTestStatus("Testovací e-mail odeslán.");
+    } catch (err) {
+      setSmtpTestStatus(err instanceof Error ? err.message : "Odeslání se nepodařilo");
+    } finally {
+      setSmtpTestBusy(false);
     }
   }
 
@@ -5036,6 +5109,71 @@ export default function Page() {
               </button>
             </form>
             {notifStatus && <div className="success-notice">{notifStatus}</div>}
+
+            {currentUser?.is_admin && (
+              <>
+                <div className="panel-header" style={{ marginTop: 32 }}>
+                  <div>
+                    <h2>E-mail (SMTP)</h2>
+                    <p>
+                      SMTP server pro odesílání e-mailových reportů (nastavení příjemce a periody je v záložce Subjekty).
+                      Uloží se do databáze - server ani jeho .env se kvůli změně nemusí restartovat.
+                    </p>
+                  </div>
+                </div>
+                <form className="rate-form" onSubmit={saveSmtpSettings}>
+                  <label>
+                    SMTP server (host)
+                    <input value={smtpHost} onChange={(event) => setSmtpHost(event.target.value)} placeholder="smtp.gmail.com" />
+                  </label>
+                  <label>
+                    Port
+                    <input value={smtpPort} onChange={(event) => setSmtpPort(event.target.value)} inputMode="numeric" placeholder="587" />
+                  </label>
+                  <label>
+                    Uživatelské jméno
+                    <input value={smtpUsername} onChange={(event) => setSmtpUsername(event.target.value)} />
+                  </label>
+                  <label>
+                    Heslo{smtpSettings?.has_password ? " (ponechte prázdné pro zachování stávajícího)" : ""}
+                    <input
+                      type="password"
+                      value={smtpPassword}
+                      onChange={(event) => setSmtpPassword(event.target.value)}
+                      placeholder={smtpSettings?.has_password ? "••••••••" : ""}
+                    />
+                  </label>
+                  <label>
+                    Odesílatel (From)
+                    <input value={smtpFrom} onChange={(event) => setSmtpFrom(event.target.value)} placeholder="vas-email@gmail.com" />
+                  </label>
+                  <label className="checkbox-row">
+                    <input type="checkbox" checked={smtpUseTls} onChange={(event) => setSmtpUseTls(event.target.checked)} />
+                    Použít STARTTLS
+                  </label>
+                  <button className="action-button" type="submit" disabled={smtpBusy}>
+                    <Save size={16} />
+                    <span>Uložit</span>
+                  </button>
+                </form>
+                {smtpStatus && <div className="success-notice">{smtpStatus}</div>}
+
+                <form className="rate-form" onSubmit={sendSmtpTestEmail} style={{ marginTop: 16 }}>
+                  <label>
+                    Testovací e-mail na
+                    <input
+                      value={smtpTestEmail}
+                      onChange={(event) => setSmtpTestEmail(event.target.value)}
+                      placeholder="vas@email.cz"
+                    />
+                  </label>
+                  <button className="action-button" type="submit" disabled={smtpTestBusy || !smtpTestEmail.trim()}>
+                    <span>Odeslat test</span>
+                  </button>
+                </form>
+                {smtpTestStatus && <div className="success-notice">{smtpTestStatus}</div>}
+              </>
+            )}
           </section>
         )}
 

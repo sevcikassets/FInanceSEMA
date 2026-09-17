@@ -34,7 +34,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .models import DailyStatistic, Portfolio, PortfolioPosition
+from .models import DailyStatistic, Portfolio, PortfolioPosition, SmtpSettings
 from .stock_services import fetch_yahoo_history, rate_for_day
 
 logger = logging.getLogger(__name__)
@@ -383,14 +383,39 @@ def build_report_html(session: Session, portfolio: Portfolio, today: date) -> tu
     return html, chart_png
 
 
-def _send_email(to_addrs: list[str], subject: str, html_body: str, chart_png: bytes | None) -> None:
-    settings = get_settings()
-    if not settings.smtp_host or not settings.smtp_from:
-        raise RuntimeError("SMTP není nakonfigurováno (SMTP_HOST/SMTP_FROM)")
+def resolve_smtp_config(session: Session) -> dict[str, Any]:
+    """SMTP credentials, preferring the single-row `smtp_settings` DB table
+    (editable from the app's own Nastavení tab) over the SMTP_* env vars -
+    falls back field-by-field to the env vars for anything left blank in the
+    DB row (or if there's no row at all yet), so an existing env-based setup
+    keeps working until someone fills in the UI."""
+    env = get_settings()
+    row = session.get(SmtpSettings, "default")
+    return {
+        "host": (row.host if row and row.host else env.smtp_host),
+        "port": (row.port if row and row.port else env.smtp_port),
+        "username": (row.username if row and row.username else env.smtp_username),
+        "password": (row.password if row and row.password else env.smtp_password),
+        "from_address": (row.from_address if row and row.from_address else env.smtp_from),
+        "use_tls": (row.use_tls if row is not None else env.smtp_use_tls),
+    }
 
+
+def _smtp_send(config: dict[str, Any], to_addrs: list[str], message: MIMEMultipart) -> None:
+    if not config["host"] or not config["from_address"]:
+        raise RuntimeError("SMTP není nakonfigurováno - vyplňte ho v záložce Nastavení (nebo SMTP_HOST/SMTP_FROM v .env)")
+    with smtplib.SMTP(config["host"], config["port"] or 587, timeout=30) as smtp:
+        if config["use_tls"]:
+            smtp.starttls()
+        if config["username"] and config["password"]:
+            smtp.login(config["username"], config["password"])
+        smtp.sendmail(config["from_address"], to_addrs, message.as_string())
+
+
+def _send_email(config: dict[str, Any], to_addrs: list[str], subject: str, html_body: str, chart_png: bytes | None) -> None:
     message = MIMEMultipart("related")
     message["Subject"] = subject
-    message["From"] = settings.smtp_from
+    message["From"] = config["from_address"] or ""
     message["To"] = ", ".join(to_addrs)
 
     alternative = MIMEMultipart("alternative")
@@ -403,12 +428,7 @@ def _send_email(to_addrs: list[str], subject: str, html_body: str, chart_png: by
         image.add_header("Content-Disposition", "inline", filename="graf.png")
         message.attach(image)
 
-    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as smtp:
-        if settings.smtp_use_tls:
-            smtp.starttls()
-        if settings.smtp_username and settings.smtp_password:
-            smtp.login(settings.smtp_username, settings.smtp_password)
-        smtp.sendmail(settings.smtp_from, to_addrs, message.as_string())
+    _smtp_send(config, to_addrs, message)
 
 
 def send_portfolio_report(session: Session, portfolio: Portfolio, today: date | None = None) -> None:
@@ -418,4 +438,15 @@ def send_portfolio_report(session: Session, portfolio: Portfolio, today: date | 
         return
     html_body, chart_png = build_report_html(session, portfolio, today)
     subject = f"FinanceSEMA – {portfolio.name}: statistika ({today.strftime('%d.%m.%Y')})"
-    _send_email(recipients, subject, html_body, chart_png)
+    config = resolve_smtp_config(session)
+    _send_email(config, recipients, subject, html_body, chart_png)
+
+
+def send_test_email(session: Session, to_address: str) -> None:
+    config = resolve_smtp_config(session)
+    message = MIMEMultipart()
+    message["Subject"] = "FinanceSEMA – testovací e-mail"
+    message["From"] = config["from_address"] or ""
+    message["To"] = to_address
+    message.attach(MIMEText("Toto je testovací e-mail z FinanceSEMA - SMTP nastavení funguje.", "plain", "utf-8"))
+    _smtp_send(config, [to_address], message)
